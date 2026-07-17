@@ -27,6 +27,12 @@ import {
   subagentKillCommand,
   subagentLogsCommand,
 } from "./commands/subagent.js";
+import {
+  harnessAddCommand,
+  harnessListCommand,
+  harnessRemoveCommand,
+  harnessRunCommand,
+} from "./commands/harness.js";
 
 const program = new Command();
 
@@ -236,6 +242,53 @@ subagent.addCommand(
     .option("-n, --lines <n>", "Number of lines to show", parseInt, 50)
     .action(async (name, options) => {
       await subagentLogsCommand(name, options.lines);
+    })
+);
+
+const harness = program
+  .command("harness")
+  .description("Connect and run other agent harnesses (OpenCode, Codex, Claude)");
+
+harness.addCommand(
+  new Command("add")
+    .description("Add a connector to another harness")
+    .argument("<name>")
+    .argument("<type>")
+    .option("--url <url>", "Server URL (for opencode)")
+    .option("--command <command>", "Binary or command override")
+    .option("--cwd <cwd>", "Working directory")
+    .option("--secret <secret>", "Auth secret")
+    .action(async (name, type, options) => {
+      await harnessAddCommand(name, type, options);
+    })
+);
+
+harness.addCommand(
+  new Command("list")
+    .alias("ls")
+    .description("List harness connectors")
+    .action(async () => {
+      await harnessListCommand();
+    })
+);
+
+harness.addCommand(
+  new Command("remove")
+    .alias("rm")
+    .description("Remove a harness connector")
+    .argument("<name>")
+    .action(async (name) => {
+      await harnessRemoveCommand(name);
+    })
+);
+
+harness.addCommand(
+  new Command("run")
+    .description("Run a prompt through a harness connector")
+    .argument("<name>")
+    .argument("<prompt>")
+    .action(async (name, prompt) => {
+      await harnessRunCommand(name, prompt);
     })
 );
 
