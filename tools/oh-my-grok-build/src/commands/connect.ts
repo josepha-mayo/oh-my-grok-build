@@ -51,12 +51,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
   );
 
   const cwd = options.cwd ?? process.cwd();
-  const session = await client.newSession(
-    cwd,
-    [],
-    { yoloMode: options.yolo ?? false, modelId: options.model },
-    60_000
-  );
+  const session = await client.newSession(cwd, [], { yoloMode: options.yolo ?? false, modelId: options.model }, 60_000);
   console.log(chalk.dim(`Session: ${session.sessionId}\n`));
 
   while (true) {
@@ -99,7 +94,10 @@ function renderUpdate(update: AcpUpdate): void {
   }
 }
 
-async function handlePermission(req: AcpPermissionRequest, rl: readline.Interface): Promise<{ outcome: { outcome: "selected"; optionId: string } }> {
+async function handlePermission(
+  req: AcpPermissionRequest,
+  rl: readline.Interface
+): Promise<{ outcome: { outcome: "selected"; optionId: string } }> {
   console.log(chalk.yellow(`\nPermission requested: ${req.toolCall.title ?? req.toolCall.command ?? "tool call"}`));
   req.options.forEach((opt, i) => {
     console.log(`  ${i + 1}. ${opt.name}${opt.kind ? ` (${opt.kind})` : ""}`);

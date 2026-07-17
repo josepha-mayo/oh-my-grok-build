@@ -11,15 +11,7 @@ export class CodexConnector implements Connector {
     const tmpDir = await mkdtemp(join(tmpdir(), "omgb-codex-"));
     const lastMessageFile = join(tmpDir, "last-message.txt");
 
-    const args = [
-      "exec",
-      "--json",
-      "--sandbox",
-      "workspace-write",
-      "--output-last-message",
-      lastMessageFile,
-      prompt,
-    ];
+    const args = ["exec", "--json", "--sandbox", "workspace-write", "--output-last-message", lastMessageFile, prompt];
     if (this.config.cwd) args.push("--cwd", this.config.cwd);
 
     return new Promise((resolve, reject) => {

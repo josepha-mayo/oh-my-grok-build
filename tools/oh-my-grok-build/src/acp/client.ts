@@ -71,7 +71,11 @@ export class AcpClient {
     });
   }
 
-  async initialize(protocolVersion = 1, capabilities: Record<string, unknown> = {}, timeoutMs = 120_000): Promise<unknown> {
+  async initialize(
+    protocolVersion = 1,
+    capabilities: Record<string, unknown> = {},
+    timeoutMs = 120_000
+  ): Promise<unknown> {
     const result = await this.request("initialize", { protocolVersion, clientCapabilities: capabilities }, timeoutMs);
     this.initialized = true;
     return result;
@@ -149,7 +153,7 @@ export class AcpClient {
     try {
       if (method === "session/request_permission") {
         const req = params as AcpPermissionRequest;
-        result = await this.handlers.onPermission?.(req) ?? { outcome: { outcome: "cancelled" } };
+        result = (await this.handlers.onPermission?.(req)) ?? { outcome: { outcome: "cancelled" } };
       } else if (method === "x.ai/ask_user_question") {
         const q = (params as { question: string }).question ?? "";
         const answer = await this.handlers.onAskUser?.({ question: q });

@@ -20,15 +20,17 @@ export type ProviderInput = {
 };
 
 function sanitizeId(id: string): string {
-  return id.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return id
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
 }
 
 export async function addProvider(input: ProviderInput): Promise<ProviderConfig> {
   const id = sanitizeId(input.id);
   if (!id) throw new Error("Provider id is required");
-  const envKey = input.apiKey
-    ? `OMGB_${id.replace(/-/g, "_").toUpperCase()}_API_KEY`
-    : input.envKey;
+  const envKey = input.apiKey ? `OMGB_${id.replace(/-/g, "_").toUpperCase()}_API_KEY` : input.envKey;
 
   const config: ProviderConfig = {
     id,

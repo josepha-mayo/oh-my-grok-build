@@ -59,9 +59,7 @@ export interface AcpPermissionRequest {
 
 export interface AcpPermissionResponse {
   outcome:
-    | { outcome: "selected"; optionId: string }
-    | { outcome: "cancelled" }
-    | { outcome: string; optionId?: string };
+    { outcome: "selected"; optionId: string } | { outcome: "cancelled" } | { outcome: string; optionId?: string };
 }
 
 export interface ProviderConfig {

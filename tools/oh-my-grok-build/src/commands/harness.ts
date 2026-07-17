@@ -1,5 +1,11 @@
 import chalk from "chalk";
-import { addConnector, buildConnector, getConnector, listConnectors, removeConnector } from "../integrations/manager.js";
+import {
+  addConnector,
+  buildConnector,
+  getConnector,
+  listConnectors,
+  removeConnector,
+} from "../integrations/manager.js";
 
 export async function harnessAddCommand(
   name: string,

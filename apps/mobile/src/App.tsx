@@ -29,7 +29,9 @@ function saveConnection(url: string) {
     const raw = localStorage.getItem(CONNECTIONS_KEY);
     const parsed = raw ? (JSON.parse(raw) as unknown) : [];
     const list = Array.isArray(parsed)
-      ? (parsed as { url?: string; name?: string }[]).filter((c): c is { url: string; name?: string } => typeof c.url === "string")
+      ? (parsed as { url?: string; name?: string }[]).filter(
+          (c): c is { url: string; name?: string } => typeof c.url === "string"
+        )
       : [];
     const without = list.filter((c) => c.url !== url);
     const next = [{ url, name: url }, ...without].slice(0, 20);
@@ -205,7 +207,9 @@ export default function App() {
             return;
           case "/help":
             appendMessage("agent", {
-              text: ["/model <id>", "/yolo", "/clear", "/new", "/loop <interval> <prompt>", "/plan", "/help"].join("\n"),
+              text: ["/model <id>", "/yolo", "/clear", "/new", "/loop <interval> <prompt>", "/plan", "/help"].join(
+                "\n"
+              ),
             });
             return;
           default:

@@ -27,19 +27,11 @@ import {
   subagentKillCommand,
   subagentLogsCommand,
 } from "./commands/subagent.js";
-import {
-  harnessAddCommand,
-  harnessListCommand,
-  harnessRemoveCommand,
-  harnessRunCommand,
-} from "./commands/harness.js";
+import { harnessAddCommand, harnessListCommand, harnessRemoveCommand, harnessRunCommand } from "./commands/harness.js";
 
 const program = new Command();
 
-program
-  .name("omgb")
-  .description("Productivity and orchestration layer for Grok Build")
-  .version("0.1.0");
+program.name("omgb").description("Productivity and orchestration layer for Grok Build").version("0.1.0");
 
 program
   .command("serve")
@@ -102,11 +94,9 @@ program
       })
   )
   .addCommand(
-    new Command("discover")
-      .description("Auto-discover Ollama and LM Studio local models")
-      .action(async () => {
-        await providerDiscoverCommand();
-      })
+    new Command("discover").description("Auto-discover Ollama and LM Studio local models").action(async () => {
+      await providerDiscoverCommand();
+    })
   )
   .addCommand(
     new Command("test")
@@ -159,9 +149,7 @@ program
     await loopCommand({ expression, prompt, ...options });
   });
 
-const schedule = program
-  .command("schedule")
-  .description("Manage scheduled background jobs");
+const schedule = program.command("schedule").description("Manage scheduled background jobs");
 
 schedule.addCommand(
   new Command("list")
@@ -200,9 +188,7 @@ schedule.addCommand(
     })
 );
 
-const subagent = program
-  .command("subagent")
-  .description("Spawn and manage Grok subagents");
+const subagent = program.command("subagent").description("Spawn and manage Grok subagents");
 
 subagent.addCommand(
   new Command("spawn")

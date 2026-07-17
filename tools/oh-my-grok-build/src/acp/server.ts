@@ -104,7 +104,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
   // Promise resolved when the server is listening or fallback timer fires.
   void ready;
 
-  const hostForClient = bind === "0.0.0.0" ? getLocalIp() ?? bind : bind;
+  const hostForClient = bind === "0.0.0.0" ? (getLocalIp() ?? bind) : bind;
   return {
     url: formatServerUrl(hostForClient, port, secret),
     secret,

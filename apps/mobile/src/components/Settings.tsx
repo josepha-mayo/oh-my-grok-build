@@ -78,7 +78,7 @@ export function Settings({ onClose, onConnect, currentUrl }: SettingsProps) {
   useEffect(() => saveProviders(providers), [providers]);
 
   const updateForm = (field: keyof Provider, value: string) => {
-    setForm((f) => ({ ...f, [field]: value } as Provider));
+    setForm((f) => ({ ...f, [field]: value }) as Provider);
   };
 
   const resetForm = () => {
@@ -215,7 +215,11 @@ export function Settings({ onClose, onConnect, currentUrl }: SettingsProps) {
             <div className="provider-fields">
               <input value={form.name} onChange={(e) => updateForm("name", e.target.value)} placeholder="Name" />
               <input value={form.model} onChange={(e) => updateForm("model", e.target.value)} placeholder="Model ID" />
-              <input value={form.baseUrl} onChange={(e) => updateForm("baseUrl", e.target.value)} placeholder="Base URL" />
+              <input
+                value={form.baseUrl}
+                onChange={(e) => updateForm("baseUrl", e.target.value)}
+                placeholder="Base URL"
+              />
               <input
                 value={form.apiBackend}
                 onChange={(e) => updateForm("apiBackend", e.target.value)}

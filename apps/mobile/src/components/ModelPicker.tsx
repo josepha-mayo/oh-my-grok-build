@@ -7,14 +7,7 @@ interface ModelPickerProps {
   onClose: () => void;
 }
 
-const STARTER_MODELS = [
-  "grok-build",
-  "grok-2",
-  "grok-2-vision",
-  "claude-3-5-sonnet",
-  "gpt-4o",
-  "ollama",
-];
+const STARTER_MODELS = ["grok-build", "grok-2", "grok-2-vision", "claude-3-5-sonnet", "gpt-4o", "ollama"];
 
 export function ModelPicker({ models, selected, onSelect, onClose }: ModelPickerProps) {
   const list = Array.from(new Set([...STARTER_MODELS, ...models]));

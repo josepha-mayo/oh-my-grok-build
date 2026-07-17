@@ -9,6 +9,8 @@
   "scripts": {
     "build": "node scripts/build.js",
     "dev": "node --watch dist/index.js",
+    "format": "prettier --write src/**/*.ts scripts/**/*.js",
+    "format:check": "prettier --check src/**/*.ts scripts/**/*.js",
     "test": "node --test dist/**/*.test.js",
     "typecheck": "tsc --noEmit"
   },
@@ -24,6 +26,7 @@
     "@types/node": "^20.14.0",
     "@types/qrcode": "^1.5.5",
     "@types/ws": "^8.5.10",
+    "prettier": "^3.9.5",
     "typescript": "^5.5.0"
   },
   "type": "module"

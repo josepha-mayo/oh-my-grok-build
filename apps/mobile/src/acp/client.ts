@@ -40,9 +40,7 @@ export interface AcpPermissionRequest {
 
 export interface AcpPermissionResponse {
   outcome:
-    | { outcome: "selected"; optionId: string }
-    | { outcome: "cancelled" }
-    | { outcome: string; optionId?: string };
+    { outcome: "selected"; optionId: string } | { outcome: "cancelled" } | { outcome: string; optionId?: string };
 }
 
 export interface AcpHandlers {
@@ -178,7 +176,8 @@ export class AcpClient {
     }
 
     if (typeof msg.method === "string" && msg.method.startsWith("_")) {
-      const wrapper = msg.params as { method?: string; params?: { sessionId?: string; update?: AcpUpdate } } | undefined;
+      const wrapper = msg.params as
+        { method?: string; params?: { sessionId?: string; update?: AcpUpdate } } | undefined;
       if (wrapper?.method === "session/update" && wrapper.params?.sessionId && wrapper.params.update) {
         this.handlers.onUpdate?.(wrapper.params.sessionId, wrapper.params.update);
       }
@@ -191,7 +190,9 @@ export class AcpClient {
     let result: unknown;
     try {
       if (method === "session/request_permission") {
-        result = await this.handlers.onPermission?.(params as AcpPermissionRequest) ?? { outcome: { outcome: "cancelled" } };
+        result = (await this.handlers.onPermission?.(params as AcpPermissionRequest)) ?? {
+          outcome: { outcome: "cancelled" },
+        };
       } else if (method === "x.ai/ask_user_question") {
         const q = (params as { question: string }).question ?? "";
         const answer = await this.handlers.onAskUser?.(q);
@@ -200,7 +201,11 @@ export class AcpClient {
         result = {};
       }
     } catch (err) {
-      this.sendRaw({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: err instanceof Error ? err.message : String(err) } });
+      this.sendRaw({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+      });
       return;
     }
     this.sendRaw({ jsonrpc: "2.0", id: msg.id, result });

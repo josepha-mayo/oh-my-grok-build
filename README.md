@@ -110,6 +110,19 @@ MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
 > profiles) is **generated** — treat it as read-only. Prefer editing per-crate
 > `Cargo.toml` files.
 
+## Skills
+
+The `plugin/skills/` directory contains Grok Build skill definitions used by the `oh-my-grok-build` harness:
+
+| Skill | Purpose |
+|-------|---------|
+| `auto-commit` | Create safe, conventional git commits. |
+| `review` | Review code for correctness, security, and style. |
+| `goal` | Plan and track multi-step objectives. |
+| `clarify` | Ask a focused question when uncertain. |
+| `todo` | Create, list, complete, and delete tasks in `~/.omgb/todo.json`. |
+| `memory` | Read and update a bounded `~/.omgb/MEMORY.md` memory file. |
+
 ## Development
 
 ```sh

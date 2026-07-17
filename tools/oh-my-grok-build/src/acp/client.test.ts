@@ -66,7 +66,10 @@ describe("AcpClient", () => {
       JSON.stringify({
         jsonrpc: "2.0",
         method: "session/update",
-        params: { sessionId: "s1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } } },
+        params: {
+          sessionId: "s1",
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } },
+        },
       })
     );
     assert.strictEqual(updates.length, 1);
@@ -85,7 +88,11 @@ describe("AcpClient", () => {
       jsonrpc: "2.0",
       id: 5,
       method: "session/request_permission",
-      params: { sessionId: "s1", toolCall: { toolCallId: "tc1", title: "Run ls" }, options: [{ optionId: "allow", name: "Allow" }] },
+      params: {
+        sessionId: "s1",
+        toolCall: { toolCallId: "tc1", title: "Run ls" },
+        options: [{ optionId: "allow", name: "Allow" }],
+      },
     };
     socket.receive(JSON.stringify(request));
     await new Promise((r) => setTimeout(r, 10));

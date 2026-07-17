@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "format": "prettier --write src/**/*.{ts,tsx} src/**/*.css",
+    "format:check": "prettier --check src/**/*.{ts,tsx} src/**/*.css",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "sync": "capacitor sync",
@@ -27,6 +29,7 @@
     "@types/react": "^19.0.12",
     "@types/react-dom": "^19.0.4",
     "@vitejs/plugin-react": "^4.3.4",
+    "prettier": "^3.9.5",
     "typescript": "^5.8.0",
     "vite": "^6.1.0"
   }

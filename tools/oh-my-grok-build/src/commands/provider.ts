@@ -22,9 +22,10 @@ export async function providerAddCommand(interactive = true, presetId?: string):
     const template = getProviderTemplate(templateId ?? "custom-openai");
     if (!template) throw new Error(`Unknown provider template: ${templateId}`);
 
-    const id = templateId === "custom-openai" || templateId === undefined
-      ? (await rl.question("Provider id (e.g. my-corp): ")).trim()
-      : templateId;
+    const id =
+      templateId === "custom-openai" || templateId === undefined
+        ? (await rl.question("Provider id (e.g. my-corp): ")).trim()
+        : templateId;
 
     const baseUrl = template.baseUrl
       ? template.baseUrl
@@ -36,7 +37,9 @@ export async function providerAddCommand(interactive = true, presetId?: string):
 
     let apiKey: string | undefined;
     if (template.apiKeyLabel) {
-      const key = await rl.question(`${template.apiKeyLabel}${template.id === "ollama" || template.id === "lmstudio" ? " (optional)" : ""}: `);
+      const key = await rl.question(
+        `${template.apiKeyLabel}${template.id === "ollama" || template.id === "lmstudio" ? " (optional)" : ""}: `
+      );
       apiKey = key.trim() || undefined;
     }
 
@@ -73,7 +76,7 @@ export async function providerListCommand(): Promise<void> {
     console.log(`    model:   ${p.model}`);
     console.log(`    base:    ${p.baseUrl}`);
     console.log(`    backend: ${p.apiBackend ?? "chat_completions"}`);
-    console.log(`    envKey:  ${Array.isArray(p.envKey) ? p.envKey.join(", ") : p.envKey ?? "none"}`);
+    console.log(`    envKey:  ${Array.isArray(p.envKey) ? p.envKey.join(", ") : (p.envKey ?? "none")}`);
     console.log("");
   }
 }
@@ -89,7 +92,11 @@ export async function providerDefaultCommand(id: string): Promise<void> {
 }
 
 function sanitizeModelId(id: string): string {
-  return id.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return id
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
 }
 
 export async function providerDiscoverCommand(): Promise<void> {

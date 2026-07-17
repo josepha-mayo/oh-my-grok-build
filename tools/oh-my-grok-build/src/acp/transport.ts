@@ -87,7 +87,10 @@ function getGlobalWebSocket(): WebSocketConstructor {
 /**
  * Node-only transport using the `ws` package with custom headers.
  */
-export async function createNodeWebSocketTransport(url: string, headers: Record<string, string>): Promise<AcpTransport> {
+export async function createNodeWebSocketTransport(
+  url: string,
+  headers: Record<string, string>
+): Promise<AcpTransport> {
   const { default: WebSocket } = await import("ws");
   return createWebSocketTransport(url, {
     createWs: (u) => new WebSocket(u, { headers }) as unknown as WebSocketLike,

@@ -28,7 +28,10 @@ afterEach(() => {
 });
 
 function startMockServer(
-  handler: (req: { url?: string }, res: { writeHead: (code: number, headers?: Record<string, string>) => void; end: (data?: string) => void }) => void
+  handler: (
+    req: { url?: string },
+    res: { writeHead: (code: number, headers?: Record<string, string>) => void; end: (data?: string) => void }
+  ) => void
 ): Promise<{ baseUrl: string; close: () => Promise<void> }> {
   return new Promise((resolve, reject) => {
     const server = createServer((req, res) => handler(req, res));

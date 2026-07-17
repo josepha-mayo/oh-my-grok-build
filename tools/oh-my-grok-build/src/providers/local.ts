@@ -34,10 +34,7 @@ async function listModelsAt(baseUrl: string): Promise<string[]> {
 export async function discoverLocalModels(
   baseUrls: { ollama?: string; lmstudio?: string } = {}
 ): Promise<{ provider: "ollama" | "lmstudio"; models: string[] }[]> {
-  const [ollama, lmstudio] = await Promise.all([
-    probeOllama(baseUrls.ollama),
-    probeLmStudio(baseUrls.lmstudio),
-  ]);
+  const [ollama, lmstudio] = await Promise.all([probeOllama(baseUrls.ollama), probeLmStudio(baseUrls.lmstudio)]);
   const found: { provider: "ollama" | "lmstudio"; models: string[] }[] = [];
   if (ollama.length) found.push({ provider: "ollama", models: ollama });
   if (lmstudio.length) found.push({ provider: "lmstudio", models: lmstudio });
