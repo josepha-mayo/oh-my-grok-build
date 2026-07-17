@@ -1,5 +1,7 @@
 import type { AcpMessage, AcpPermissionRequest, AcpPermissionResponse, AcpPromptPart, AcpUpdate } from "../types.js";
 
+export type { AcpPermissionRequest, AcpPermissionResponse };
+
 export interface AcpTransport {
   send(message: string): void;
   close(): void;
@@ -69,21 +71,25 @@ export class AcpClient {
     });
   }
 
-  async initialize(protocolVersion = 1, capabilities: Record<string, unknown> = {}): Promise<unknown> {
-    const result = await this.request("initialize", { protocolVersion, clientCapabilities: capabilities });
+  async initialize(protocolVersion = 1, capabilities: Record<string, unknown> = {}, timeoutMs = 120_000): Promise<unknown> {
+    const result = await this.request("initialize", { protocolVersion, clientCapabilities: capabilities }, timeoutMs);
     this.initialized = true;
     return result;
   }
 
-  async newSession(cwd: string, mcpServers: unknown[] = [], meta: Record<string, unknown> = {}): Promise<{ sessionId: string }> {
+  async newSession(
+    cwd: string,
+    mcpServers: unknown[] = [],
+    meta: Record<string, unknown> = {},
+    timeoutMs = 120_000
+  ): Promise<{ sessionId: string }> {
     const params: Record<string, unknown> = { cwd, mcpServers };
     if (Object.keys(meta).length) params._meta = meta;
-    const result = (await this.request("session/new", params)) as { sessionId: string };
-    return result;
+    return (await this.request("session/new", params, timeoutMs)) as { sessionId: string };
   }
 
-  async prompt(sessionId: string, prompt: AcpPromptPart[]): Promise<unknown> {
-    return this.request("session/prompt", { sessionId, prompt });
+  async prompt(sessionId: string, prompt: AcpPromptPart[], timeoutMs = 120_000): Promise<unknown> {
+    return this.request("session/prompt", { sessionId, prompt }, timeoutMs);
   }
 
   close(): void {

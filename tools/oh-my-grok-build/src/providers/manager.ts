@@ -86,7 +86,8 @@ export async function setDefaultProvider(id: string): Promise<void> {
 }
 
 export async function writeApiKeyToEnv(providerId: string, key: string): Promise<void> {
-  const omgDir = join(homedir(), ".omgb");
+  const { getOmgDir } = await import("../config.js");
+  const omgDir = getOmgDir();
   await mkdir(omgDir, { recursive: true });
   const envPath = join(omgDir, ".env");
   const varName = `OMGB_${providerId.replace(/-/g, "_").toUpperCase()}_API_KEY`;

@@ -4,9 +4,6 @@ import { homedir } from "node:os";
 import { parse, stringify } from "smol-toml";
 import type { OmgConfig, ProviderConfig } from "./types.js";
 
-const OMG_DIR = join(homedir(), ".omgb");
-const OMG_CONFIG = join(OMG_DIR, "config.json");
-
 export function getGrokHome(): string {
   return process.env.GROK_HOME ?? join(homedir(), ".grok");
 }
@@ -16,17 +13,22 @@ export function getGrokConfigPath(): string {
 }
 
 export function getOmgDir(): string {
-  return OMG_DIR;
+  return process.env.OMGB_HOME ? join(process.env.OMGB_HOME) : join(homedir(), ".omgb");
+}
+
+export function getOmgConfigPath(): string {
+  return join(getOmgDir(), "config.json");
 }
 
 export async function ensureOmgDir(): Promise<void> {
-  await mkdir(OMG_DIR, { recursive: true });
+  await mkdir(getOmgDir(), { recursive: true });
 }
 
 export async function loadOmgConfig(): Promise<OmgConfig> {
+  const path = getOmgConfigPath();
   await ensureOmgDir();
   try {
-    const raw = await readFile(OMG_CONFIG, "utf8");
+    const raw = await readFile(path, "utf8");
     return JSON.parse(raw) as OmgConfig;
   } catch {
     return { providers: {} };
@@ -35,7 +37,7 @@ export async function loadOmgConfig(): Promise<OmgConfig> {
 
 export async function saveOmgConfig(config: OmgConfig): Promise<void> {
   await ensureOmgDir();
-  await writeFile(OMG_CONFIG, JSON.stringify(config, null, 2));
+  await writeFile(getOmgConfigPath(), JSON.stringify(config, null, 2));
 }
 
 export async function loadGrokConfig(): Promise<Record<string, unknown>> {
