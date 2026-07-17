@@ -1,0 +1,24 @@
+{
+  "name": "oh-my-grok-build",
+  "version": "0.1.0",
+  "description": "Productivity and orchestration layer for Grok Build",
+  "bin": {
+    "omgb": "./dist/index.js",
+    "oh-my-grok-build": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "dev": "node --watch dist/index.js",
+    "test": "node --test dist/**/*.test.js"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.5.0"
+  },
+  "type": "module"
+}

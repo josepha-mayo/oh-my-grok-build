@@ -1,0 +1,7 @@
+{
+  "name": "oh-my-grok-build",
+  "version": "0.1.0",
+  "description": "Productivity layer for Grok Build: auto-commit, safety hooks, review skills, and team orchestration helpers.",
+  "author": "josepha-mayo",
+  "license": "Apache-2.0"
+}

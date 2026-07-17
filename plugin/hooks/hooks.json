@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "run_terminal_cmd",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node bin/safe-shell-guard.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "search_replace",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node bin/after-edit.js",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
