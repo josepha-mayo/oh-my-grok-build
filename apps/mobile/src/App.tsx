@@ -90,8 +90,8 @@ export default function App() {
       clientRef.current = client;
 
       try {
-        await client.initialize(1, { terminal: true, fs_read: true, fs_write: false });
-        const { sessionId: sid } = await client.newSession("/", [], { yoloMode: yolo });
+        await client.initialize(1, { terminal: true, fs: { readTextFile: true, writeTextFile: false } }, 30_000);
+        const { sessionId: sid } = await client.newSession("/", [], { yoloMode: yolo, modelId: model }, 60_000);
         setSessionId(sid);
         setView("chat");
       } catch (err) {

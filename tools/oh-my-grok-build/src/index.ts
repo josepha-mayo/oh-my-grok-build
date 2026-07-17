@@ -33,6 +33,7 @@ program
   .command("connect <url>")
   .description("Connect to a Grok agent server as a CLI client")
   .option("--cwd <cwd>", "Working directory")
+  .option("-m, --model <model>", "Model to use for this session")
   .option("--yolo", "Auto-approve tool calls")
   .action(async (url, options) => {
     await connectCommand({ url, ...options });

@@ -41,10 +41,22 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
     },
   });
 
-  await client.initialize(1, { terminal: true, fs_read: true, fs_write: false });
+  await client.initialize(
+    1,
+    {
+      terminal: true,
+      fs: { readTextFile: true, writeTextFile: false },
+    },
+    30_000
+  );
 
   const cwd = options.cwd ?? process.cwd();
-  const session = await client.newSession(cwd, [], { yoloMode: options.yolo ?? false });
+  const session = await client.newSession(
+    cwd,
+    [],
+    { yoloMode: options.yolo ?? false, modelId: options.model },
+    60_000
+  );
   console.log(chalk.dim(`Session: ${session.sessionId}\n`));
 
   while (true) {

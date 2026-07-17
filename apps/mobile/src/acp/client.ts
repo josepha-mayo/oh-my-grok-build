@@ -89,18 +89,27 @@ export class AcpClient {
     this.ws.close();
   }
 
-  async initialize(protocolVersion = 1, capabilities: Record<string, unknown> = {}): Promise<unknown> {
-    return this.request("initialize", { protocolVersion, clientCapabilities: capabilities });
+  async initialize(
+    protocolVersion = 1,
+    capabilities: Record<string, unknown> = {},
+    timeoutMs = 120_000
+  ): Promise<unknown> {
+    return this.request("initialize", { protocolVersion, clientCapabilities: capabilities }, timeoutMs);
   }
 
-  async newSession(cwd: string, mcpServers: unknown[] = [], meta: Record<string, unknown> = {}): Promise<{ sessionId: string }> {
+  async newSession(
+    cwd: string,
+    mcpServers: unknown[] = [],
+    meta: Record<string, unknown> = {},
+    timeoutMs = 120_000
+  ): Promise<{ sessionId: string }> {
     const params: Record<string, unknown> = { cwd, mcpServers };
     if (Object.keys(meta).length) params._meta = meta;
-    return (await this.request("session/new", params)) as { sessionId: string };
+    return (await this.request("session/new", params, timeoutMs)) as { sessionId: string };
   }
 
-  async prompt(sessionId: string, prompt: AcpPromptPart[]): Promise<unknown> {
-    return this.request("session/prompt", { sessionId, prompt });
+  async prompt(sessionId: string, prompt: AcpPromptPart[], timeoutMs = 120_000): Promise<unknown> {
+    return this.request("session/prompt", { sessionId, prompt }, timeoutMs);
   }
 
   sendRaw(message: AcpMessage): void {
