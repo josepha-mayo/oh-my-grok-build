@@ -1,105 +1,124 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { runGrok, runGrokOnce } from "./grok.js";
-import { startRelay } from "./server.js";
-import { getTaste, listTaste, removeTaste, setTaste, learnFromSession } from "./taste.js";
-import { listSessions } from "./session.js";
-import { runTeam, streamTeam } from "./team.js";
-import type { GrokEvent } from "./types.js";
+import chalk from "chalk";
+import { serveCommand } from "./commands/serve.js";
+import { connectCommand } from "./commands/connect.js";
+import { providerAddCommand, providerListCommand, providerRemoveCommand, providerDefaultCommand } from "./commands/provider.js";
+import { modelCommand, modelsCommand } from "./commands/model.js";
+import { execCommand } from "./commands/exec.js";
+import { teamCommand } from "./commands/team.js";
 
-const program = new Command("omgb").description("Oh My Grok Build — productivity layer for grok").version("0.1.0");
+const program = new Command();
+
+program
+  .name("omgb")
+  .description("Productivity and orchestration layer for Grok Build")
+  .version("0.1.0");
 
 program
   .command("serve")
-  .description("Start the mobile/remote relay server")
-  .option("-p, --port <port>", "relay port", "3001")
-  .action((opts) => startRelay(Number(opts.port)));
+  .description("Start the Grok Build agent server and print a mobile pairing QR code")
+  .option("-b, --bind <addr>", "Bind address", "0.0.0.0")
+  .option("-p, --port <port>", "Port (0 for auto)", parseInt, 0)
+  .option("-s, --secret <secret>", "Server secret")
+  .option("--cwd <cwd>", "Working directory")
+  .option("-m, --model <model>", "Model to use")
+  .option("--yolo", "Auto-approve tool calls")
+  .option("--no-qr", "Do not print QR code")
+  .action(async (options) => {
+    await serveCommand({ ...options, qr: options.qr !== false });
+  });
+
+program
+  .command("connect <url>")
+  .description("Connect to a Grok agent server as a CLI client")
+  .option("--cwd <cwd>", "Working directory")
+  .option("--yolo", "Auto-approve tool calls")
+  .action(async (url, options) => {
+    await connectCommand({ url, ...options });
+  });
+
+program
+  .command("provider")
+  .description("Manage BYOK model providers")
+  .addCommand(
+    new Command("add")
+      .description("Add a new provider")
+      .argument("[preset]", "Provider preset id")
+      .action(async (preset) => {
+        await providerAddCommand(true, preset);
+      })
+  )
+  .addCommand(
+    new Command("list")
+      .alias("ls")
+      .description("List configured providers")
+      .action(async () => {
+        await providerListCommand();
+      })
+  )
+  .addCommand(
+    new Command("remove")
+      .alias("rm")
+      .description("Remove a provider")
+      .argument("<id>")
+      .action(async (id) => {
+        await providerRemoveCommand(id);
+      })
+  )
+  .addCommand(
+    new Command("default")
+      .description("Set the default provider")
+      .argument("<id>")
+      .action(async (id) => {
+        await providerDefaultCommand(id);
+      })
+  );
+
+program
+  .command("model [model]")
+  .description("Set or show the default model")
+  .action(async (model) => {
+    await modelCommand(model);
+  });
+
+program
+  .command("models")
+  .description("List configured models")
+  .action(async () => {
+    await modelsCommand();
+  });
 
 program
   .command("exec <prompt>")
-  .description("Run a single headless grok prompt")
-  .option("-m, --model <model>", "model override")
-  .option("--yolo", "auto-approve tools", false)
-  .option("-c, --cwd <cwd>", "working directory")
-  .option("-s, --stream", "stream output", false)
-  .option("-r, --resume <id>", "resume session id")
-  .action(async (prompt, opts) => {
-    if (opts.stream) {
-      const child = runGrok(prompt, {
-        cwd: opts.cwd,
-        model: opts.model,
-        yolo: opts.yolo,
-        resume: opts.resume,
-        outputFormat: "streaming-json",
-      });
-      child.on("event", (ev: GrokEvent) => console.log(JSON.stringify(ev)));
-      child.on("end", () => process.exit(0));
-    } else {
-      const out = await runGrokOnce(prompt, { cwd: opts.cwd, model: opts.model, yolo: opts.yolo, resume: opts.resume });
-      console.log(out);
-    }
-  });
-
-const taste = program.command("taste").description("Manage taste packages");
-
-taste
-  .command("list")
-  .description("List taste packages")
-  .action(() => console.log(JSON.stringify(listTaste(), null, 2)));
-
-taste
-  .command("show <name>")
-  .description("Show a taste package")
-  .action((name) => {
-    const pkg = getTaste(name);
-    if (!pkg) { console.error(`Taste package ${name} not found`); process.exit(1); }
-    console.log(JSON.stringify(pkg, null, 2));
-  });
-
-taste
-  .command("set")
-  .description("Set a taste package from stdin")
-  .action(async () => {
-    const stdin = await readStdin();
-    setTaste(JSON.parse(stdin));
-  });
-
-taste
-  .command("rm <name>")
-  .description("Remove a taste package")
-  .action((name) => removeTaste(name));
-
-taste
-  .command("learn <sessionDir>")
-  .description("Derive taste from a Grok session directory")
-  .action((sessionDir) => console.log(JSON.stringify(learnFromSession(sessionDir), null, 2)));
-
-program
-  .command("team <prompt>")
-  .description("Run the same prompt through N grok agents in parallel")
-  .option("-n, --agents <n>", "number of agents", "3")
-  .option("-m, --model <model>", "model override")
-  .option("--yolo", "auto-approve tools", false)
-  .option("-c, --cwd <cwd>")
-  .action(async (prompt, opts) => {
-    const n = Number(opts.agents);
-    const gen = streamTeam(prompt, { cwd: opts.cwd, model: opts.model, yolo: opts.yolo, agents: n });
-    for await (const ev of gen) {
-      console.log(JSON.stringify(ev));
-    }
+  .description("Run a single headless Grok prompt")
+  .option("-m, --model <model>", "Model to use")
+  .option("--yolo", "Auto-approve tool calls")
+  .option("--max-turns <n>", "Maximum agent turns", parseInt)
+  .action(async (prompt, options) => {
+    await execCommand({ prompt, ...options });
   });
 
 program
-  .command("sessions")
-  .description("List recent Grok sessions")
-  .option("-l, --limit <limit>", "limit", "20")
-  .action((opts) => console.log(JSON.stringify(listSessions(Number(opts.limit)), null, 2)));
+  .command("team <count> <prompt>")
+  .description("Spawn N Grok workers with the same prompt")
+  .option("-m, --model <model>", "Model to use")
+  .option("--yolo", "Auto-approve tool calls")
+  .action(async (count: string, prompt: string, options) => {
+    await teamCommand({ count: parseInt(count, 10), prompt, ...options });
+  });
 
-program.parse();
+program.hook("postAction", () => {
+  // Ensure async errors are not swallowed.
+});
 
-async function readStdin(): Promise<string> {
-  let data = "";
-  process.stdin.setEncoding("utf8");
-  for await (const chunk of process.stdin) data += chunk;
-  return data;
+async function main() {
+  try {
+    await program.parseAsync(process.argv);
+  } catch (err) {
+    console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
 }
+
+main();
