@@ -1,4 +1,5 @@
 import readline from "node:readline/promises";
+import type { Readable as ReadableStream, Writable as WritableStream } from "node:stream";
 import chalk from "chalk";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
@@ -10,6 +11,9 @@ export interface ConnectOptions {
   cwd?: string;
   yolo?: boolean;
   model?: string;
+  input?: ReadableStream;
+  output?: WritableStream;
+  exit?: (code: number) => void;
 }
 
 export async function connectCommand(options: ConnectOptions): Promise<void> {
@@ -20,10 +24,11 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
 
   const transport = await createNodeWebSocketTransport(options.url, {});
 
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  const input = options.input ?? process.stdin;
+  const output = options.output ?? process.stdout;
+  const exit = options.exit ?? ((code: number) => process.exit(code));
+
+  const rl = readline.createInterface({ input, output });
 
   const client = new AcpClient(transport, {
     onUpdate: (_sessionId, update) => renderUpdate(update),
@@ -36,7 +41,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
     onClose: () => {
       console.log(chalk.dim("\nConnection closed."));
       rl.close();
-      process.exit(0);
+      exit(0);
     },
   });
 

@@ -7,16 +7,6 @@ import { connectCommand } from "./connect.js";
 import { setupOmgHome, cleanupOmgHome } from "../test-utils.js";
 
 let tempDir: string;
-let originalStdin: typeof process.stdin;
-let originalExit: typeof process.exit;
-
-function setProcessStdin(value: typeof process.stdin) {
-  Object.defineProperty(process, "stdin", { value, configurable: true });
-}
-
-function setProcessExit(value: typeof process.exit) {
-  Object.defineProperty(process, "exit", { value, configurable: true });
-}
 
 describe("connect command", () => {
   beforeEach(() => {
@@ -24,8 +14,6 @@ describe("connect command", () => {
   });
 
   afterEach(() => {
-    if (originalStdin) setProcessStdin(originalStdin);
-    if (originalExit) setProcessExit(originalExit);
     cleanupOmgHome(tempDir);
   });
 
@@ -56,15 +44,19 @@ describe("connect command", () => {
       });
     });
 
-    originalStdin = process.stdin;
-    originalExit = process.exit;
-    const stdin = new PassThrough();
-    setProcessStdin(stdin as any);
-    setProcessExit((() => {}) as any);
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const exit = (code: number) => output.write(`exit:${code}\n`);
 
     try {
-      setTimeout(() => stdin.write("/quit\n"), 100);
-      await connectCommand({ url: `${urlBase}/ws?server-key=test` });
+      // Give the command time to reach the readline prompt before sending /quit.
+      setTimeout(() => input.write("/quit\n"), 500);
+      await connectCommand({
+        url: `${urlBase}/ws?server-key=test`,
+        input,
+        output,
+        exit,
+      });
     } finally {
       wss.clients.forEach((client) => client.close());
       await new Promise<void>((resolve) => wss.close(() => resolve()));
