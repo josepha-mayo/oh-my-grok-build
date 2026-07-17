@@ -1,14 +1,88 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { AcpClient, type AcpPermissionRequest, type AcpUpdate, type AcpPermissionResponse } from "./acp/client";
 import { ConnectionScreen } from "./components/ConnectionScreen";
 import { ChatScreen, type Message } from "./components/ChatScreen";
+import type { ToolOutputData } from "./components/ToolOutput";
 import "./App.css";
 
 type View = "connect" | "chat";
+type ConnectionStatus = "connecting" | "connected" | "disconnected";
+
+const CONNECTIONS_KEY = "omgb:connections";
+
+function loadLastUrl(): string {
+  try {
+    const raw = localStorage.getItem(CONNECTIONS_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const first = parsed[0] as { url?: string };
+      return first.url ?? "";
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+function saveConnection(url: string) {
+  try {
+    const raw = localStorage.getItem(CONNECTIONS_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    const list = Array.isArray(parsed)
+      ? (parsed as { url?: string; name?: string }[]).filter((c): c is { url: string; name?: string } => typeof c.url === "string")
+      : [];
+    const without = list.filter((c) => c.url !== url);
+    const next = [{ url, name: url }, ...without].slice(0, 20);
+    localStorage.setItem(CONNECTIONS_KEY, JSON.stringify(next));
+  } catch {
+    // ignore
+  }
+}
+
+function getText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content && typeof content === "object") {
+    const c = content as { text?: string };
+    return c.text ?? "";
+  }
+  return "";
+}
+
+function parseToolOutput(raw: unknown): ToolOutputData | undefined {
+  if (raw == null) return undefined;
+
+  let parsed: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { text: raw };
+    }
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    return { text: String(raw) };
+  }
+
+  const o = parsed as Record<string, unknown>;
+  const out: ToolOutputData = {};
+
+  if (typeof o.terminal === "string") out.terminal = o.terminal;
+  if (typeof o.text === "string") out.text = o.text;
+  if ("diff" in o) out.diff = o.diff as ToolOutputData["diff"];
+  if (typeof o.image === "string") out.image = o.image;
+  if (typeof o.screenshot === "string") out.screenshot = o.screenshot;
+
+  if (!out.terminal && !out.diff && !out.image && !out.screenshot && !out.text) {
+    out.text = JSON.stringify(o, null, 2);
+  }
+
+  return out;
+}
 
 export default function App() {
   const [view, setView] = useState<View>("connect");
-  const [url, setUrl] = useState("");
+  const [url, setUrl] = useState(loadLastUrl);
   const [sessionId, setSessionId] = useState("");
   const [model, setModel] = useState("grok-build");
   const [yolo, setYolo] = useState(false);
@@ -16,9 +90,17 @@ export default function App() {
   const [thinking, setThinking] = useState(false);
   const [permission, setPermission] = useState<AcpPermissionRequest | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("disconnected");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
 
   const clientRef = useRef<AcpClient | null>(null);
   const permissionResolver = useRef<((value: AcpPermissionResponse) => void) | null>(null);
+  const closingRef = useRef(false);
+
+  useEffect(() => {
+    // Reset close flag on mount so disconnect-to-reconnect cycles behave.
+    closingRef.current = false;
+  }, []);
 
   const appendMessage = useCallback((role: Message["role"], update?: Partial<Message>) => {
     setMessages((prev) => {
@@ -36,25 +118,35 @@ export default function App() {
     (_sessionId: string, update: AcpUpdate) => {
       switch (update.sessionUpdate) {
         case "agent_message_chunk": {
-          const text = (update.content as { text?: string } | undefined)?.text ?? "";
-          appendMessage("agent", { text });
+          appendMessage("agent", { text: getText(update.content) });
           break;
         }
-        case "tool_call":
+        case "agent_thought_chunk": {
+          appendMessage("thought", { text: getText(update.content) });
+          break;
+        }
+        case "tool_call": {
           appendMessage("agent", { tool: { title: update.title ?? "tool", status: "running" }, text: "" });
           break;
-        case "tool_call_update":
+        }
+        case "tool_call_update": {
+          const output = parseToolOutput(update.output ?? update.content);
           setMessages((prev) => {
             const next = [...prev];
             const lastTool = [...next].reverse().find((m) => m.tool);
-            if (lastTool?.tool) lastTool.tool.status = update.status ?? lastTool.tool.status;
+            if (lastTool?.tool) {
+              lastTool.tool.status = update.status ?? lastTool.tool.status;
+              if (output) lastTool.tool.output = output;
+            }
             return next;
           });
           break;
+        }
         case "turn_completed":
-        case "stop":
+        case "stop": {
           setThinking(false);
           break;
+        }
       }
     },
     [appendMessage]
@@ -73,42 +165,8 @@ export default function App() {
     permissionResolver.current = null;
   }, []);
 
-  const onConnect = useCallback(
-    async (connectUrl: string) => {
-      setError(null);
-      setUrl(connectUrl);
-      setMessages([]);
-
-      const client = new AcpClient(connectUrl, {
-        onOpen: () => {},
-        onClose: () => setError("Connection closed"),
-        onError: (err) => setError(err.message),
-        onUpdate: handleUpdate,
-        onPermission: handlePermission,
-      });
-
-      clientRef.current = client;
-
-      try {
-        await client.initialize(1, { terminal: true, fs: { readTextFile: true, writeTextFile: false } }, 30_000);
-        const { sessionId: sid } = await client.newSession("/", [], { yoloMode: yolo, modelId: model }, 60_000);
-        setSessionId(sid);
-        setView("chat");
-      } catch (err) {
-        client.close();
-        setError(err instanceof Error ? err.message : String(err));
-      }
-    },
-    [handleUpdate, handlePermission, yolo]
-  );
-
-  const onDisconnect = useCallback(() => {
-    clientRef.current?.close();
-    clientRef.current = null;
-    setView("connect");
-    setSessionId("");
-    setMessages([]);
-    setPermission(null);
+  const handleModelsUpdate = useCallback((models: string[]) => {
+    setAvailableModels((prev) => Array.from(new Set([...prev, ...models])));
   }, []);
 
   const onSend = useCallback(
@@ -168,6 +226,82 @@ export default function App() {
     [sessionId, appendMessage]
   );
 
+  const handleModelChange = useCallback(
+    (modelId: string) => {
+      setModel(modelId);
+      appendMessage("agent", { text: `Model preference set to ${modelId}.` });
+    },
+    [appendMessage]
+  );
+
+  const connect = useCallback(
+    async (connectUrl: string, switchView = true, clearHistory = true) => {
+      setError(null);
+      closingRef.current = false;
+      clientRef.current?.close();
+      clientRef.current = null;
+      setUrl(connectUrl);
+      if (clearHistory) setMessages([]);
+      setPermission(null);
+      setConnectionStatus("connecting");
+
+      const client = new AcpClient(connectUrl, {
+        onOpen: () => setConnectionStatus("connected"),
+        onClose: () => {
+          setConnectionStatus("disconnected");
+          if (!closingRef.current) setError("Connection closed");
+        },
+        onError: (err) => {
+          setConnectionStatus("disconnected");
+          setError(err.message);
+        },
+        onUpdate: handleUpdate,
+        onPermission: handlePermission,
+        onModelsUpdate: handleModelsUpdate,
+      });
+      clientRef.current = client;
+
+      try {
+        await client.initialize(1, { terminal: true, fs: { readTextFile: true, writeTextFile: false } }, 30_000);
+        const { sessionId: sid } = await client.newSession("/", [], { yoloMode: yolo, modelId: model }, 60_000);
+        setSessionId(sid);
+        setConnectionStatus("connected");
+        if (switchView) setView("chat");
+        saveConnection(connectUrl);
+      } catch (err) {
+        closingRef.current = true;
+        client.close();
+        setConnectionStatus("disconnected");
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [handleUpdate, handlePermission, handleModelsUpdate, yolo, model]
+  );
+
+  const onConnect = useCallback(
+    (connectUrl: string) => {
+      void connect(connectUrl, true, true);
+    },
+    [connect]
+  );
+
+  const onDisconnect = useCallback(() => {
+    closingRef.current = true;
+    clientRef.current?.close();
+    clientRef.current = null;
+    setView("connect");
+    setSessionId("");
+    setMessages([]);
+    setPermission(null);
+    setError(null);
+    setThinking(false);
+    setConnectionStatus("disconnected");
+  }, []);
+
+  const onReconnect = useCallback(() => {
+    void connect(url, false, false);
+  }, [connect, url]);
+
   if (view === "connect") {
     return (
       <div className="app">
@@ -186,10 +320,14 @@ export default function App() {
         messages={messages}
         thinking={thinking}
         permission={permission}
+        connectionStatus={connectionStatus}
+        availableModels={availableModels}
         onSend={onSend}
         onPermissionSelect={handlePermissionSelect}
         onDisconnect={onDisconnect}
-        onModelChange={setModel}
+        onReconnect={onReconnect}
+        onModelChange={handleModelChange}
+        onConnectSaved={onConnect}
         onYoloToggle={() => setYolo((v) => !v)}
         onClear={() => setMessages([])}
       />

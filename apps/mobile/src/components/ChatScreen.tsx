@@ -1,13 +1,16 @@
 import { useRef, useEffect, useState } from "react";
-import { ArrowLeft, Send, Command, Bot, User, Settings } from "lucide-react";
+import { ArrowLeft, Send, Command, Bot, User, Settings as SettingsIcon, Trash2, RefreshCw } from "lucide-react";
 import type { AcpPermissionRequest } from "../acp/client";
 import { PermissionCard } from "./PermissionCard";
+import { ToolOutput, type ToolOutputData } from "./ToolOutput";
+import { ModelPicker } from "./ModelPicker";
+import { Settings } from "./Settings";
 
 export interface Message {
   id: string;
-  role: "user" | "agent";
+  role: "user" | "agent" | "thought";
   text: string;
-  tool?: { title?: string; status?: string };
+  tool?: { title?: string; status?: string; output?: ToolOutputData };
 }
 
 interface ChatScreenProps {
@@ -17,10 +20,14 @@ interface ChatScreenProps {
   messages: Message[];
   thinking: boolean;
   permission: AcpPermissionRequest | null;
+  connectionStatus: "connecting" | "connected" | "disconnected";
+  availableModels: string[];
   onSend: (text: string) => void;
   onPermissionSelect: (optionId: string) => void;
   onDisconnect: () => void;
+  onReconnect: () => void;
   onModelChange: (model: string) => void;
+  onConnectSaved: (url: string) => void;
   onYoloToggle: () => void;
   onClear: () => void;
 }
@@ -42,13 +49,20 @@ export function ChatScreen({
   messages,
   thinking,
   permission,
+  connectionStatus,
+  availableModels,
   onSend,
   onPermissionSelect,
   onDisconnect,
+  onReconnect,
+  onModelChange,
+  onConnectSaved,
   onClear,
 }: ChatScreenProps) {
   const [input, setInput] = useState("");
   const [slashQuery, setSlashQuery] = useState("");
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -59,6 +73,13 @@ export function ChatScreen({
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
+  }, [input]);
 
   const submit = (text: string) => {
     if (!text.trim() || thinking) return;
@@ -91,9 +112,13 @@ export function ChatScreen({
       )
     : [];
 
-  const insertCommand = (id: string, args?: string) => {
-    setInput(`${id} ${args ? "" : ""}`);
+  const insertCommand = (id: string) => {
+    setInput(`${id} `);
     textareaRef.current?.focus();
+  };
+
+  const handleModelSelect = (m: string) => {
+    onModelChange(m);
   };
 
   return (
@@ -102,13 +127,26 @@ export function ChatScreen({
         <button onClick={onDisconnect} className="icon-button">
           <ArrowLeft size={22} />
         </button>
-        <div className="header-meta">
+
+        <button className="header-meta" onClick={() => setShowModelPicker(true)}>
+          <span className={`status-dot ${connectionStatus}`} />
           <span className="model-badge">{model}</span>
           {yolo ? <span className="yolo-badge">YOLO</span> : null}
-        </div>
-        <button className="icon-button" onClick={onClear} title="Clear chat">
-          <Settings size={22} />
         </button>
+
+        <div className="header-actions">
+          {connectionStatus === "disconnected" ? (
+            <button className="icon-button reconnect-button" onClick={onReconnect} title="Reconnect">
+              <RefreshCw size={20} />
+            </button>
+          ) : null}
+          <button className="icon-button" onClick={() => setShowSettings(true)} title="Settings">
+            <SettingsIcon size={20} />
+          </button>
+          <button className="icon-button" onClick={onClear} title="Clear chat">
+            <Trash2 size={20} />
+          </button>
+        </div>
       </header>
 
       <div className="chat-scroll" ref={scrollRef}>
@@ -119,15 +157,35 @@ export function ChatScreen({
             <p className="hint">Type a prompt or / command.</p>
           </div>
         )}
-        {messages.map((m) => (
-          <div key={m.id} className={`message ${m.role}`}>
-            <div className="message-avatar">{m.role === "user" ? <User size={16} /> : <Bot size={16} />}</div>
-            <div className="message-body">
-              {m.tool ? <div className="tool-pill">{m.tool.title} {m.tool.status ? `· ${m.tool.status}` : ""}</div> : null}
-              {m.text}
+
+        {messages.map((m) => {
+          if (m.role === "thought") {
+            return (
+              <details key={m.id} className="thinking-bubble">
+                <summary>Thinking</summary>
+                <pre>{m.text}</pre>
+              </details>
+            );
+          }
+
+          return (
+            <div key={m.id} className={`message ${m.role}`}>
+              <div className="message-avatar">{m.role === "user" ? <User size={16} /> : <Bot size={16} />}</div>
+              <div className="message-body">
+                {m.tool ? (
+                  <div className="tool-card">
+                    <div className="tool-pill">
+                      {m.tool.title} {m.tool.status ? `· ${m.tool.status}` : ""}
+                    </div>
+                    {m.tool.output ? <ToolOutput output={m.tool.output} /> : null}
+                  </div>
+                ) : null}
+                {m.text}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
+
         {thinking && <div className="typing-indicator">Grok is thinking…</div>}
       </div>
 
@@ -136,7 +194,7 @@ export function ChatScreen({
       {filteredCommands.length > 0 ? (
         <div className="slash-menu">
           {filteredCommands.map((c) => (
-            <button key={c.id} className="slash-item" onClick={() => insertCommand(c.id, c.args)}>
+            <button key={c.id} className="slash-item" onClick={() => insertCommand(c.id)}>
               <Command size={14} />
               <div>
                 <div className="slash-cmd">{c.id}</div>
@@ -160,6 +218,19 @@ export function ChatScreen({
           <Send size={20} />
         </button>
       </div>
+
+      {showModelPicker ? (
+        <ModelPicker
+          models={availableModels}
+          selected={model}
+          onSelect={handleModelSelect}
+          onClose={() => setShowModelPicker(false)}
+        />
+      ) : null}
+
+      {showSettings ? (
+        <Settings onClose={() => setShowSettings(false)} onConnect={onConnectSaved} currentUrl={url} />
+      ) : null}
     </div>
   );
 }

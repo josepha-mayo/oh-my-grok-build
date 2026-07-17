@@ -17,6 +17,7 @@ export interface AcpUpdate {
   title?: string;
   status?: string;
   stopReason?: string;
+  output?: unknown;
   [key: string]: unknown;
 }
 
@@ -48,6 +49,7 @@ export interface AcpHandlers {
   onUpdate?: (sessionId: string, update: AcpUpdate) => void;
   onPermission?: (req: AcpPermissionRequest) => Promise<AcpPermissionResponse>;
   onAskUser?: (question: string) => Promise<string | null>;
+  onModelsUpdate?: (models: string[]) => void;
   onError?: (err: Error) => void;
   onClose?: () => void;
   onOpen?: () => void;
@@ -166,6 +168,12 @@ export class AcpClient {
     if (msg.method === "session/update") {
       const p = (msg.params ?? {}) as { sessionId?: string; update?: AcpUpdate };
       if (p.sessionId && p.update) this.handlers.onUpdate?.(p.sessionId, p.update);
+      return;
+    }
+
+    if (msg.method === "x.ai/models/update") {
+      const p = (msg.params ?? {}) as { models?: string[] } | undefined;
+      if (p?.models?.length) this.handlers.onModelsUpdate?.(p.models);
       return;
     }
 
