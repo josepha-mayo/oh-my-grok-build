@@ -6,9 +6,11 @@ import { listProviderTemplates, getProviderTemplate } from "../providers/registr
 import { discoverLocalModels, testProvider } from "../providers/local.js";
 import type { ProviderConfig } from "../types.js";
 
-async function questionHidden(query: string): Promise<string> {
+async function questionHidden(rl: readline.Interface, query: string): Promise<string> {
   process.stdout.write(query);
-  const rl = readline.createInterface({
+  // Pause the main readline interface so it does not compete with the hidden one.
+  rl.pause();
+  const hidden = readline.createInterface({
     input: process.stdin,
     output: new Writable({
       write(_chunk, _encoding, callback) {
@@ -18,10 +20,11 @@ async function questionHidden(query: string): Promise<string> {
     terminal: true,
   });
   try {
-    const answer = await rl.question("");
+    const answer = await hidden.question("");
     return answer.trim();
   } finally {
-    rl.close();
+    hidden.close();
+    rl.resume();
     process.stdout.write("\n");
   }
 }
@@ -59,7 +62,7 @@ export async function providerAddCommand(interactive = true, presetId?: string):
     let apiKey: string | undefined;
     if (template.apiKeyLabel) {
       const suffix = template.id === "ollama" || template.id === "lmstudio" ? " (optional)" : "";
-      const key = await questionHidden(`${template.apiKeyLabel}${suffix}: `);
+      const key = await questionHidden(rl, `${template.apiKeyLabel}${suffix}: `);
       apiKey = key || undefined;
     }
 
