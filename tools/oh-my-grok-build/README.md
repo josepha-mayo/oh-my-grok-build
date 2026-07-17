@@ -4,14 +4,14 @@ A productivity and orchestration layer for [Grok Build](https://github.com/xai-o
 
 ## Features
 
-- **ACP relay**: `omgb serve` starts `grok agent serve`, generates a secret, and prints a QR code for the mobile app.
-- **BYOK providers**: `omgb provider add` wires OpenAI, Anthropic, xAI, OpenRouter, Ollama, LM Studio, and custom OpenAI-compatible endpoints into `~/.grok/config.toml`.
+- **ACP relay**: `omgb serve` starts a WebSocket bridge to `grok agent stdio`, generates a secret, and prints a QR code for the mobile app.
+- **BYOK providers**: `omgb provider add` wires OpenAI, Anthropic, xAI, OpenRouter, Ollama, LM Studio, and custom OpenAI-compatible endpoints into `~/.grok/config.toml` while keeping API keys in `~/.omgb/.env`.
 - **Local model discovery**: `omgb provider discover` finds Ollama/LM Studio models automatically.
 - **Interactive ACP client**: `omgb connect <url>` lets you chat with a running agent server from the terminal.
 - **Headless execution**: `omgb exec <prompt>` and `omgb team <count> <prompt>`.
 - **Background tasks**: `omgb loop` and `omgb schedule` for cron-style runs.
 - **Subagent orchestration**: `omgb subagent spawn/list/kill/logs`.
-- **Cross-harness connector**: (in progress) drive OpenCode, Codex, and Claude CLI from `omgb`.
+- **Cross-harness connector**: drive OpenCode, Codex, and Claude CLI from `omgb`.
 
 ## Install
 
@@ -38,6 +38,12 @@ omgb exec "refactor the auth module"
 omgb connect ws://host:port/ws?server-key=...
 ```
 
+## Security notes
+
+- API keys are stored in `~/.omgb/.env` and referenced by `env_key` in `~/.grok/config.toml`; they are never written to the Grok config.
+- The `omgb serve` QR code and URL contain the `server-key` secret; treat them like a password and do not share them.
+- Saved mobile connections strip the `server-key` query parameter; re-scan or re-enter the full pairing URL when reconnecting.
+
 ## Development
 
 ```bash
@@ -45,4 +51,5 @@ npm install
 npm run typecheck
 npm run build
 npm test
+npm run format:check
 ```

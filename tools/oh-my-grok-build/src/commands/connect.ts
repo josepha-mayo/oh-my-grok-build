@@ -18,8 +18,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
     throw new Error("URL must include a server-key query parameter, e.g. ws://host:port/ws?server-key=XYZ");
   }
 
-  const headers = { Authorization: `Bearer ${parsed.secret}` };
-  const transport = await createNodeWebSocketTransport(options.url, headers);
+  const transport = await createNodeWebSocketTransport(options.url, {});
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -41,14 +40,19 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
     },
   });
 
-  await client.initialize(
+  const init = await client.initialize(
     1,
     {
       terminal: true,
-      fs: { readTextFile: true, writeTextFile: false },
+      fs: { readTextFile: true, writeTextFile: true },
     },
     30_000
   );
+
+  const authMethod = init.authMethods?.find((m) => m.id === "xai.api_key") ?? init.authMethods?.[0];
+  if (authMethod) {
+    await client.authenticate(authMethod, 60_000);
+  }
 
   const cwd = options.cwd ?? process.cwd();
   const session = await client.newSession(cwd, [], { yoloMode: options.yolo ?? false, modelId: options.model }, 60_000);
@@ -57,9 +61,22 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
   while (true) {
     const line = await rl.question(chalk.bold("you> "));
     if (!line.trim()) continue;
-    if (line.trim() === "/quit" || line.trim() === "/exit") {
+    const trimmed = line.trim();
+    if (trimmed === "/quit" || trimmed === "/exit") {
       client.close();
       break;
+    }
+    if (trimmed.startsWith("/model ")) {
+      const modelId = trimmed.slice("/model ".length).trim();
+      if (modelId) {
+        try {
+          await client.setModel(session.sessionId, modelId);
+          console.log(chalk.dim(`Model set to ${modelId}`));
+        } catch (err) {
+          console.error(chalk.red(`Failed to set model: ${err instanceof Error ? err.message : String(err)}`));
+        }
+      }
+      continue;
     }
     try {
       await client.prompt(session.sessionId, [{ type: "text", text: line }]);

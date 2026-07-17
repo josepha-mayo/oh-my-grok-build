@@ -18,7 +18,7 @@ export const BUILT_IN_PROVIDERS: Record<string, ProviderTemplate> = {
     apiBackend: "responses",
     envKey: "OPENAI_API_KEY",
     apiKeyLabel: "OpenAI API key",
-    defaultModel: "gpt-5.5",
+    defaultModel: "gpt-4o",
     contextWindow: 200_000,
   },
   anthropic: {
@@ -27,7 +27,7 @@ export const BUILT_IN_PROVIDERS: Record<string, ProviderTemplate> = {
     apiBackend: "messages",
     envKey: "ANTHROPIC_API_KEY",
     apiKeyLabel: "Anthropic API key",
-    defaultModel: "claude-sonnet-4-6",
+    defaultModel: "claude-3-5-sonnet-20241022",
     extraHeaders: { "anthropic-version": "2023-06-01" },
     contextWindow: 200_000,
   },
@@ -37,7 +37,7 @@ export const BUILT_IN_PROVIDERS: Record<string, ProviderTemplate> = {
     apiBackend: "chat_completions",
     envKey: "XAI_API_KEY",
     apiKeyLabel: "xAI API key",
-    defaultModel: "grok-build",
+    defaultModel: "grok-2",
     contextWindow: 500_000,
   },
   openrouter: {
@@ -46,7 +46,7 @@ export const BUILT_IN_PROVIDERS: Record<string, ProviderTemplate> = {
     apiBackend: "chat_completions",
     envKey: "OPENROUTER_API_KEY",
     apiKeyLabel: "OpenRouter API key",
-    defaultModel: "anthropic/claude-sonnet-4",
+    defaultModel: "anthropic/claude-3.5-sonnet",
     extraHeaders: { "HTTP-Referer": "https://oh-my-grok.build", "X-Title": "oh-my-grok-build" },
     contextWindow: 200_000,
   },
@@ -74,7 +74,7 @@ export const BUILT_IN_PROVIDERS: Record<string, ProviderTemplate> = {
     apiBackend: "chat_completions",
     envKey: "TOGETHER_API_KEY",
     apiKeyLabel: "Together API key",
-    defaultModel: "deepseek-ai/deepseek-coder-33b-instruct",
+    defaultModel: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
     contextWindow: 128_000,
   },
   fireworks: {
@@ -92,7 +92,7 @@ export const BUILT_IN_PROVIDERS: Record<string, ProviderTemplate> = {
     apiBackend: "chat_completions",
     envKey: "GROQ_API_KEY",
     apiKeyLabel: "Groq API key",
-    defaultModel: "llama-3-70b-8192",
+    defaultModel: "llama-3.1-70b-versatile",
     contextWindow: 128_000,
   },
   "custom-openai": {

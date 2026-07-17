@@ -55,6 +55,15 @@ export function isRunning(pid: number): boolean {
   }
 }
 
+function sanitizeSubagentName(name: string): string {
+  const sanitized = name
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (!sanitized) throw new Error("Invalid subagent name");
+  return sanitized;
+}
+
 function setupWorktree(worktree: string): void {
   mkdirSync(subagentsDir(), { recursive: true });
 
@@ -79,13 +88,14 @@ export async function spawnSubagent(
   prompt: string,
   options: SpawnSubagentOptions = {}
 ): Promise<SubagentStatus> {
-  const worktree = join(subagentsDir(), name);
+  const safeName = sanitizeSubagentName(name);
+  const worktree = join(subagentsDir(), safeName);
   const logPath = join(worktree, "subagent.log");
 
   setupWorktree(worktree);
 
   const records = await loadRegistry();
-  const existing = records.findIndex((r) => r.name === name);
+  const existing = records.findIndex((r) => r.name === safeName);
   if (existing >= 0) records.splice(existing, 1);
 
   const logFd = openSync(logPath, "a");
@@ -104,7 +114,7 @@ export async function spawnSubagent(
   proc.unref();
 
   const record: SubagentRecord = {
-    name,
+    name: safeName,
     pid: proc.pid ?? 0,
     worktree,
     logPath,
@@ -127,15 +137,27 @@ export async function listSubagents(): Promise<SubagentStatus[]> {
 }
 
 export async function killSubagent(name: string): Promise<void> {
+  const safeName = sanitizeSubagentName(name);
   const records = await loadRegistry();
-  const idx = records.findIndex((r) => r.name === name);
-  if (idx === -1) throw new Error(`Subagent "${name}" not found`);
+  const idx = records.findIndex((r) => r.name === safeName);
+  if (idx === -1) throw new Error(`Subagent "${safeName}" not found`);
 
   const record = records[idx];
   try {
-    process.kill(record.pid, "SIGTERM");
+    if (isRunning(record.pid)) {
+      // On Unix, kill the whole process group to avoid leaving orphans.
+      if (process.platform !== "win32") {
+        try {
+          process.kill(-record.pid, "SIGTERM");
+        } catch {
+          process.kill(record.pid, "SIGTERM");
+        }
+      } else {
+        process.kill(record.pid, "SIGTERM");
+      }
+    }
   } catch (err) {
-    throw new Error(`Failed to kill subagent "${name}": ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`Failed to kill subagent "${safeName}": ${err instanceof Error ? err.message : String(err)}`);
   }
 
   records.splice(idx, 1);
@@ -143,9 +165,10 @@ export async function killSubagent(name: string): Promise<void> {
 }
 
 export async function subagentOutput(name: string, tailLines = 50): Promise<string> {
+  const safeName = sanitizeSubagentName(name);
   const records = await loadRegistry();
-  const record = records.find((r) => r.name === name);
-  if (!record) throw new Error(`Subagent "${name}" not found`);
+  const record = records.find((r) => r.name === safeName);
+  if (!record) throw new Error(`Subagent "${safeName}" not found`);
 
   try {
     const lines = readFileSync(record.logPath, "utf8").split("\n");

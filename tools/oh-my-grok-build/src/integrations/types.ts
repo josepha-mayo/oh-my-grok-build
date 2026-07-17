@@ -1,6 +1,6 @@
 export interface ConnectorConfig {
   name: string;
-  type: "opencode" | "codex" | "claude" | "custom";
+  type: "opencode" | "codex" | "claude";
   url?: string;
   command?: string;
   cwd?: string;

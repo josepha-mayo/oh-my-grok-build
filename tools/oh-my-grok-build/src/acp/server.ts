@@ -1,8 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { createServer } from "node:net";
+import { createInterface } from "node:readline";
 import { networkInterfaces } from "node:os";
 import type { ServerInfo } from "../types.js";
+import { WebSocket, WebSocketServer } from "ws";
 
 export interface ServeOptions {
   bind?: string;
@@ -11,18 +12,6 @@ export interface ServeOptions {
   cwd?: string;
   model?: string;
   yolo?: boolean;
-}
-
-function findFreePort(preferred: number | undefined, host = "127.0.0.1"): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.listen(preferred ?? 0, host, () => {
-      const addr = server.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      server.close(() => resolve(port));
-    });
-    server.on("error", reject);
-  });
 }
 
 export function makeSecret(): string {
@@ -53,75 +42,165 @@ export function getLocalIp(): string | undefined {
   return undefined;
 }
 
-export async function startAgentServer(options: ServeOptions = {}): Promise<ServerInfo & { process: ChildProcess }> {
+interface Client {
+  ws: any;
+  proc: ChildProcess;
+  stderrTail: string[];
+}
+
+export async function startAgentServer(options: ServeOptions = {}): Promise<ServerInfo & { process?: ChildProcess }> {
   const bind = options.bind ?? "0.0.0.0";
-  const hostForProbe = bind === "0.0.0.0" ? "127.0.0.1" : bind;
-  const port = options.port || (await findFreePort(options.port, hostForProbe));
   const secret = options.secret ?? makeSecret();
   const cwd = options.cwd ?? process.cwd();
 
-  const args = ["agent", "serve", "--bind", `${bind}:${port}`];
-  if (options.model) args.push("--model", options.model);
-  if (options.yolo) args.push("--yolo");
+  const wss = new WebSocketServer({ host: bind, port: options.port ?? 0 });
 
-  const proc = spawn("grok", args, {
-    cwd,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, GROK_AGENT_SECRET: secret, GROK_DISABLE_AUTOUPDATER: "1" },
-  });
+  const clients = new Set<Client>();
+  let address: { port: number; address: string } | null = null;
 
-  // Wait for the "listening" log line or process exit.
-  const ready = await new Promise<void>((resolve, reject) => {
-    const onData = (data: Buffer) => {
-      const line = data.toString();
-      if (line.includes("Agent server listening")) {
-        cleanup();
-        resolve();
-      }
-    };
-    const onExit = (code: number | null) => {
-      cleanup();
-      reject(new Error(`grok agent serve exited early with code ${code}`));
-    };
-    const cleanup = () => {
-      proc.stdout?.off("data", onData);
-      proc.stderr?.off("data", onData);
-      proc.off("exit", onExit);
-    };
-    proc.stdout?.on("data", onData);
-    proc.stderr?.on("data", onData);
-    proc.on("exit", onExit);
-
-    // Fallback: resolve after 5s if no listening log or exit.
-    setTimeout(() => {
-      cleanup();
-      resolve();
-    }, 5000);
-  });
-
-  // Promise resolved when the server is listening or fallback timer fires.
-  void ready;
-
-  const hostForClient = bind === "0.0.0.0" ? (getLocalIp() ?? bind) : bind;
-  return {
-    url: formatServerUrl(hostForClient, port, secret),
-    secret,
-    pid: proc.pid,
-    cwd,
-    process: proc,
+  const getHostForClient = () => {
+    if (bind === "0.0.0.0") return getLocalIp() ?? "127.0.0.1";
+    return bind;
   };
-}
 
-export function stopAgentServer(proc: ChildProcess): Promise<void> {
-  return new Promise((resolve) => {
-    if (proc.killed || proc.exitCode !== null) {
+  const serverReady = new Promise<void>((resolve, reject) => {
+    wss.on("listening", () => {
+      const addr = wss.address() as any;
+      if (addr && typeof addr === "object") {
+        address = { port: (addr as any).port as number, address: (addr as any).address as string };
+      }
       resolve();
+    });
+    wss.on("error", reject);
+  });
+
+  wss.on("connection", (ws: any, req: any) => {
+    const clientSecret = extractSecret(ws, req);
+    if (clientSecret !== secret) {
+      console.warn("[omgb serve] rejected client: invalid server-key");
+      ws.close(1008, "invalid server-key");
       return;
     }
-    proc.on("exit", () => resolve());
-    proc.kill("SIGTERM");
-    setTimeout(() => {
-      if (!proc.killed && proc.exitCode === null) proc.kill("SIGKILL");
-    }, 3000);
+
+    const args = ["agent", "stdio"];
+    if (options.model) args.push("--model", options.model);
+    if (options.yolo) args.push("--yolo");
+
+    const proc = spawn("grok", args, {
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
+    });
+
+    const client: Client = { ws, proc, stderrTail: [] };
+    clients.add(client);
+
+    proc.on("error", (err) => {
+      console.error(`[omgb serve] grok agent stdio error: ${err.message}`);
+      cleanupClient(client, 1011, "agent spawn error");
+    });
+
+    proc.on("exit", (code) => {
+      if (code !== 0 && code !== null) {
+        const tail = client.stderrTail.slice(-10).join("");
+        console.error(`[omgb serve] grok agent stdio exited with ${code}${tail ? `\n${tail}` : ""}`);
+      }
+      cleanupClient(client, 1011, "agent exited");
+    });
+
+    if (proc.stderr) {
+      proc.stderr.on("data", (data: Buffer) => {
+        const line = data.toString();
+        client.stderrTail.push(line);
+        if (client.stderrTail.length > 100) client.stderrTail.shift();
+      });
+    }
+
+    const rl = createInterface({ input: proc.stdout! });
+    rl.on("line", (line) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(line);
+      }
+    });
+
+    ws.on("message", (data: unknown) => {
+      const buf = Buffer.isBuffer(data)
+        ? data
+        : Array.isArray(data)
+          ? Buffer.concat(data)
+          : Buffer.from(data as ArrayBuffer);
+      if (proc.stdin?.writable) {
+        proc.stdin.write(buf.toString() + "\n");
+      }
+    });
+
+    ws.on("close", () => {
+      cleanupClient(client);
+    });
+
+    ws.on("error", (err: any) => {
+      console.error(`[omgb serve] WebSocket error: ${err.message}`);
+      cleanupClient(client, 1011, "websocket error");
+    });
   });
+
+  await serverReady;
+
+  const hostForClient = getHostForClient();
+  const actualPort = (address as any)?.port ?? 0;
+
+  const close = async (): Promise<void> => {
+    for (const client of Array.from(clients)) {
+      cleanupClient(client, 1000, "server closing");
+    }
+    return new Promise((resolve, reject) => {
+      wss.close((err: Error | undefined) => (err ? reject(err) : resolve()));
+    });
+  };
+
+  return {
+    url: formatServerUrl(hostForClient, actualPort, secret),
+    secret,
+    cwd,
+    close,
+  };
+
+  function cleanupClient(client: Client, code?: number, reason?: string): void {
+    if (!clients.has(client)) return;
+    clients.delete(client);
+    try {
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.close(code ?? 1000, reason ?? "closing");
+      } else if (client.ws.readyState === WebSocket.CONNECTING) {
+        client.ws.terminate();
+      }
+    } catch {
+      // ignore
+    }
+    if (!client.proc.killed && client.proc.exitCode === null) {
+      client.proc.kill("SIGTERM");
+      setTimeout(() => {
+        if (!client.proc.killed && client.proc.exitCode === null) {
+          client.proc.kill("SIGKILL");
+        }
+      }, 3000);
+    }
+  }
+
+  function extractSecret(_ws: WebSocket, req: import("http").IncomingMessage): string | undefined {
+    // Browsers can only send the key in the URL query; Node clients may also use the Authorization header.
+    try {
+      const fromUrl = new URL(req.url ?? "", "http://localhost").searchParams.get("server-key");
+      if (fromUrl) return fromUrl;
+    } catch {
+      // fallthrough
+    }
+    const auth = req.headers.authorization ?? "";
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    return m?.[1];
+  }
+}
+
+export function stopAgentServer(server: ServerInfo): Promise<void> {
+  return server.close?.() ?? Promise.resolve();
 }

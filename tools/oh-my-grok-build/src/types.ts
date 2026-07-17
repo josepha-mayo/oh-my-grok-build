@@ -23,6 +23,17 @@ export interface AcpMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
+export interface AcpAuthMethod {
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface AcpInitializeResponse {
+  protocolVersion?: number;
+  authMethods?: AcpAuthMethod[];
+  [key: string]: unknown;
+}
+
 export interface AcpUpdate {
   sessionUpdate:
     | "agent_message_chunk"
@@ -91,4 +102,5 @@ export interface ServerInfo {
   secret: string;
   pid?: number;
   cwd: string;
+  close?: () => Promise<void>;
 }

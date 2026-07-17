@@ -2,7 +2,19 @@
 const input = [];
 process.stdin.on("data", (d) => input.push(d));
 process.stdin.on("end", () => {
-  const payload = JSON.parse(input.join(""));
+  let payload = {};
+  try {
+    payload = JSON.parse(input.join(""));
+  } catch {
+    console.log(
+      JSON.stringify({
+        decision: "deny",
+        reason: "Invalid guard payload",
+      })
+    );
+    process.exit(2);
+  }
+
   const cmd = payload.toolInput?.command ?? "";
 
   if (isDangerous(cmd)) {
@@ -19,22 +31,24 @@ process.stdin.on("end", () => {
 });
 
 function isDangerous(command) {
-  // Split on common shell separators so each logical segment is checked independently.
-  const segments = command.split(/;|&&|\|\||\||`|\$\([^)]*\)|\r?\n/);
+  const segments = splitCommand(command);
 
   for (const segment of segments) {
     const trimmed = segment.trim();
     if (!trimmed) continue;
-
     if (isDangerousSegment(trimmed)) return true;
   }
 
   return false;
 }
 
-function isDangerousSegment(segment) {
-  const lower = segment.toLowerCase();
+function splitCommand(command) {
+  // Split on common shell separators. This is intentionally simple and can be
+  // bypassed by determined input, but it catches the obvious chained cases.
+  return command.split(/;|&&|\|\||`|\$\([^)]*\)|\r?\n/);
+}
 
+function isDangerousSegment(segment) {
   // Fork bomb
   if (/:\(\)\s*\{\s*:\|:\s*&\s*\};\s*:/.test(segment)) return true;
 
@@ -57,20 +71,46 @@ function isDangerousSegment(segment) {
   if (/^\s*rd\s+\/s\s+\/q\b/i.test(segment)) return true;
 
   // rm -rf targeting root or wildcards
-  const tokens = segment.split(/\s+/);
-  if (tokens[0] === "rm" || (tokens[1] === "rm" && tokens[1])) {
-    const hasRecursiveForce = tokens.slice(1).some(
-      (t) => /^-/.test(t) && t.includes("r") && t.includes("f")
-    );
-    if (hasRecursiveForce) {
-      for (const arg of tokens.slice(1)) {
-        if (arg.startsWith("-")) continue;
-        if (arg === "/" || arg === "/*" || arg === "/.*" || arg === "*" || arg === "./*") {
+  const tokens = segment.split(/\s+/).filter(Boolean);
+  const rmIndex = tokens.indexOf("rm");
+  if (rmIndex !== -1) {
+    const prefix = tokens.slice(0, rmIndex);
+    const isSudoRm = prefix.length === 0 || (prefix[0] === "sudo" && prefix.slice(1).every((t) => t.startsWith("-")));
+    if (isSudoRm) {
+      const flags = new Set();
+      let sawDoubleDash = false;
+      for (let i = rmIndex + 1; i < tokens.length; i++) {
+        const arg = tokens[i];
+        if (!sawDoubleDash && arg === "--") {
+          sawDoubleDash = true;
+          continue;
+        }
+        if (!sawDoubleDash && arg.startsWith("-")) {
+          if (arg.startsWith("--")) {
+            const name = arg.slice(2);
+            if (name === "recursive" || name === "r" || name === "remove" || name === "R") flags.add("r");
+            if (name === "force" || name === "f") flags.add("f");
+          } else {
+            for (const ch of arg.slice(1)) {
+              if (ch === "r" || ch === "R") flags.add("r");
+              if (ch === "f") flags.add("f");
+            }
+          }
+          continue;
+        }
+        if ((flags.has("r") || flags.has("R")) && flags.has("f") && isDangerousRmTarget(arg)) {
           return true;
         }
       }
     }
   }
 
+  return false;
+}
+
+function isDangerousRmTarget(arg) {
+  const target = arg.replace(/^["']|["']$/g, "");
+  if (["/", "/*", "/.*", "*", "./*", "~", "~/"].includes(target)) return true;
+  if (/^~\/.*/.test(target)) return true;
   return false;
 }

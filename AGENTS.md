@@ -25,7 +25,9 @@ This repo is a fork of the open-source `xai-org/grok-build` SpaceXAI harness. We
 - Keep code compact; avoid verbose error handling and unnecessary comments.
 - Never log secrets or API keys.
 - For Rust changes, follow existing `rustfmt.toml` and `clippy.toml`; run `cargo fmt` and `cargo clippy`.
+- Run `npm run format:check` and `npm run format` (fix) before committing.
 - Use Grok's extension points: plugins, skills, hooks, agents, MCP, ACP.
+- Provider API keys are stored in `~/.omgb/.env`, never committed, and referenced by `env_key` in `~/.grok/config.toml`.
 
 ## Build & test
 
@@ -33,13 +35,17 @@ This repo is a fork of the open-source `xai-org/grok-build` SpaceXAI harness. We
 # TypeScript harness
 cd tools/oh-my-grok-build
 npm install
+npm run typecheck
 npm run build
 npm test
+npm run format:check
 
 # Mobile app
 cd apps/mobile
 npm install
+npm run typecheck
 npm run build
+npm run format:check
 ```
 
 ## Key principles

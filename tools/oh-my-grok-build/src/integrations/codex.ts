@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
@@ -13,7 +13,7 @@ export class CodexConnector implements Connector {
 
     const args = ["exec", "--json", "--sandbox", "workspace-write", "--output-last-message", lastMessageFile, prompt];
 
-    return new Promise((resolve, reject) => {
+    return new Promise<ConnectorResult>((resolve, reject) => {
       const chunks: Buffer[] = [];
       const proc = spawn("codex", args, {
         cwd: this.config.cwd ?? process.cwd(),
@@ -23,26 +23,39 @@ export class CodexConnector implements Connector {
 
       proc.stdout?.on("data", (d) => chunks.push(d));
       proc.stderr?.on("data", (d) => chunks.push(d));
-      proc.on("error", reject);
-      proc.on("exit", async () => {
-        let text = "";
+      proc.on("error", (err) => {
+        void rm(tmpDir, { recursive: true, force: true });
+        reject(err);
+      });
+      proc.on("exit", async (code) => {
         try {
-          text = await readFile(lastMessageFile, "utf8");
-        } catch {
-          // Fallback to stdout JSONL parsing if the file is missing.
-          const raw = Buffer.concat(chunks).toString("utf8");
-          const lines = raw.split("\n").filter(Boolean);
-          for (const line of lines) {
-            try {
-              const obj = JSON.parse(line) as Record<string, unknown>;
-              if (typeof obj.text === "string") text += obj.text;
-              if (typeof obj.message === "string") text += obj.message;
-            } catch {
-              text += line;
+          if (code !== 0 && code !== null) {
+            const stderr = Buffer.concat(chunks).toString("utf8").slice(-500);
+            reject(new Error(`codex exited with code ${code}${stderr ? `: ${stderr}` : ""}`));
+            return;
+          }
+
+          let text = "";
+          try {
+            text = await readFile(lastMessageFile, "utf8");
+          } catch {
+            // Fallback to stdout JSONL parsing if the file is missing.
+            const raw = Buffer.concat(chunks).toString("utf8");
+            const lines = raw.split("\n").filter(Boolean);
+            for (const line of lines) {
+              try {
+                const obj = JSON.parse(line) as Record<string, unknown>;
+                if (typeof obj.text === "string") text += obj.text;
+                if (typeof obj.message === "string") text += obj.message;
+              } catch {
+                text += line;
+              }
             }
           }
+          resolve({ text, usage: { lastMessageFile } });
+        } finally {
+          void rm(tmpDir, { recursive: true, force: true });
         }
-        resolve({ text, usage: { lastMessageFile } });
       });
     });
   }

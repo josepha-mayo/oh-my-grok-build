@@ -1,8 +1,15 @@
-import { writeFile, chmod, mkdir } from "node:fs/promises";
+import { writeFile, chmod, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import type { ProviderConfig } from "../types.js";
-import { loadOmgConfig, saveOmgConfig, syncProviderToGrokConfig } from "../config.js";
+import {
+  loadOmgConfig,
+  saveOmgConfig,
+  loadGrokConfig,
+  saveGrokConfig,
+  syncProviderToGrokConfig,
+  removeProviderFromGrokConfig,
+  getOmgDir,
+} from "../config.js";
 
 export type ProviderInput = {
   id: string;
@@ -27,10 +34,14 @@ function sanitizeId(id: string): string {
     .replace(/^-|-$/g, "");
 }
 
+function envVarName(providerId: string): string {
+  return `OMGB_${providerId.replace(/-/g, "_").toUpperCase()}_API_KEY`;
+}
+
 export async function addProvider(input: ProviderInput): Promise<ProviderConfig> {
   const id = sanitizeId(input.id);
   if (!id) throw new Error("Provider id is required");
-  const envKey = input.apiKey ? `OMGB_${id.replace(/-/g, "_").toUpperCase()}_API_KEY` : input.envKey;
+  const envKey = input.apiKey ? envVarName(id) : input.envKey;
 
   const config: ProviderConfig = {
     id,
@@ -78,24 +89,32 @@ export async function removeProvider(id: string): Promise<void> {
     delete cfg.providers[id];
     await saveOmgConfig(cfg);
   }
+  await removeApiKeyFromEnv(id);
+  await removeProviderFromGrokConfig(id);
 }
 
 export async function setDefaultProvider(id: string): Promise<void> {
   const cfg = await loadOmgConfig();
   if (!cfg.providers?.[id]) throw new Error(`Provider '${id}' not found`);
-  cfg.defaultModel = `omgb-${id}`;
+  const modelId = `omgb-${id}`;
+  cfg.defaultModel = modelId;
   await saveOmgConfig(cfg);
+
+  const gcfg = await loadGrokConfig();
+  if (!gcfg.models || typeof gcfg.models !== "object" || Array.isArray(gcfg.models)) {
+    gcfg.models = {};
+  }
+  (gcfg.models as Record<string, unknown>).default = modelId;
+  await saveGrokConfig(gcfg);
 }
 
 export async function writeApiKeyToEnv(providerId: string, key: string): Promise<void> {
-  const { getOmgDir } = await import("../config.js");
   const omgDir = getOmgDir();
   await mkdir(omgDir, { recursive: true });
   const envPath = join(omgDir, ".env");
-  const varName = `OMGB_${providerId.replace(/-/g, "_").toUpperCase()}_API_KEY`;
+  const varName = envVarName(providerId);
   const line = `${varName}=${key}\n`;
-  // For simplicity we append/overwrite the single key line.
-  const { readFile } = await import("node:fs/promises");
+
   let content = "";
   try {
     content = await readFile(envPath, "utf8");
@@ -108,4 +127,29 @@ export async function writeApiKeyToEnv(providerId: string, key: string): Promise
   if (process.platform !== "win32") {
     await chmod(envPath, 0o600);
   }
+
+  // Make the key available to spawned grok processes immediately.
+  process.env[varName] = key;
+}
+
+export async function removeApiKeyFromEnv(providerId: string): Promise<void> {
+  const omgDir = getOmgDir();
+  const envPath = join(omgDir, ".env");
+  const varName = envVarName(providerId);
+
+  let content = "";
+  try {
+    content = await readFile(envPath, "utf8");
+  } catch {
+    return;
+  }
+  const lines = content.split("\n").filter((l) => !l.startsWith(`${varName}=`));
+  const newContent = lines.join("\n").trimEnd();
+  if (newContent) {
+    await writeFile(envPath, newContent + "\n");
+  } else {
+    await writeFile(envPath, "");
+  }
+
+  delete process.env[varName];
 }

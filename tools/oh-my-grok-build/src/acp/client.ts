@@ -1,6 +1,14 @@
-import type { AcpMessage, AcpPermissionRequest, AcpPermissionResponse, AcpPromptPart, AcpUpdate } from "../types.js";
+import type {
+  AcpAuthMethod,
+  AcpInitializeResponse,
+  AcpMessage,
+  AcpPermissionRequest,
+  AcpPermissionResponse,
+  AcpPromptPart,
+  AcpUpdate,
+} from "../types.js";
 
-export type { AcpPermissionRequest, AcpPermissionResponse };
+export type { AcpAuthMethod, AcpPermissionRequest, AcpPermissionResponse };
 
 export interface AcpTransport {
   send(message: string): void;
@@ -75,10 +83,18 @@ export class AcpClient {
     protocolVersion = 1,
     capabilities: Record<string, unknown> = {},
     timeoutMs = 120_000
-  ): Promise<unknown> {
-    const result = await this.request("initialize", { protocolVersion, clientCapabilities: capabilities }, timeoutMs);
+  ): Promise<AcpInitializeResponse> {
+    const result = (await this.request(
+      "initialize",
+      { protocolVersion, clientCapabilities: capabilities },
+      timeoutMs
+    )) as AcpInitializeResponse;
     this.initialized = true;
     return result;
+  }
+
+  async authenticate(authMethod: AcpAuthMethod, timeoutMs = 60_000): Promise<unknown> {
+    return this.request("authenticate", { authMethod: authMethod.id, meta: { headless: true } }, timeoutMs);
   }
 
   async newSession(
@@ -90,6 +106,10 @@ export class AcpClient {
     const params: Record<string, unknown> = { cwd, mcpServers };
     if (Object.keys(meta).length) params._meta = meta;
     return (await this.request("session/new", params, timeoutMs)) as { sessionId: string };
+  }
+
+  async setModel(sessionId: string, modelId: string, timeoutMs = 60_000): Promise<unknown> {
+    return this.request("session/set_model", { sessionId, modelId }, timeoutMs);
   }
 
   async prompt(sessionId: string, prompt: AcpPromptPart[], timeoutMs = 120_000): Promise<unknown> {

@@ -9,6 +9,59 @@ type View = "connect" | "chat";
 type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
 const CONNECTIONS_KEY = "omgb:connections";
+const SERVER_KEYS_KEY = "omgb:serverKeys";
+
+function stripSecret(url: string): string {
+  try {
+    const u = new URL(url);
+    u.searchParams.delete("server-key");
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+function extractSecret(url: string): string | undefined {
+  try {
+    return new URL(url).searchParams.get("server-key") ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function getServerKey(safeUrl: string): string | undefined {
+  try {
+    const raw = sessionStorage.getItem(SERVER_KEYS_KEY);
+    const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    return map[safeUrl];
+  } catch {
+    return undefined;
+  }
+}
+
+function setServerKey(safeUrl: string, secret: string | undefined): void {
+  try {
+    const raw = sessionStorage.getItem(SERVER_KEYS_KEY);
+    const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    if (secret) map[safeUrl] = secret;
+    sessionStorage.setItem(SERVER_KEYS_KEY, JSON.stringify(map));
+  } catch {
+    // ignore
+  }
+}
+
+function restoreSecret(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.searchParams.has("server-key")) return url;
+    const safeUrl = stripSecret(url);
+    const secret = getServerKey(safeUrl);
+    if (secret) u.searchParams.set("server-key", secret);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
 
 function loadLastUrl(): string {
   try {
@@ -25,6 +78,9 @@ function loadLastUrl(): string {
 }
 
 function saveConnection(url: string) {
+  const safeUrl = stripSecret(url);
+  const secret = extractSecret(url) ?? getServerKey(safeUrl);
+  setServerKey(safeUrl, secret);
   try {
     const raw = localStorage.getItem(CONNECTIONS_KEY);
     const parsed = raw ? (JSON.parse(raw) as unknown) : [];
@@ -33,8 +89,8 @@ function saveConnection(url: string) {
           (c): c is { url: string; name?: string } => typeof c.url === "string"
         )
       : [];
-    const without = list.filter((c) => c.url !== url);
-    const next = [{ url, name: url }, ...without].slice(0, 20);
+    const without = list.filter((c) => c.url !== safeUrl);
+    const next = [{ url: safeUrl, name: safeUrl }, ...without].slice(0, 20);
     localStorage.setItem(CONNECTIONS_KEY, JSON.stringify(next));
   } catch {
     // ignore
@@ -187,16 +243,38 @@ export default function App() {
             appendMessage("agent", { text: "Use disconnect to start a new session." });
             return;
           case "/yolo":
-            setYolo((v) => {
-              const next = !v;
+            {
+              const next = !yolo;
+              setYolo(next);
               appendMessage("agent", { text: `Auto-approve ${next ? "enabled" : "disabled"}.` });
-              return next;
-            });
+              if (client && sessionId) {
+                try {
+                  const { sessionId: sid } = await client.newSession(
+                    "/",
+                    [],
+                    { modelId: model, yoloMode: next },
+                    60_000
+                  );
+                  setSessionId(sid);
+                } catch (err) {
+                  appendMessage("agent", {
+                    text: `Failed to switch yolo mode: ${err instanceof Error ? err.message : String(err)}`,
+                  });
+                }
+              }
+            }
             return;
           case "/model":
             if (arg) {
-              setModel(arg);
-              appendMessage("agent", { text: `Model preference set to ${arg}.` });
+              try {
+                await client.setModel(sessionId, arg);
+                setModel(arg);
+                appendMessage("agent", { text: `Model set to ${arg}.` });
+              } catch (err) {
+                appendMessage("agent", {
+                  text: `Failed to set model: ${err instanceof Error ? err.message : String(err)}`,
+                });
+              }
             }
             return;
           case "/loop":
@@ -227,15 +305,28 @@ export default function App() {
         setThinking(false);
       }
     },
-    [sessionId, appendMessage]
+    [sessionId, appendMessage, yolo, model]
   );
 
   const handleModelChange = useCallback(
-    (modelId: string) => {
-      setModel(modelId);
-      appendMessage("agent", { text: `Model preference set to ${modelId}.` });
+    async (modelId: string) => {
+      const client = clientRef.current;
+      if (client && sessionId) {
+        try {
+          await client.setModel(sessionId, modelId);
+          setModel(modelId);
+          appendMessage("agent", { text: `Model set to ${modelId}.` });
+        } catch (err) {
+          appendMessage("agent", {
+            text: `Failed to set model: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      } else {
+        setModel(modelId);
+        appendMessage("agent", { text: `Model preference set to ${modelId}.` });
+      }
     },
-    [appendMessage]
+    [appendMessage, sessionId]
   );
 
   const connect = useCallback(
@@ -244,12 +335,14 @@ export default function App() {
       closingRef.current = false;
       clientRef.current?.close();
       clientRef.current = null;
-      setUrl(connectUrl);
+      const safeUrl = stripSecret(connectUrl);
+      const fullUrl = restoreSecret(connectUrl);
+      setUrl(safeUrl);
       if (clearHistory) setMessages([]);
       setPermission(null);
       setConnectionStatus("connecting");
 
-      const client = new AcpClient(connectUrl, {
+      const client = new AcpClient(fullUrl, {
         onOpen: () => setConnectionStatus("connected"),
         onClose: () => {
           setConnectionStatus("disconnected");
@@ -266,8 +359,16 @@ export default function App() {
       clientRef.current = client;
 
       try {
-        await client.initialize(1, { terminal: true, fs: { readTextFile: true, writeTextFile: false } }, 30_000);
-        const { sessionId: sid } = await client.newSession("/", [], { yoloMode: yolo, modelId: model }, 60_000);
+        const init = await client.initialize(
+          1,
+          { terminal: true, fs: { readTextFile: true, writeTextFile: true } },
+          30_000
+        );
+        const authMethod = init.authMethods?.find((m) => m.id === "xai.api_key") ?? init.authMethods?.[0];
+        if (authMethod) {
+          await client.authenticate(authMethod, 60_000);
+        }
+        const { sessionId: sid } = await client.newSession("/", [], { modelId: model, yoloMode: yolo }, 60_000);
         setSessionId(sid);
         setConnectionStatus("connected");
         if (switchView) setView("chat");
@@ -279,7 +380,7 @@ export default function App() {
         setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [handleUpdate, handlePermission, handleModelsUpdate, yolo, model]
+    [handleUpdate, handlePermission, handleModelsUpdate, model, yolo]
   );
 
   const onConnect = useCallback(

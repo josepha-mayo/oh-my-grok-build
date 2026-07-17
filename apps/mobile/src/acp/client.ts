@@ -62,6 +62,17 @@ export interface AcpMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
+export interface AcpAuthMethod {
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface AcpInitializeResponse {
+  protocolVersion?: number;
+  authMethods?: AcpAuthMethod[];
+  [key: string]: unknown;
+}
+
 /**
  * Browser ACP client. Uses the global `WebSocket` so it works inside a
  * Capacitor WebView without extra native dependencies.
@@ -71,12 +82,19 @@ export class AcpClient {
   private handlers: AcpHandlers;
   private pending = new Map<string | number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private idCounter = 0;
+  private queue: AcpMessage[] = [];
 
   constructor(url: string, handlers: AcpHandlers = {}) {
     this.handlers = handlers;
     this.ws = new WebSocket(url);
-    this.ws.onopen = () => handlers.onOpen?.();
-    this.ws.onclose = () => handlers.onClose?.();
+    this.ws.onopen = () => {
+      this.flushQueue();
+      handlers.onOpen?.();
+    };
+    this.ws.onclose = () => {
+      this.queue = [];
+      handlers.onClose?.();
+    };
     this.ws.onerror = () => handlers.onError?.(new Error("WebSocket error"));
     this.ws.onmessage = (ev) => this.handleMessage(ev.data);
   }
@@ -93,8 +111,16 @@ export class AcpClient {
     protocolVersion = 1,
     capabilities: Record<string, unknown> = {},
     timeoutMs = 120_000
-  ): Promise<unknown> {
-    return this.request("initialize", { protocolVersion, clientCapabilities: capabilities }, timeoutMs);
+  ): Promise<AcpInitializeResponse> {
+    return (await this.request(
+      "initialize",
+      { protocolVersion, clientCapabilities: capabilities },
+      timeoutMs
+    )) as AcpInitializeResponse;
+  }
+
+  async authenticate(authMethod: AcpAuthMethod, timeoutMs = 60_000): Promise<unknown> {
+    return this.request("authenticate", { authMethod: authMethod.id, meta: { headless: true } }, timeoutMs);
   }
 
   async newSession(
@@ -108,12 +134,30 @@ export class AcpClient {
     return (await this.request("session/new", params, timeoutMs)) as { sessionId: string };
   }
 
+  async setModel(sessionId: string, modelId: string, timeoutMs = 60_000): Promise<unknown> {
+    return this.request("session/set_model", { sessionId, modelId }, timeoutMs);
+  }
+
   async prompt(sessionId: string, prompt: AcpPromptPart[], timeoutMs = 120_000): Promise<unknown> {
     return this.request("session/prompt", { sessionId, prompt }, timeoutMs);
   }
 
   sendRaw(message: AcpMessage): void {
-    this.ws.send(JSON.stringify(message));
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message));
+      return;
+    }
+    if (this.ws.readyState === WebSocket.CLOSING || this.ws.readyState === WebSocket.CLOSED) {
+      throw new Error("WebSocket is closed");
+    }
+    this.queue.push(message);
+  }
+
+  private flushQueue(): void {
+    for (const message of this.queue) {
+      this.ws.send(JSON.stringify(message));
+    }
+    this.queue = [];
   }
 
   private nextId(): number {

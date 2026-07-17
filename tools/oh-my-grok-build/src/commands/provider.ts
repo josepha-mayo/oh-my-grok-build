@@ -6,6 +6,18 @@ import { listProviderTemplates, getProviderTemplate } from "../providers/registr
 import { discoverLocalModels, testProvider } from "../providers/local.js";
 import type { ProviderConfig } from "../types.js";
 
+function pickProviderEnvKey(
+  template: { id: string; envKey?: string | string[] },
+  apiKey?: string
+): string | string[] | undefined {
+  if (apiKey) return undefined;
+  if (template.id === "ollama" || template.id === "lmstudio") return undefined;
+  if (!template.envKey) return undefined;
+  if (typeof template.envKey === "string") return template.envKey;
+  const filtered = template.envKey.filter((k) => k.endsWith("_API_KEY"));
+  return filtered.length ? filtered : undefined;
+}
+
 async function questionHidden(rl: readline.Interface, query: string): Promise<string> {
   process.stdout.write(query);
   // Pause the main readline interface so it does not compete with the hidden one.
@@ -75,7 +87,7 @@ export async function providerAddCommand(interactive = true, presetId?: string):
       baseUrl,
       apiBackend: template.apiBackend,
       apiKey,
-      envKey: template.envKey,
+      envKey: pickProviderEnvKey(template, apiKey),
       extraHeaders: template.extraHeaders,
       contextWindow: template.contextWindow,
     });
@@ -133,11 +145,7 @@ export async function providerDiscoverCommand(): Promise<void> {
     const template = getProviderTemplate(group.provider);
     if (!template) continue;
 
-    const envKey = Array.isArray(template.envKey)
-      ? template.envKey.filter((k) => k.endsWith("_API_KEY"))
-      : template.envKey?.endsWith("_API_KEY")
-        ? [template.envKey]
-        : undefined;
+    const envKey = pickProviderEnvKey(template);
 
     for (const model of group.models) {
       const safeModel = sanitizeModelId(model);

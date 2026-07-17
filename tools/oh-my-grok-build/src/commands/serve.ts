@@ -32,14 +32,10 @@ export async function serveCommand(options: ServeOptions & { qr?: boolean }): Pr
 
   const onShutdown = async () => {
     console.log(chalk.dim("\nShutting down agent server..."));
-    await stopAgentServer(server.process);
+    await stopAgentServer(server);
     process.exit(0);
   };
 
   process.on("SIGINT", onShutdown);
   process.on("SIGTERM", onShutdown);
-  server.process.on("exit", (code) => {
-    console.log(chalk.red(`\nGrok agent server exited with code ${code}`));
-    process.exit(code ?? 1);
-  });
 }

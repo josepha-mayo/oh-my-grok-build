@@ -91,7 +91,9 @@ export function providerSection(provider: ProviderConfig): Record<string, unknow
     name: provider.name,
   };
   if (provider.apiBackend) section.api_backend = provider.apiBackend;
-  if (provider.envKey) section.env_key = provider.envKey;
+  if (provider.envKey) {
+    section.env_key = Array.isArray(provider.envKey) ? provider.envKey[0] : provider.envKey;
+  }
   if (provider.extraHeaders) section.extra_headers = provider.extraHeaders;
   if (provider.contextWindow) section.context_window = provider.contextWindow;
   if (provider.temperature !== undefined) section.temperature = provider.temperature;
@@ -118,4 +120,79 @@ export async function removeOmgProvider(id: string): Promise<void> {
     delete cfg.providers[id];
     await saveOmgConfig(cfg);
   }
+}
+
+export async function removeProviderFromGrokConfig(id: string): Promise<void> {
+  const config = await loadGrokConfig();
+  if (config["model"] && typeof config["model"] === "object" && !Array.isArray(config["model"])) {
+    delete (config["model"] as Record<string, unknown>)[`omgb-${id}`];
+  }
+  if (
+    config["models"] &&
+    typeof config["models"] === "object" &&
+    !Array.isArray(config["models"]) &&
+    (config["models"] as Record<string, unknown>).default === `omgb-${id}`
+  ) {
+    const modelsTable = config["models"] as Record<string, unknown>;
+    const remaining = Object.keys((config["model"] as Record<string, unknown>) ?? {});
+    if (remaining.length > 0) {
+      modelsTable.default = remaining[0];
+    } else {
+      delete modelsTable.default;
+    }
+  }
+  await saveGrokConfig(config);
+}
+
+/**
+ * Load `~/.omgb/.env` into `process.env` so spawned `grok` children can resolve
+ * provider `env_key` values. This is intentionally a one-time load at startup;
+ * it does not watch the file for changes.
+ */
+export async function loadOmgDotEnvIntoProcess(): Promise<void> {
+  const envPath = join(getOmgDir(), ".env");
+  let content = "";
+  try {
+    content = await readFile(envPath, "utf8");
+  } catch {
+    return;
+  }
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const idx = trimmed.indexOf("=");
+    if (idx === -1) continue;
+    const key = trimmed.slice(0, idx).trim();
+    const value = unquote(trimmed.slice(idx + 1).trim());
+    if (key && process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+export async function loadOmgDotEnv(): Promise<Record<string, string>> {
+  const envPath = join(getOmgDir(), ".env");
+  try {
+    const content = await readFile(envPath, "utf8");
+    const env: Record<string, string> = {};
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const idx = trimmed.indexOf("=");
+      if (idx === -1) continue;
+      const key = trimmed.slice(0, idx).trim();
+      const value = unquote(trimmed.slice(idx + 1).trim());
+      if (key) env[key] = value;
+    }
+    return env;
+  } catch {
+    return {};
+  }
+}
+
+function unquote(value: string): string {
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+  return value;
 }

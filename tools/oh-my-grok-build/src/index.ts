@@ -28,6 +28,7 @@ import {
   subagentLogsCommand,
 } from "./commands/subagent.js";
 import { harnessAddCommand, harnessListCommand, harnessRemoveCommand, harnessRunCommand } from "./commands/harness.js";
+import { loadOmgDotEnvIntoProcess } from "./config.js";
 
 const program = new Command();
 
@@ -278,12 +279,9 @@ harness.addCommand(
     })
 );
 
-program.hook("postAction", () => {
-  // Ensure async errors are not swallowed.
-});
-
 async function main() {
   try {
+    await loadOmgDotEnvIntoProcess();
     await program.parseAsync(process.argv);
   } catch (err) {
     console.error(chalk.red(err instanceof Error ? err.message : String(err)));

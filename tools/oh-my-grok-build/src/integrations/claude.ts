@@ -9,7 +9,7 @@ export class ClaudeConnector implements Connector {
     const args = ["--bare", "-p", prompt, "--allowedTools", "Bash,Read,Edit,View", "--output-format", "text"];
     if (this.config.cwd) args.push("--cwd", this.config.cwd);
 
-    return new Promise((resolve, reject) => {
+    return new Promise<ConnectorResult>((resolve, reject) => {
       const chunks: Buffer[] = [];
       const proc = spawn(cmd, args, {
         cwd: this.config.cwd ?? process.cwd(),
@@ -21,7 +21,12 @@ export class ClaudeConnector implements Connector {
       proc.on("error", reject);
       proc.on("exit", (code) => {
         const text = Buffer.concat(chunks).toString("utf8");
-        resolve({ text, usage: code !== null ? { exitCode: code } : undefined });
+        if (code !== 0 && code !== null) {
+          const snippet = text.slice(-500);
+          reject(new Error(`${cmd} exited with code ${code}${snippet ? `: ${snippet}` : ""}`));
+          return;
+        }
+        resolve({ text, usage: { exitCode: code ?? 0 } });
       });
     });
   }
