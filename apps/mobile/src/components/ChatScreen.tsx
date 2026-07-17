@@ -47,11 +47,14 @@ interface ChatScreenProps {
   onClear: () => void;
 }
 
-const SLASH_COMMANDS = [
+export const SLASH_COMMANDS = [
   { id: "/model", label: "Switch model", args: "<model-id>" },
   { id: "/effort", label: "Set reasoning effort", args: "low|medium|high|max" },
   { id: "/loop", label: "Auto-iterate on a prompt", args: "<prompt>" },
+  { id: "/devin loop", label: "Devin-style diff loop", args: "<prompt>" },
   { id: "/autonomous", label: "Toggle auto-approve" },
+  { id: "/devin autonomous", label: "Devin-style autonomous mode" },
+  { id: "/swarm", label: "Run swarm (desktop CLI)", args: "<prompt>" },
   { id: "/yolo", label: "Toggle auto-approve" },
   { id: "/plan", label: "Enter plan mode" },
   { id: "/clear", label: "Clear conversation" },

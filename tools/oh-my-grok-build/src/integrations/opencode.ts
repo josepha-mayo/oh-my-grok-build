@@ -13,9 +13,13 @@ export class OpenCodeConnector implements Connector {
   constructor(readonly config: ConnectorConfig) {}
 
   async run(prompt: string): Promise<ConnectorResult> {
-    const url = this.config.url ?? "ws://127.0.0.1:7331/acp";
+    const rawUrl = this.config.url ?? "ws://127.0.0.1:7331/acp";
+    const urlObj = new URL(rawUrl);
+    const secret = this.config.secret ?? urlObj.searchParams.get("server-key") ?? undefined;
+    urlObj.searchParams.delete("server-key");
+    const url = urlObj.toString();
     const headers: Record<string, string> = {};
-    if (this.config.secret) headers.Authorization = `Bearer ${this.config.secret}`;
+    if (secret) headers.Authorization = `Bearer ${secret}`;
     const transport = await createNodeWebSocketTransport(url, headers);
 
     const chunks: string[] = [];

@@ -1,9 +1,10 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { AcpClient, type AcpPermissionRequest, type AcpUpdate, type AcpPermissionResponse } from "./acp/client";
 import { ConnectionScreen } from "./components/ConnectionScreen";
-import { ChatScreen, type Message } from "./components/ChatScreen";
+import { ChatScreen, type Message, SLASH_COMMANDS } from "./components/ChatScreen";
 import type { ToolOutputData } from "./components/ToolOutput";
 import type { ReasoningEffort } from "./components/EffortPicker";
+import { notifyCompletion, requestNotificationPermission } from "./notifications";
 import "./App.css";
 
 type View = "connect" | "chat";
@@ -144,21 +145,6 @@ function parseToolOutput(raw: unknown): ToolOutputData | undefined {
   return out;
 }
 
-function notifyIfHidden(title: string, body?: string) {
-  try {
-    if (
-      typeof document !== "undefined" &&
-      document.hidden &&
-      "Notification" in window &&
-      Notification.permission === "granted"
-    ) {
-      new Notification(title, { body, icon: "/favicon.ico" });
-    }
-  } catch {
-    // ignore
-  }
-}
-
 export default function App() {
   const [view, setView] = useState<View>("connect");
   const [url, setUrl] = useState(loadLastUrl);
@@ -252,7 +238,7 @@ export default function App() {
         case "turn_completed":
         case "stop": {
           setThinking(false);
-          notifyIfHidden("Grok completed");
+          void notifyCompletion("Grok completed");
           if (loopRef.current && loopRef.current.remaining > 0) {
             void maybeContinueLoop();
           } else {
@@ -291,14 +277,24 @@ export default function App() {
     []
   );
 
+  const matchSlashCommand = useCallback((text: string): { cmd: string; arg: string } | null => {
+    const trimmed = text.trim();
+    for (const c of SLASH_COMMANDS) {
+      if (trimmed === c.id || trimmed.startsWith(c.id + " ")) {
+        return { cmd: c.id, arg: trimmed.slice(c.id.length).trim() };
+      }
+    }
+    return null;
+  }, []);
+
   const onSend = useCallback(
     async (text: string) => {
       const client = clientRef.current;
       if (!client || !sessionId) return;
 
-      if (text.startsWith("/")) {
-        const [cmd, ...rest] = text.trim().split(/\s+/);
-        const arg = rest.join(" ").trim();
+      const slash = matchSlashCommand(text);
+      if (slash) {
+        const { cmd, arg } = slash;
         switch (cmd) {
           case "/clear":
             setMessages([]);
@@ -307,7 +303,8 @@ export default function App() {
             appendMessage("agent", { text: "Use disconnect to start a new session." });
             return;
           case "/yolo":
-          case "/autonomous": {
+          case "/autonomous":
+          case "/devin autonomous": {
             const next = !yolo;
             setYolo(next);
             appendMessage("agent", { text: `Auto-approve ${next ? "enabled" : "disabled"}.` });
@@ -353,7 +350,8 @@ export default function App() {
               appendMessage("agent", { text: "Usage: /effort low|medium|high|max" });
             }
             return;
-          case "/loop": {
+          case "/loop":
+          case "/devin loop": {
             loopRef.current = { remaining: 3, basePrompt: arg };
             appendMessage("user", { text: arg });
             setThinking(true);
@@ -366,22 +364,19 @@ export default function App() {
             }
             return;
           }
+          case "/swarm": {
+            const swarmCmd = `omgb swarm "${arg.replace(/"/g, '\\"')}"`;
+            appendMessage("agent", {
+              text: `Swarm mode runs on the desktop CLI. Copy and run:\n\`\`\`\n${swarmCmd}\n\`\`\``,
+            });
+            return;
+          }
           case "/plan":
             appendMessage("agent", { text: "Plan mode cannot be toggled from mobile yet." });
             return;
           case "/help":
             appendMessage("agent", {
-              text: [
-                "/model <id>",
-                "/effort low|medium|high|max",
-                "/yolo",
-                "/autonomous",
-                "/loop <prompt>",
-                "/clear",
-                "/new",
-                "/plan",
-                "/help",
-              ].join("\n"),
+              text: SLASH_COMMANDS.map((c) => `${c.id}${c.args ? ` ${c.args}` : ""}`).join("\n"),
             });
             return;
           default:
@@ -489,13 +484,7 @@ export default function App() {
         if (switchView) setView("chat");
         saveConnection(connectUrl);
 
-        if ("Notification" in window && Notification.permission !== "denied" && Notification.permission !== "granted") {
-          try {
-            void Notification.requestPermission();
-          } catch {
-            // ignore
-          }
-        }
+        void requestNotificationPermission();
       } catch (err) {
         closingRef.current = true;
         client.close();

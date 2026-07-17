@@ -22,7 +22,9 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
     throw new Error("URL must include a server-key query parameter, e.g. ws://host:port/ws?server-key=XYZ");
   }
 
-  const transport = await createNodeWebSocketTransport(options.url, {});
+  const transport = await createNodeWebSocketTransport(parsed.baseUrl, {
+    Authorization: `Bearer ${parsed.secret}`,
+  });
 
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;

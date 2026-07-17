@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
 import { getOmgDir, loadGrokConfig, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
@@ -19,6 +20,8 @@ export interface DevinAutonomousOptions {
   cwd?: string;
 }
 
+const DIFF_MAX_BYTES = 1_000_000;
+
 function logsDir(): string {
   return join(getOmgDir(), "logs");
 }
@@ -36,14 +39,43 @@ function appendLoopLog(entry: Record<string, unknown>): void {
   appendFileSync(logPath(), JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
 }
 
-function gitStatusShort(cwd: string): string {
-  const result = spawner.spawnSync("git", ["status", "--short"], { cwd, encoding: "utf8" });
-  return result.stdout?.toString() ?? "";
+function gitOutput(cwd: string, args: string[], maxBytes = DIFF_MAX_BYTES): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    let stderr = "";
+    let killed = false;
+    const proc = spawner.spawn("git", args, { cwd, env: process.env }) as ChildProcess;
+    proc.stdout?.setEncoding("utf8");
+    proc.stdout?.on("data", (chunk: string) => {
+      if (killed) return;
+      output += chunk;
+      if (Buffer.byteLength(output, "utf8") > maxBytes) {
+        killed = true;
+        proc.kill("SIGTERM");
+        output += "\n[truncated: diff exceeded size limit]";
+      }
+    });
+    proc.stderr?.setEncoding("utf8");
+    proc.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    proc.on("error", reject);
+    proc.on("exit", () => {
+      if (stderr && !output.trim()) {
+        reject(new Error(`git ${args.join(" ")} failed: ${stderr.trim()}`));
+        return;
+      }
+      resolve(output);
+    });
+  });
 }
 
-function gitDiff(cwd: string): string {
-  const result = spawner.spawnSync("git", ["diff"], { cwd, encoding: "utf8" });
-  return result.stdout?.toString() ?? "";
+function gitStatusShort(cwd: string): Promise<string> {
+  return gitOutput(cwd, ["status", "--short"], DIFF_MAX_BYTES);
+}
+
+function gitDiff(cwd: string): Promise<string> {
+  return gitOutput(cwd, ["diff"], DIFF_MAX_BYTES);
 }
 
 function runGrokOnce(prompt: string, options: { cwd: string; model: string; yolo?: boolean }): Promise<number | null> {
@@ -66,7 +98,7 @@ export async function devinLoopCommand(options: DevinLoopOptions): Promise<void>
   const model = options.model ?? cfg.defaultModel ?? "grok-build";
   const maxIterations = options.maxIterations ?? 5;
 
-  if (gitStatusShort(cwd).trim()) {
+  if ((await gitStatusShort(cwd)).trim()) {
     throw new Error("Working tree is not clean. Commit or stash changes before starting a devin loop.");
   }
 
@@ -82,8 +114,8 @@ export async function devinLoopCommand(options: DevinLoopOptions): Promise<void>
 
     lastExit = await runGrokOnce(currentPrompt, { cwd, model, yolo: options.yolo });
 
-    const diff = gitDiff(cwd);
-    const status = gitStatusShort(cwd);
+    const diff = await gitDiff(cwd);
+    const status = await gitStatusShort(cwd);
 
     appendLoopLog({
       iteration,
@@ -106,7 +138,7 @@ export async function devinLoopCommand(options: DevinLoopOptions): Promise<void>
     throw new Error(`grok exited with code ${lastExit}`);
   }
 
-  if (gitStatusShort(cwd).trim()) {
+  if ((await gitStatusShort(cwd)).trim()) {
     console.warn(chalk.yellow("Warning: working tree is still dirty after max iterations."));
   }
 }

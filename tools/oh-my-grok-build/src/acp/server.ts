@@ -19,12 +19,22 @@ export function makeSecret(): string {
   return randomBytes(16).toString("hex").toUpperCase();
 }
 
-export function parseServerUrl(url?: string): { host: string; port: number; secret?: string } {
-  if (!url) return { host: "127.0.0.1", port: 0 };
-  const m = url.match(/^wss?:\/\/([^/:]+)(?::(\d+))?/);
-  const secret = new URL(url).searchParams.get("server-key") ?? undefined;
+export interface ParsedServerUrl {
+  host: string;
+  port: number;
+  secret?: string;
+  baseUrl: string;
+}
+
+export function parseServerUrl(url?: string): ParsedServerUrl {
+  if (!url) return { host: "127.0.0.1", port: 0, baseUrl: "" };
+  const u = new URL(url);
+  const secret = u.searchParams.get("server-key") ?? undefined;
+  u.searchParams.delete("server-key");
+  const baseUrl = u.toString();
+  const m = baseUrl.match(/^wss?:\/\/([^/:]+)(?::(\d+))?/);
   if (!m) throw new Error(`Invalid WebSocket URL: ${url}`);
-  return { host: m[1], port: m[2] ? parseInt(m[2], 10) : 0, secret };
+  return { host: m[1], port: m[2] ? parseInt(m[2], 10) : 0, secret, baseUrl };
 }
 
 export function formatServerUrl(host: string, port: number, secret: string): string {
@@ -189,16 +199,17 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
   }
 
   function extractSecret(_ws: WebSocket, req: import("http").IncomingMessage): string | undefined {
-    // Browsers can only send the key in the URL query; Node clients may also use the Authorization header.
-    try {
-      const fromUrl = new URL(req.url ?? "", "http://localhost").searchParams.get("server-key");
-      if (fromUrl) return fromUrl;
-    } catch {
-      // fallthrough
-    }
+    // Prefer the Authorization header when available (Node clients). Browsers/WebViews that
+    // cannot set headers continue to pass the key in the URL query as a fallback.
     const auth = req.headers.authorization ?? "";
     const m = auth.match(/^Bearer\s+(.+)$/i);
-    return m?.[1];
+    if (m) return m[1];
+
+    try {
+      return new URL(req.url ?? "", "http://localhost").searchParams.get("server-key") ?? undefined;
+    } catch {
+      return undefined;
+    }
   }
 }
 

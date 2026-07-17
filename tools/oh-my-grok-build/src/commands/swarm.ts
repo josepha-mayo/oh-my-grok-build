@@ -21,6 +21,8 @@ function clampWorkers(n: number | undefined): number {
   return Math.max(1, Math.min(20, value));
 }
 
+const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
+
 function runGrokCapture(
   prompt: string,
   options: { model: string; yolo?: boolean; cwd?: string }
@@ -29,13 +31,27 @@ function runGrokCapture(
   if (options.yolo) args.push("--yolo");
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
+    let killed = false;
+    let byteCount = 0;
     const proc = spawner.spawn("grok", args, {
       cwd: options.cwd ?? process.cwd(),
       env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
       stdio: ["ignore", "pipe", "pipe"],
     });
-    proc.stdout?.on("data", (d) => chunks.push(d));
-    proc.stderr?.on("data", (d) => chunks.push(d));
+    proc.stdout?.on("data", (d: Buffer) => {
+      if (killed) return;
+      byteCount += d.length;
+      if (byteCount > MAX_CAPTURE_BYTES) {
+        killed = true;
+        proc.kill("SIGTERM");
+        chunks.push(Buffer.from("\n[captured output truncated]"));
+        return;
+      }
+      chunks.push(d);
+    });
+    proc.stderr?.on("data", (d: Buffer) => {
+      if (!killed) chunks.push(d);
+    });
     proc.on("error", reject);
     proc.on("exit", (code) => {
       resolve({ code, output: Buffer.concat(chunks).toString("utf8") });
@@ -43,29 +59,63 @@ function runGrokCapture(
   });
 }
 
+function extractJsonArray(output: string): unknown {
+  const trimmed = output.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = fenced ? fenced[1].trim() : trimmed;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return undefined;
+  }
+}
+
+function validateSubtasks(parsed: unknown, workers: number): string[] {
+  if (!Array.isArray(parsed)) return [];
+  const items = parsed
+    .map((x) =>
+      typeof x === "string"
+        ? x.trim()
+        : typeof x === "object" && x && "task" in x && typeof (x as { task: unknown }).task === "string"
+          ? (x as { task: string }).task.trim()
+          : ""
+    )
+    .filter((x) => x.length > 0);
+  return items.slice(0, workers);
+}
+
 async function decomposeTask(
   prompt: string,
   workers: number,
   options: { model: string; yolo?: boolean; cwd?: string }
 ): Promise<string[]> {
-  const task = `Decompose the following task into at most ${workers} concise subtasks. Reply with a single JSON array of strings and nothing else.\n\nTask: ${prompt}`;
-  const { code, output } = await runGrokCapture(task, options);
-  if (code !== 0) throw new Error(`grok decompose exited with code ${code}`);
+  const makePrompt = (extra = "") =>
+    [
+      `Decompose the following task into at most ${workers} concise subtasks.`,
+      `Reply with a single JSON array of strings. Example: ["subtask one", "subtask two"].`,
+      extra,
+      `\nTask: ${prompt}`,
+    ].join("\n");
 
-  try {
-    const parsed = JSON.parse(output.trim());
-    if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
-      return parsed.slice(0, workers);
-    }
-  } catch {
-    // fallthrough to line-based fallback
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const task = makePrompt(
+      attempt > 1 ? "\nYour previous response was not valid JSON. Please reply with only the JSON array." : ""
+    );
+    const { code, output } = await runGrokCapture(task, options);
+    if (code !== 0) throw new Error(`grok decompose exited with code ${code}`);
+
+    const parsed = extractJsonArray(output);
+    const valid = validateSubtasks(parsed, workers);
+    if (valid.length > 0) return valid;
   }
 
-  const lines = output
-    .split("\n")
-    .map((l) => l.replace(/^\s*[-*\d.]+\s*/, "").trim())
-    .filter((l) => l.length > 0);
-  return lines.length > 0 ? lines.slice(0, workers) : [prompt];
+  // Final fallback: split the prompt into sentences and treat each as a subtask.
+  const fallback = prompt
+    .split(/[.!?]\n+|[.!?]\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .slice(0, workers);
+  return fallback.length > 0 ? fallback : [prompt];
 }
 
 async function waitForSubagents(names: string[], timeoutMs: number): Promise<void> {
