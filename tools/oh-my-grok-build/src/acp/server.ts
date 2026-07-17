@@ -1,9 +1,10 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
 import { networkInterfaces } from "node:os";
 import type { ServerInfo } from "../types.js";
 import { WebSocket, WebSocketServer } from "ws";
+import spawner from "../spawner.js";
 
 export interface ServeOptions {
   bind?: string;
@@ -86,7 +87,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
     if (options.model) args.push("--model", options.model);
     if (options.yolo) args.push("--yolo");
 
-    const proc = spawn("grok", args, {
+    const proc = spawner.spawn("grok", args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },

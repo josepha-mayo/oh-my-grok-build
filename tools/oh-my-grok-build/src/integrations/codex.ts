@@ -1,8 +1,8 @@
-import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
+import spawner from "../spawner.js";
 
 export class CodexConnector implements Connector {
   constructor(readonly config: ConnectorConfig) {}
@@ -15,7 +15,7 @@ export class CodexConnector implements Connector {
 
     return new Promise<ConnectorResult>((resolve, reject) => {
       const chunks: Buffer[] = [];
-      const proc = spawn("codex", args, {
+      const proc = spawner.spawn("codex", args, {
         cwd: this.config.cwd ?? process.cwd(),
         env: { ...process.env, ...this.config.env },
         stdio: ["ignore", "pipe", "pipe"],

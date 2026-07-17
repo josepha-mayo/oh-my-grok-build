@@ -1,7 +1,7 @@
-import { spawn, spawnSync } from "node:child_process";
 import { openSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { ensureOmgDir, getOmgDir } from "../config.js";
+import spawner from "../spawner.js";
 
 export interface SubagentRecord {
   name: string;
@@ -23,6 +23,7 @@ export interface SpawnSubagentOptions {
   model?: string;
   yolo?: boolean;
   maxTurns?: number;
+  cwd?: string;
 }
 
 function registryPath(): string {
@@ -64,17 +65,17 @@ function sanitizeSubagentName(name: string): string {
   return sanitized;
 }
 
-function setupWorktree(worktree: string): void {
+function setupWorktree(worktree: string, cwd: string): void {
   mkdirSync(subagentsDir(), { recursive: true });
 
-  const gitCheck = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
-    cwd: process.cwd(),
+  const gitCheck = spawner.spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+    cwd,
     encoding: "utf8",
   });
 
-  if (gitCheck.status === 0 && gitCheck.stdout?.trim() === "true") {
-    const add = spawnSync("git", ["worktree", "add", "--detach", worktree], {
-      cwd: process.cwd(),
+  if (gitCheck.status === 0 && gitCheck.stdout?.toString().trim() === "true") {
+    const add = spawner.spawnSync("git", ["worktree", "add", "--detach", worktree], {
+      cwd,
       encoding: "utf8",
     });
     if (add.status === 0) return;
@@ -91,8 +92,9 @@ export async function spawnSubagent(
   const safeName = sanitizeSubagentName(name);
   const worktree = join(subagentsDir(), safeName);
   const logPath = join(worktree, "subagent.log");
+  const repoRoot = options.cwd ?? process.cwd();
 
-  setupWorktree(worktree);
+  setupWorktree(worktree, repoRoot);
 
   const records = await loadRegistry();
   const existing = records.findIndex((r) => r.name === safeName);
@@ -104,7 +106,7 @@ export async function spawnSubagent(
   if (options.yolo) args.push("--yolo");
   if (options.maxTurns) args.push("--max-turns", String(options.maxTurns));
 
-  const proc = spawn("grok", args, {
+  const proc = spawner.spawn("grok", args, {
     cwd: worktree,
     env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     detached: true,

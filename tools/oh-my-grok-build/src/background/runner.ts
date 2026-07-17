@@ -1,7 +1,7 @@
-import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { getOmgDir, loadOmgConfig } from "../config.js";
+import spawner from "../spawner.js";
 
 export interface RunPromptOptions {
   jobName?: string;
@@ -37,7 +37,7 @@ export async function runPromptTask(prompt: string, options: RunPromptOptions = 
   const file = logPath(options.jobName);
 
   return new Promise((resolve, reject) => {
-    const proc = spawn("grok", args, {
+    const proc = spawner.spawn("grok", args, {
       cwd: options.cwd ?? process.cwd(),
       env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     });

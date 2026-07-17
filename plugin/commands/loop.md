@@ -1,16 +1,16 @@
 ---
 name: loop
-description: Start an autonomous work loop. Use when the user says /loop or wants the agent to keep iterating on a task without per-step confirmation.
+description: Start a Devin-style autonomous work loop via `omgb devin loop`. Requires a clean git working tree and iterates until the tree is clean or the max iteration limit is reached.
 ---
 
 # /loop — autonomous iteration mode
 
-1. Confirm the high-level goal with the user if unclear, then switch to autonomous execution.
-2. Maintain a visible TODO list; update it after every step.
-3. For each iteration:
-   - Pick the next highest-value action.
-   - Execute it (read, edit, run tests, spawn subagents as needed).
-   - Report a one-line status in the scrollback.
-   - Stop if the task is complete, if you are blocked for more than one turn, or if you hit a safety boundary.
-4. Ask for confirmation before irreversible operations (deletes, force-pushes, large refactors).
-5. End with a concise summary of what changed.
+1. Confirm the high-level goal with the user if unclear.
+2. Require a clean git working tree before starting; error otherwise.
+3. Run the initial prompt with `omgb devin loop "<goal>" [--model ...] [--max-iterations 5]`.
+4. After each Grok run:
+   - Run `git diff` and `git status --short`.
+   - If the working tree is dirty, send Grok a follow-up prompt asking it to review the diff and fix issues.
+   - Stop when `git status --short` is empty or after `--max-iterations`.
+5. Log each iteration to `~/.omgb/logs/devin-loop.jsonl`.
+6. End with a concise summary of what changed.

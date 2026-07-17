@@ -1,9 +1,9 @@
-import { spawn } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import chalk from "chalk";
 import { loadOmgConfig } from "../config.js";
+import spawner from "../spawner.js";
 
 export interface TeamOptions {
   count: number;
@@ -25,7 +25,7 @@ export async function teamCommand(options: TeamOptions): Promise<void> {
 
     return new Promise<{ index: number; output: string; code: number | null }>((resolve) => {
       const chunks: Buffer[] = [];
-      const proc = spawn("grok", args, {
+      const proc = spawner.spawn("grok", args, {
         cwd: workdir,
         env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
       });

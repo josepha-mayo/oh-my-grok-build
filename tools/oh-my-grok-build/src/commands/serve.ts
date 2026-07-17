@@ -3,8 +3,9 @@ import chalk from "chalk";
 import { startAgentServer, stopAgentServer } from "../acp/server.js";
 import { loadOmgConfig } from "../config.js";
 import type { ServeOptions } from "../acp/server.js";
+import type { ServerInfo } from "../types.js";
 
-export async function serveCommand(options: ServeOptions & { qr?: boolean }): Promise<void> {
+export async function serveCommand(options: ServeOptions & { qr?: boolean }): Promise<ServerInfo> {
   const cfg = await loadOmgConfig();
   const model = options.model ?? cfg.defaultModel;
 
@@ -38,4 +39,6 @@ export async function serveCommand(options: ServeOptions & { qr?: boolean }): Pr
 
   process.on("SIGINT", onShutdown);
   process.on("SIGTERM", onShutdown);
+
+  return server;
 }

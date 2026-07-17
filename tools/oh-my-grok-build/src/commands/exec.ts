@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
 import { loadOmgConfig } from "../config.js";
+import spawner from "../spawner.js";
 
 export interface ExecOptions {
   prompt: string;
@@ -18,7 +18,7 @@ export async function execCommand(options: ExecOptions): Promise<void> {
   if (options.maxTurns) args.push("--max-turns", String(options.maxTurns));
 
   return new Promise((resolve, reject) => {
-    const proc = spawn("grok", args, {
+    const proc = spawner.spawn("grok", args, {
       cwd: options.cwd ?? process.cwd(),
       stdio: "inherit",
       env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },

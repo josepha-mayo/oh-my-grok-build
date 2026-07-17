@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
+import spawner from "../spawner.js";
 
 export class ClaudeConnector implements Connector {
   constructor(readonly config: ConnectorConfig) {}
@@ -11,7 +11,7 @@ export class ClaudeConnector implements Connector {
 
     return new Promise<ConnectorResult>((resolve, reject) => {
       const chunks: Buffer[] = [];
-      const proc = spawn(cmd, args, {
+      const proc = spawner.spawn(cmd, args, {
         cwd: this.config.cwd ?? process.cwd(),
         env: { ...process.env, ...this.config.env },
       });
