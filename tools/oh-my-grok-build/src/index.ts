@@ -3,10 +3,30 @@ import { Command } from "commander";
 import chalk from "chalk";
 import { serveCommand } from "./commands/serve.js";
 import { connectCommand } from "./commands/connect.js";
-import { providerAddCommand, providerListCommand, providerRemoveCommand, providerDefaultCommand } from "./commands/provider.js";
+import {
+  providerAddCommand,
+  providerListCommand,
+  providerRemoveCommand,
+  providerDefaultCommand,
+  providerDiscoverCommand,
+  providerTestCommand,
+} from "./commands/provider.js";
 import { modelCommand, modelsCommand } from "./commands/model.js";
 import { execCommand } from "./commands/exec.js";
 import { teamCommand } from "./commands/team.js";
+import { loopCommand } from "./commands/loop.js";
+import {
+  scheduleListCommand,
+  scheduleStopCommand,
+  scheduleRunCommand,
+  scheduleDeleteCommand,
+} from "./commands/schedule.js";
+import {
+  subagentSpawnCommand,
+  subagentListCommand,
+  subagentKillCommand,
+  subagentLogsCommand,
+} from "./commands/subagent.js";
 
 const program = new Command();
 
@@ -73,6 +93,21 @@ program
       .argument("<id>")
       .action(async (id) => {
         await providerDefaultCommand(id);
+      })
+  )
+  .addCommand(
+    new Command("discover")
+      .description("Auto-discover Ollama and LM Studio local models")
+      .action(async () => {
+        await providerDiscoverCommand();
+      })
+  )
+  .addCommand(
+    new Command("test")
+      .description("Test connectivity to a provider")
+      .argument("<id>")
+      .action(async (id) => {
+        await providerTestCommand(id);
       })
   );
 

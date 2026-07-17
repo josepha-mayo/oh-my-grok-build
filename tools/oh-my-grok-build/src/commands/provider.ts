@@ -1,7 +1,8 @@
 import readline from "node:readline/promises";
 import chalk from "chalk";
-import { addProvider, listProviders, removeProvider, setDefaultProvider } from "../providers/manager.js";
+import { addProvider, getProvider, listProviders, removeProvider, setDefaultProvider } from "../providers/manager.js";
 import { listProviderTemplates, getProviderTemplate } from "../providers/registry.js";
+import { discoverLocalModels, testProvider } from "../providers/local.js";
 import type { ProviderConfig } from "../types.js";
 
 export async function providerAddCommand(interactive = true, presetId?: string): Promise<void> {
@@ -85,4 +86,56 @@ export async function providerRemoveCommand(id: string): Promise<void> {
 export async function providerDefaultCommand(id: string): Promise<void> {
   await setDefaultProvider(id);
   console.log(chalk.green(`Default model set to omgb-${id}.`));
+}
+
+function sanitizeModelId(id: string): string {
+  return id.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+}
+
+export async function providerDiscoverCommand(): Promise<void> {
+  const found = await discoverLocalModels();
+  if (found.length === 0) {
+    console.log(chalk.yellow("No local models discovered. Make sure Ollama or LM Studio is running."));
+    return;
+  }
+
+  for (const group of found) {
+    const template = getProviderTemplate(group.provider);
+    if (!template) continue;
+
+    const envKey = Array.isArray(template.envKey)
+      ? template.envKey.filter((k) => k.endsWith("_API_KEY"))
+      : template.envKey?.endsWith("_API_KEY")
+        ? [template.envKey]
+        : undefined;
+
+    for (const model of group.models) {
+      const safeModel = sanitizeModelId(model);
+      const id = `${group.provider}-${safeModel}`;
+      if (await getProvider(id)) continue;
+
+      await addProvider({
+        id,
+        name: `${template.name} ${model}`,
+        model,
+        baseUrl: template.baseUrl,
+        apiBackend: "chat_completions",
+        envKey,
+      });
+
+      console.log(chalk.green(`Added omgb-${id}`));
+    }
+  }
+}
+
+export async function providerTestCommand(id: string): Promise<void> {
+  const provider = await getProvider(id);
+  if (!provider) throw new Error(`Provider '${id}' not found`);
+  const result = await testProvider(provider);
+  if (result.ok) {
+    console.log(chalk.green(`Provider '${id}' is reachable.`));
+  } else {
+    console.log(chalk.red(`Provider '${id}' test failed: ${result.error}`));
+    process.exitCode = 1;
+  }
 }
