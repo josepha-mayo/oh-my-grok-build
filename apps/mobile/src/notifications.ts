@@ -2,6 +2,7 @@ import { LocalNotifications } from "@capacitor/local-notifications";
 import { Capacitor } from "@capacitor/core";
 
 let requested = false;
+let notificationId = 1;
 
 export async function requestNotificationPermission(): Promise<void> {
   if (requested) return;
@@ -37,7 +38,7 @@ export async function notifyCompletion(title: string, body?: string): Promise<vo
             {
               title,
               body: body ?? "",
-              id: Date.now(),
+              id: notificationId++,
               schedule: { at: new Date(Date.now() + 1000) },
             },
           ],
