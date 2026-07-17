@@ -91,7 +91,6 @@ export function providerSection(provider: ProviderConfig): Record<string, unknow
     name: provider.name,
   };
   if (provider.apiBackend) section.api_backend = provider.apiBackend;
-  if (provider.apiKey) section.api_key = provider.apiKey;
   if (provider.envKey) section.env_key = provider.envKey;
   if (provider.extraHeaders) section.extra_headers = provider.extraHeaders;
   if (provider.contextWindow) section.context_window = provider.contextWindow;

@@ -12,13 +12,13 @@ export class CodexConnector implements Connector {
     const lastMessageFile = join(tmpDir, "last-message.txt");
 
     const args = ["exec", "--json", "--sandbox", "workspace-write", "--output-last-message", lastMessageFile, prompt];
-    if (this.config.cwd) args.push("--cwd", this.config.cwd);
 
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       const proc = spawn("codex", args, {
         cwd: this.config.cwd ?? process.cwd(),
         env: { ...process.env, ...this.config.env },
+        stdio: ["ignore", "pipe", "pipe"],
       });
 
       proc.stdout?.on("data", (d) => chunks.push(d));

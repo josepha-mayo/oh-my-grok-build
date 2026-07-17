@@ -22,12 +22,12 @@ Create the directory if needed, then operate with `node -e` one-liners:
 
 - **complete** `<id>`:
   ```sh
-  node -e "const fs=require('fs'),p=require('path');const f=p.join(require('os').homedir(),'.omgb','todo.json');let l=JSON.parse(fs.readFileSync(f,'utf8'));l.find(t=>t.id==process.argv[1]).done=true;fs.writeFileSync(f,JSON.stringify(l,null,2))" <id>
+  node -e "const fs=require('fs'),p=require('path');const f=p.join(require('os').homedir(),'.omgb','todo.json');let l=[];try{l=JSON.parse(fs.readFileSync(f,'utf8'))}catch{}const t=l.find(x=>x.id==process.argv[1]);if(t){t.done=true;fs.writeFileSync(f,JSON.stringify(l,null,2))}" <id>
   ```
 
 - **delete** `<id>`:
   ```sh
-  node -e "const fs=require('fs'),p=require('path');const f=p.join(require('os').homedir(),'.omgb','todo.json');let l=JSON.parse(fs.readFileSync(f,'utf8')).filter(t=>t.id!=process.argv[1]);fs.writeFileSync(f,JSON.stringify(l,null,2))" <id>
+  node -e "const fs=require('fs'),p=require('path');const f=p.join(require('os').homedir(),'.omgb','todo.json');let l=[];try{l=JSON.parse(fs.readFileSync(f,'utf8'))}catch{}l=l.filter(t=>t.id!=process.argv[1]);fs.writeFileSync(f,JSON.stringify(l,null,2))" <id>
   ```
 
 Output the result as a concise bulleted list.

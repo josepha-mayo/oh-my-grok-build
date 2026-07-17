@@ -3,7 +3,7 @@ import chalk from "chalk";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
 import { parseServerUrl } from "../acp/server.js";
-import type { AcpPermissionRequest, AcpUpdate } from "../types.js";
+import type { AcpPermissionRequest, AcpPermissionResponse, AcpUpdate } from "../types.js";
 
 export interface ConnectOptions {
   url: string;
@@ -94,16 +94,16 @@ function renderUpdate(update: AcpUpdate): void {
   }
 }
 
-async function handlePermission(
-  req: AcpPermissionRequest,
-  rl: readline.Interface
-): Promise<{ outcome: { outcome: "selected"; optionId: string } }> {
+async function handlePermission(req: AcpPermissionRequest, rl: readline.Interface): Promise<AcpPermissionResponse> {
   console.log(chalk.yellow(`\nPermission requested: ${req.toolCall.title ?? req.toolCall.command ?? "tool call"}`));
   req.options.forEach((opt, i) => {
     console.log(`  ${i + 1}. ${opt.name}${opt.kind ? ` (${opt.kind})` : ""}`);
   });
+  console.log("  0. Cancel");
   const answer = await rl.question("Choose option: ");
   const index = parseInt(answer.trim(), 10) - 1;
-  const optionId = req.options[index]?.optionId ?? req.options[0]?.optionId ?? "cancel";
-  return { outcome: { outcome: "selected", optionId } };
+  if (Number.isNaN(index) || index < 0 || index >= req.options.length) {
+    return { outcome: { outcome: "cancelled" } };
+  }
+  return { outcome: { outcome: "selected", optionId: req.options[index].optionId } };
 }

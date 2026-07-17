@@ -13,10 +13,10 @@ export interface ServeOptions {
   yolo?: boolean;
 }
 
-function findFreePort(preferred?: number): Promise<number> {
+function findFreePort(preferred: number | undefined, host = "127.0.0.1"): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = createServer();
-    server.listen(preferred ?? 0, "127.0.0.1", () => {
+    server.listen(preferred ?? 0, host, () => {
       const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
       server.close(() => resolve(port));
@@ -55,18 +55,19 @@ export function getLocalIp(): string | undefined {
 
 export async function startAgentServer(options: ServeOptions = {}): Promise<ServerInfo & { process: ChildProcess }> {
   const bind = options.bind ?? "0.0.0.0";
-  const port = options.port ?? (await findFreePort());
+  const hostForProbe = bind === "0.0.0.0" ? "127.0.0.1" : bind;
+  const port = options.port || (await findFreePort(options.port, hostForProbe));
   const secret = options.secret ?? makeSecret();
   const cwd = options.cwd ?? process.cwd();
 
-  const args = ["agent", "serve", "--bind", `${bind}:${port}`, "--secret", secret];
+  const args = ["agent", "serve", "--bind", `${bind}:${port}`];
   if (options.model) args.push("--model", options.model);
   if (options.yolo) args.push("--yolo");
 
   const proc = spawn("grok", args, {
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
+    env: { ...process.env, GROK_AGENT_SECRET: secret, GROK_DISABLE_AUTOUPDATER: "1" },
   });
 
   // Wait for the "listening" log line or process exit.
@@ -76,9 +77,6 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
       if (line.includes("Agent server listening")) {
         cleanup();
         resolve();
-      } else if (line.includes("error") || line.includes("Error")) {
-        cleanup();
-        reject(new Error(`grok agent serve failed: ${line.trim()}`));
       }
     };
     const onExit = (code: number | null) => {
@@ -94,7 +92,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
     proc.stderr?.on("data", onData);
     proc.on("exit", onExit);
 
-    // Fallback: resolve after 5s if no error.
+    // Fallback: resolve after 5s if no listening log or exit.
     setTimeout(() => {
       cleanup();
       resolve();

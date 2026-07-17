@@ -73,18 +73,18 @@ describe("resolveApiKey", () => {
     assert.strictEqual(key, "sk-dotenv");
   });
 
-  it("prefers the inline apiKey when present", async () => {
+  it("prefers environment variable over ~/.omgb/.env", async () => {
     process.env.OMGB_LOCALTEST_ENV = "sk-env";
+    writeFileSync(join(tempDir, ".env"), "OMGB_LOCALTEST_ENV=sk-dotenv\n");
     const provider: ProviderConfig = {
       id: "test",
       name: "Test",
       model: "m",
       baseUrl: "http://localhost/v1",
-      apiKey: "sk-direct",
       envKey: ["OMGB_LOCALTEST_ENV"],
     };
     const key = await resolveApiKey(provider);
-    assert.strictEqual(key, "sk-direct");
+    assert.strictEqual(key, "sk-env");
   });
 });
 

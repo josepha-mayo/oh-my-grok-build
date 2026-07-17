@@ -1,9 +1,30 @@
 import readline from "node:readline/promises";
+import { Writable } from "node:stream";
 import chalk from "chalk";
 import { addProvider, getProvider, listProviders, removeProvider, setDefaultProvider } from "../providers/manager.js";
 import { listProviderTemplates, getProviderTemplate } from "../providers/registry.js";
 import { discoverLocalModels, testProvider } from "../providers/local.js";
 import type { ProviderConfig } from "../types.js";
+
+async function questionHidden(query: string): Promise<string> {
+  process.stdout.write(query);
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    }),
+    terminal: true,
+  });
+  try {
+    const answer = await rl.question("");
+    return answer.trim();
+  } finally {
+    rl.close();
+    process.stdout.write("\n");
+  }
+}
 
 export async function providerAddCommand(interactive = true, presetId?: string): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -37,10 +58,9 @@ export async function providerAddCommand(interactive = true, presetId?: string):
 
     let apiKey: string | undefined;
     if (template.apiKeyLabel) {
-      const key = await rl.question(
-        `${template.apiKeyLabel}${template.id === "ollama" || template.id === "lmstudio" ? " (optional)" : ""}: `
-      );
-      apiKey = key.trim() || undefined;
+      const suffix = template.id === "ollama" || template.id === "lmstudio" ? " (optional)" : "";
+      const key = await questionHidden(`${template.apiKeyLabel}${suffix}: `);
+      apiKey = key || undefined;
     }
 
     const model = defaultModel || (await rl.question("Model id: ")).trim();

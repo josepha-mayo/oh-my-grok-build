@@ -68,7 +68,6 @@ export interface ProviderConfig {
   model: string;
   baseUrl: string;
   apiBackend?: "chat_completions" | "responses" | "messages";
-  apiKey?: string;
   envKey?: string | string[];
   extraHeaders?: Record<string, string>;
   contextWindow?: number;

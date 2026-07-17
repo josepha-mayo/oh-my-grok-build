@@ -9,8 +9,21 @@ export interface Provider {
   name: string;
   model: string;
   baseUrl: string;
-  apiKey: string;
   apiBackend: string;
+}
+
+function sanitizeProvider(raw: unknown): Provider | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  const id =
+    typeof r.id === "string" && r.id ? r.id : `provider-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  return {
+    id,
+    name: typeof r.name === "string" ? r.name : id,
+    model: typeof r.model === "string" ? r.model : "",
+    baseUrl: typeof r.baseUrl === "string" ? r.baseUrl : "",
+    apiBackend: typeof r.apiBackend === "string" ? r.apiBackend : "openai",
+  };
 }
 
 interface SavedConnection {
@@ -46,7 +59,7 @@ function loadProviders(): Provider[] {
   try {
     const raw = localStorage.getItem(PROVIDERS_KEY);
     const parsed = raw ? (JSON.parse(raw) as unknown) : [];
-    return Array.isArray(parsed) ? (parsed as Provider[]) : [];
+    return Array.isArray(parsed) ? parsed.map(sanitizeProvider).filter((p): p is Provider => p !== null) : [];
   } catch {
     return [];
   }
@@ -70,7 +83,6 @@ export function Settings({ onClose, onConnect, currentUrl }: SettingsProps) {
     name: "",
     model: "",
     baseUrl: "",
-    apiKey: "",
     apiBackend: "",
   });
 
@@ -82,7 +94,7 @@ export function Settings({ onClose, onConnect, currentUrl }: SettingsProps) {
   };
 
   const resetForm = () => {
-    setForm({ id: "", name: "", model: "", baseUrl: "", apiKey: "", apiBackend: "" });
+    setForm({ id: "", name: "", model: "", baseUrl: "", apiBackend: "" });
     setEditing(null);
   };
 
@@ -116,7 +128,6 @@ export function Settings({ onClose, onConnect, currentUrl }: SettingsProps) {
         name: "Ollama (local)",
         model: "llama3",
         baseUrl: "http://localhost:11434",
-        apiKey: "",
         apiBackend: "ollama",
       },
     ]);
@@ -130,7 +141,6 @@ export function Settings({ onClose, onConnect, currentUrl }: SettingsProps) {
         name: "LM Studio (local)",
         model: "local",
         baseUrl: "http://localhost:1234/v1",
-        apiKey: "",
         apiBackend: "openai",
       },
     ]);
@@ -203,6 +213,9 @@ export function Settings({ onClose, onConnect, currentUrl }: SettingsProps) {
           </div>
         ) : (
           <div className="settings-form">
+            <p className="settings-empty" style={{ margin: "0 0 8px" }}>
+              Provider API keys are managed on the paired server, not stored on this device.
+            </p>
             <div className="one-tap-row">
               <button className="btn-secondary" onClick={addOllama}>
                 + Ollama
@@ -224,12 +237,6 @@ export function Settings({ onClose, onConnect, currentUrl }: SettingsProps) {
                 value={form.apiBackend}
                 onChange={(e) => updateForm("apiBackend", e.target.value)}
                 placeholder="API backend (openai / ollama / ...)"
-              />
-              <input
-                type="password"
-                value={form.apiKey}
-                onChange={(e) => updateForm("apiKey", e.target.value)}
-                placeholder="API key (optional)"
               />
             </div>
 

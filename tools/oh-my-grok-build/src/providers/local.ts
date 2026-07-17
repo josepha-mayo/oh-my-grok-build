@@ -42,7 +42,6 @@ export async function discoverLocalModels(
 }
 
 export async function resolveApiKey(provider: ProviderConfig): Promise<string | undefined> {
-  if (provider.apiKey) return provider.apiKey;
   const keys = typeof provider.envKey === "string" ? [provider.envKey] : (provider.envKey ?? []);
   for (const k of keys) {
     const v = process.env[k];
