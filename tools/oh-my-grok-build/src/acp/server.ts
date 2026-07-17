@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
+import { networkInterfaces } from "node:os";
 import type { ServerInfo } from "../types.js";
 
 export interface ServeOptions {
@@ -38,6 +39,18 @@ export function parseServerUrl(url?: string): { host: string; port: number; secr
 
 export function formatServerUrl(host: string, port: number, secret: string): string {
   return `ws://${host}:${port}/ws?server-key=${encodeURIComponent(secret)}`;
+}
+
+export function getLocalIp(): string | undefined {
+  const interfaces = networkInterfaces();
+  for (const [, addrs] of Object.entries(interfaces)) {
+    for (const addr of addrs ?? []) {
+      if (addr.family === "IPv4" && !addr.internal && !addr.address.startsWith("169.254")) {
+        return addr.address;
+      }
+    }
+  }
+  return undefined;
 }
 
 export async function startAgentServer(options: ServeOptions = {}): Promise<ServerInfo & { process: ChildProcess }> {
@@ -91,8 +104,9 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
   // Promise resolved when the server is listening or fallback timer fires.
   void ready;
 
+  const hostForClient = bind === "0.0.0.0" ? getLocalIp() ?? bind : bind;
   return {
-    url: formatServerUrl(bind, port, secret),
+    url: formatServerUrl(hostForClient, port, secret),
     secret,
     pid: proc.pid,
     cwd,
