@@ -144,6 +144,101 @@ program
     await teamCommand({ count: parseInt(count, 10), prompt, ...options });
   });
 
+program
+  .command("loop <expression> <prompt>")
+  .description("Run a prompt on a cron schedule")
+  .option("-m, --model <model>", "Model to use")
+  .option("--yolo", "Auto-approve tool calls")
+  .action(async (expression, prompt, options) => {
+    await loopCommand({ expression, prompt, ...options });
+  });
+
+const schedule = program
+  .command("schedule")
+  .description("Manage scheduled background jobs");
+
+schedule.addCommand(
+  new Command("list")
+    .alias("ls")
+    .description("List scheduled jobs")
+    .action(async () => {
+      await scheduleListCommand();
+    })
+);
+
+schedule.addCommand(
+  new Command("stop")
+    .description("Stop a scheduled job")
+    .argument("<name>")
+    .action(async (name) => {
+      await scheduleStopCommand(name);
+    })
+);
+
+schedule.addCommand(
+  new Command("run")
+    .description("Run a scheduled job now")
+    .argument("<name>")
+    .action(async (name) => {
+      await scheduleRunCommand(name);
+    })
+);
+
+schedule.addCommand(
+  new Command("delete")
+    .alias("rm")
+    .description("Delete a scheduled job")
+    .argument("<name>")
+    .action(async (name) => {
+      await scheduleDeleteCommand(name);
+    })
+);
+
+const subagent = program
+  .command("subagent")
+  .description("Spawn and manage Grok subagents");
+
+subagent.addCommand(
+  new Command("spawn")
+    .description("Spawn a detached Grok subagent in a worktree")
+    .argument("<name>")
+    .argument("<prompt>")
+    .option("-m, --model <model>", "Model to use")
+    .option("--yolo", "Auto-approve tool calls")
+    .option("--max-turns <n>", "Maximum agent turns", parseInt)
+    .action(async (name, prompt, options) => {
+      await subagentSpawnCommand({ name, prompt, ...options });
+    })
+);
+
+subagent.addCommand(
+  new Command("list")
+    .alias("ls")
+    .description("List subagents")
+    .action(async () => {
+      await subagentListCommand();
+    })
+);
+
+subagent.addCommand(
+  new Command("kill")
+    .description("Kill a subagent")
+    .argument("<name>")
+    .action(async (name) => {
+      await subagentKillCommand(name);
+    })
+);
+
+subagent.addCommand(
+  new Command("logs")
+    .description("Show subagent logs")
+    .argument("<name>")
+    .option("-n, --lines <n>", "Number of lines to show", parseInt, 50)
+    .action(async (name, options) => {
+      await subagentLogsCommand(name, options.lines);
+    })
+);
+
 program.hook("postAction", () => {
   // Ensure async errors are not swallowed.
 });
