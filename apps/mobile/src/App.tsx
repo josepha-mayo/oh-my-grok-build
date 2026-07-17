@@ -3,6 +3,7 @@ import { AcpClient, type AcpPermissionRequest, type AcpUpdate, type AcpPermissio
 import { ConnectionScreen } from "./components/ConnectionScreen";
 import { ChatScreen, type Message } from "./components/ChatScreen";
 import type { ToolOutputData } from "./components/ToolOutput";
+import type { ReasoningEffort } from "./components/EffortPicker";
 import "./App.css";
 
 type View = "connect" | "chat";
@@ -10,6 +11,11 @@ type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
 const CONNECTIONS_KEY = "omgb:connections";
 const SERVER_KEYS_KEY = "omgb:serverKeys";
+
+interface LoopState {
+  remaining: number;
+  basePrompt: string;
+}
 
 function stripSecret(url: string): string {
   try {
@@ -138,11 +144,27 @@ function parseToolOutput(raw: unknown): ToolOutputData | undefined {
   return out;
 }
 
+function notifyIfHidden(title: string, body?: string) {
+  try {
+    if (
+      typeof document !== "undefined" &&
+      document.hidden &&
+      "Notification" in window &&
+      Notification.permission === "granted"
+    ) {
+      new Notification(title, { body, icon: "/favicon.ico" });
+    }
+  } catch {
+    // ignore
+  }
+}
+
 export default function App() {
   const [view, setView] = useState<View>("connect");
   const [url, setUrl] = useState(loadLastUrl);
   const [sessionId, setSessionId] = useState("");
   const [model, setModel] = useState("grok-build");
+  const [effort, setEffort] = useState<ReasoningEffort>("medium");
   const [yolo, setYolo] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [thinking, setThinking] = useState(false);
@@ -154,9 +176,9 @@ export default function App() {
   const clientRef = useRef<AcpClient | null>(null);
   const permissionResolver = useRef<((value: AcpPermissionResponse) => void) | null>(null);
   const closingRef = useRef(false);
+  const loopRef = useRef<LoopState | null>(null);
 
   useEffect(() => {
-    // Reset close flag on mount so disconnect-to-reconnect cycles behave.
     closingRef.current = false;
   }, []);
 
@@ -171,6 +193,33 @@ export default function App() {
       return [...prev, { id: `${Date.now()}-${Math.random()}`, role, text: update?.text ?? "", ...update }];
     });
   }, []);
+
+  const maybeContinueLoop = useCallback(async () => {
+    const client = clientRef.current;
+    const loop = loopRef.current;
+    if (!client || !loop || loop.remaining <= 0 || !sessionId) return;
+
+    loop.remaining -= 1;
+    if (loop.remaining < 0) {
+      loopRef.current = null;
+      return;
+    }
+
+    const prompt =
+      loop.remaining > 0
+        ? `Review the result above, fix any issues, and continue. Original task: ${loop.basePrompt}`
+        : `Wrap up and finalize. Original task: ${loop.basePrompt}`;
+
+    setThinking(true);
+    appendMessage("agent", { text: `[loop] ${loop.remaining} iteration${loop.remaining === 1 ? "" : "s"} remaining` });
+    try {
+      await client.prompt(sessionId, [{ type: "text", text: prompt }]);
+    } catch (err) {
+      appendMessage("agent", { text: `Loop error: ${err instanceof Error ? err.message : String(err)}` });
+      setThinking(false);
+      loopRef.current = null;
+    }
+  }, [appendMessage, sessionId]);
 
   const handleUpdate = useCallback(
     (_sessionId: string, update: AcpUpdate) => {
@@ -203,11 +252,17 @@ export default function App() {
         case "turn_completed":
         case "stop": {
           setThinking(false);
+          notifyIfHidden("Grok completed");
+          if (loopRef.current && loopRef.current.remaining > 0) {
+            void maybeContinueLoop();
+          } else {
+            loopRef.current = null;
+          }
           break;
         }
       }
     },
-    [appendMessage]
+    [appendMessage, maybeContinueLoop]
   );
 
   const handlePermission = useCallback((req: AcpPermissionRequest): Promise<AcpPermissionResponse> => {
@@ -227,6 +282,15 @@ export default function App() {
     setAvailableModels((prev) => Array.from(new Set([...prev, ...models])));
   }, []);
 
+  const startSessionWithProfile = useCallback(
+    async (client: AcpClient, modelId: string, yoloMode: boolean, reasoningEffort: ReasoningEffort) => {
+      const { sessionId: sid } = await client.newSession("/", [], { modelId, yoloMode, reasoningEffort }, 60_000);
+      setSessionId(sid);
+      return sid;
+    },
+    []
+  );
+
   const onSend = useCallback(
     async (text: string) => {
       const client = clientRef.current;
@@ -243,27 +307,22 @@ export default function App() {
             appendMessage("agent", { text: "Use disconnect to start a new session." });
             return;
           case "/yolo":
-            {
-              const next = !yolo;
-              setYolo(next);
-              appendMessage("agent", { text: `Auto-approve ${next ? "enabled" : "disabled"}.` });
-              if (client && sessionId) {
-                try {
-                  const { sessionId: sid } = await client.newSession(
-                    "/",
-                    [],
-                    { modelId: model, yoloMode: next },
-                    60_000
-                  );
-                  setSessionId(sid);
-                } catch (err) {
-                  appendMessage("agent", {
-                    text: `Failed to switch yolo mode: ${err instanceof Error ? err.message : String(err)}`,
-                  });
-                }
+          case "/autonomous": {
+            const next = !yolo;
+            setYolo(next);
+            appendMessage("agent", { text: `Auto-approve ${next ? "enabled" : "disabled"}.` });
+            if (client && sessionId) {
+              try {
+                await startSessionWithProfile(client, model, next, effort);
+                appendMessage("agent", { text: `Session restarted with auto-approve ${next ? "on" : "off"}.` });
+              } catch (err) {
+                appendMessage("agent", {
+                  text: `Failed to switch mode: ${err instanceof Error ? err.message : String(err)}`,
+                });
               }
             }
             return;
+          }
           case "/model":
             if (arg) {
               try {
@@ -277,17 +336,52 @@ export default function App() {
               }
             }
             return;
-          case "/loop":
-            appendMessage("agent", { text: "Scheduling is not yet implemented in mobile." });
+          case "/effort":
+            if (arg && ["low", "medium", "high", "max"].includes(arg)) {
+              const e = arg as ReasoningEffort;
+              setEffort(e);
+              appendMessage("agent", { text: `Reasoning effort set to ${e}.` });
+              try {
+                await startSessionWithProfile(client, model, yolo, e);
+                appendMessage("agent", { text: `Session restarted with effort ${e}.` });
+              } catch (err) {
+                appendMessage("agent", {
+                  text: `Failed to set effort: ${err instanceof Error ? err.message : String(err)}`,
+                });
+              }
+            } else {
+              appendMessage("agent", { text: "Usage: /effort low|medium|high|max" });
+            }
             return;
+          case "/loop": {
+            loopRef.current = { remaining: 3, basePrompt: arg };
+            appendMessage("user", { text: arg });
+            setThinking(true);
+            try {
+              await client.prompt(sessionId, [{ type: "text", text: arg }]);
+            } catch (err) {
+              appendMessage("agent", { text: `Error: ${err instanceof Error ? err.message : String(err)}` });
+              setThinking(false);
+              loopRef.current = null;
+            }
+            return;
+          }
           case "/plan":
             appendMessage("agent", { text: "Plan mode cannot be toggled from mobile yet." });
             return;
           case "/help":
             appendMessage("agent", {
-              text: ["/model <id>", "/yolo", "/clear", "/new", "/loop <interval> <prompt>", "/plan", "/help"].join(
-                "\n"
-              ),
+              text: [
+                "/model <id>",
+                "/effort low|medium|high|max",
+                "/yolo",
+                "/autonomous",
+                "/loop <prompt>",
+                "/clear",
+                "/new",
+                "/plan",
+                "/help",
+              ].join("\n"),
             });
             return;
           default:
@@ -296,6 +390,8 @@ export default function App() {
         }
       }
 
+      // Normal user message cancels an active loop so we do not unexpectedly keep iterating.
+      loopRef.current = null;
       appendMessage("user", { text });
       setThinking(true);
       try {
@@ -305,7 +401,7 @@ export default function App() {
         setThinking(false);
       }
     },
-    [sessionId, appendMessage, yolo, model]
+    [sessionId, appendMessage, yolo, model, effort, startSessionWithProfile]
   );
 
   const handleModelChange = useCallback(
@@ -327,6 +423,26 @@ export default function App() {
       }
     },
     [appendMessage, sessionId]
+  );
+
+  const handleEffortChange = useCallback(
+    async (e: ReasoningEffort) => {
+      const client = clientRef.current;
+      setEffort(e);
+      if (client && sessionId) {
+        try {
+          await startSessionWithProfile(client, model, yolo, e);
+          appendMessage("agent", { text: `Reasoning effort set to ${e}.` });
+        } catch (err) {
+          appendMessage("agent", {
+            text: `Failed to set effort: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      } else {
+        appendMessage("agent", { text: `Effort preference set to ${e}.` });
+      }
+    },
+    [appendMessage, model, sessionId, yolo, startSessionWithProfile]
   );
 
   const connect = useCallback(
@@ -368,11 +484,18 @@ export default function App() {
         if (authMethod) {
           await client.authenticate(authMethod, 60_000);
         }
-        const { sessionId: sid } = await client.newSession("/", [], { modelId: model, yoloMode: yolo }, 60_000);
-        setSessionId(sid);
+        await startSessionWithProfile(client, model, yolo, effort);
         setConnectionStatus("connected");
         if (switchView) setView("chat");
         saveConnection(connectUrl);
+
+        if ("Notification" in window && Notification.permission !== "denied" && Notification.permission !== "granted") {
+          try {
+            void Notification.requestPermission();
+          } catch {
+            // ignore
+          }
+        }
       } catch (err) {
         closingRef.current = true;
         client.close();
@@ -380,7 +503,7 @@ export default function App() {
         setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [handleUpdate, handlePermission, handleModelsUpdate, model, yolo]
+    [handleUpdate, handlePermission, handleModelsUpdate, model, yolo, effort, startSessionWithProfile]
   );
 
   const onConnect = useCallback(
@@ -394,6 +517,7 @@ export default function App() {
     closingRef.current = true;
     clientRef.current?.close();
     clientRef.current = null;
+    loopRef.current = null;
     setView("connect");
     setSessionId("");
     setMessages([]);
@@ -404,6 +528,17 @@ export default function App() {
   }, []);
 
   const onReconnect = useCallback(() => {
+    void connect(url, false, false);
+  }, [connect, url]);
+
+  const onQuickSync = useCallback(() => {
+    if (!url) return;
+    setMessages((prev) => {
+      if (prev.length > 50) {
+        return prev.slice(-50);
+      }
+      return prev;
+    });
     void connect(url, false, false);
   }, [connect, url]);
 
@@ -421,6 +556,7 @@ export default function App() {
       <ChatScreen
         url={url}
         model={model}
+        effort={effort}
         yolo={yolo}
         messages={messages}
         thinking={thinking}
@@ -431,9 +567,10 @@ export default function App() {
         onPermissionSelect={handlePermissionSelect}
         onDisconnect={onDisconnect}
         onReconnect={onReconnect}
+        onQuickSync={onQuickSync}
         onModelChange={handleModelChange}
+        onEffortChange={handleEffortChange}
         onConnectSaved={onConnect}
-        onYoloToggle={() => setYolo((v) => !v)}
         onClear={() => setMessages([])}
       />
       {error ? <div className="toast error">{error}</div> : null}

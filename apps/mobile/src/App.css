@@ -179,7 +179,8 @@
 }
 
 .model-badge,
-.yolo-badge {
+.yolo-badge,
+.effort-badge {
   font-size: 0.75rem;
   font-weight: 600;
   padding: 0.25rem 0.5rem;
@@ -191,6 +192,11 @@
 .model-badge {
   background: var(--surface-2);
   color: var(--text);
+}
+
+.effort-badge {
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
 }
 
 .yolo-badge {
@@ -281,6 +287,17 @@
   color: var(--text-subtle);
   font-size: 0.875rem;
   padding-left: 2.5rem;
+}
+
+.load-more {
+  align-self: center;
+  padding: 0.5rem 1rem;
+  margin-bottom: 0.5rem;
+  background: var(--surface-2);
+  border: 1px solid var(--surface-3);
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
 }
 
 /* Permission card */
@@ -374,6 +391,13 @@
   color: var(--text-muted);
 }
 
+.slash-args {
+  font-size: 0.75rem;
+  color: var(--text-subtle);
+  font-weight: 400;
+  margin-left: 0.25rem;
+}
+
 /* Composer */
 .composer {
   display: flex;
@@ -413,6 +437,16 @@
 .send-button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.voice-button {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.voice-button.listening {
+  color: #ef4444;
+  animation: pulse 1.2s infinite;
 }
 
 /* Toast */

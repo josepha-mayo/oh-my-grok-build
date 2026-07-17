@@ -1,10 +1,23 @@
 import { useRef, useEffect, useState } from "react";
-import { ArrowLeft, Send, Command, Bot, User, Settings as SettingsIcon, Trash2, RefreshCw } from "lucide-react";
+import {
+  ArrowLeft,
+  Send,
+  Command,
+  Bot,
+  User,
+  Settings as SettingsIcon,
+  Trash2,
+  RefreshCw,
+  Zap,
+  ChevronUp,
+} from "lucide-react";
 import type { AcpPermissionRequest } from "../acp/client";
 import { PermissionCard } from "./PermissionCard";
 import { ToolOutput, type ToolOutputData } from "./ToolOutput";
 import { ModelPicker } from "./ModelPicker";
+import { EffortPicker, type ReasoningEffort } from "./EffortPicker";
 import { Settings } from "./Settings";
+import { VoiceButton } from "./VoiceButton";
 
 export interface Message {
   id: string;
@@ -16,6 +29,7 @@ export interface Message {
 interface ChatScreenProps {
   url: string;
   model: string;
+  effort: ReasoningEffort;
   yolo: boolean;
   messages: Message[];
   thinking: boolean;
@@ -26,25 +40,31 @@ interface ChatScreenProps {
   onPermissionSelect: (optionId: string) => void;
   onDisconnect: () => void;
   onReconnect: () => void;
+  onQuickSync: () => void;
   onModelChange: (model: string) => void;
+  onEffortChange: (effort: ReasoningEffort) => void;
   onConnectSaved: (url: string) => void;
-  onYoloToggle: () => void;
   onClear: () => void;
 }
 
 const SLASH_COMMANDS = [
   { id: "/model", label: "Switch model", args: "<model-id>" },
-  { id: "/loop", label: "Run on a schedule", args: "<interval> <prompt>" },
-  { id: "/plan", label: "Enter plan mode" },
+  { id: "/effort", label: "Set reasoning effort", args: "low|medium|high|max" },
+  { id: "/loop", label: "Auto-iterate on a prompt", args: "<prompt>" },
+  { id: "/autonomous", label: "Toggle auto-approve" },
   { id: "/yolo", label: "Toggle auto-approve" },
+  { id: "/plan", label: "Enter plan mode" },
   { id: "/clear", label: "Clear conversation" },
   { id: "/new", label: "New session" },
   { id: "/help", label: "Show commands" },
 ];
 
+const PAGE_SIZE = 30;
+
 export function ChatScreen({
   url,
   model,
+  effort,
   yolo,
   messages,
   thinking,
@@ -55,20 +75,28 @@ export function ChatScreen({
   onPermissionSelect,
   onDisconnect,
   onReconnect,
+  onQuickSync,
   onModelChange,
+  onEffortChange,
   onConnectSaved,
   onClear,
 }: ChatScreenProps) {
   const [input, setInput] = useState("");
   const [slashQuery, setSlashQuery] = useState("");
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const [showEffortPicker, setShowEffortPicker] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [loadedCount, setLoadedCount] = useState(PAGE_SIZE);
+  const [voiceDraft, setVoiceDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  const visibleMessages = messages.slice(-loadedCount);
+  const canLoadMore = messages.length > visibleMessages.length;
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages]);
+  }, [messages, visibleMessages.length]);
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -80,6 +108,13 @@ export function ChatScreen({
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
   }, [input]);
+
+  useEffect(() => {
+    if (voiceDraft) {
+      setInput((prev) => (prev ? `${prev} ${voiceDraft}` : voiceDraft).trim());
+      setVoiceDraft("");
+    }
+  }, [voiceDraft]);
 
   const submit = (text: string) => {
     if (!text.trim() || thinking) return;
@@ -121,6 +156,10 @@ export function ChatScreen({
     onModelChange(m);
   };
 
+  const handleLoadMore = () => {
+    setLoadedCount((prev) => prev + PAGE_SIZE);
+  };
+
   return (
     <div className="chat-screen safe-area">
       <header className="chat-header">
@@ -131,15 +170,22 @@ export function ChatScreen({
         <button className="header-meta" onClick={() => setShowModelPicker(true)}>
           <span className={`status-dot ${connectionStatus}`} />
           <span className="model-badge">{model}</span>
-          {yolo ? <span className="yolo-badge">YOLO</span> : null}
+          <span className="effort-badge">{effort}</span>
+          {yolo ? <span className="yolo-badge">AUTO</span> : null}
         </button>
 
         <div className="header-actions">
+          <button className="icon-button" onClick={onQuickSync} title="Quick sync (reconnect + trim)">
+            <Zap size={20} />
+          </button>
           {connectionStatus === "disconnected" ? (
             <button className="icon-button reconnect-button" onClick={onReconnect} title="Reconnect">
               <RefreshCw size={20} />
             </button>
           ) : null}
+          <button className="icon-button" onClick={() => setShowEffortPicker(true)} title="Effort">
+            <ChevronUp size={20} />
+          </button>
           <button className="icon-button" onClick={() => setShowSettings(true)} title="Settings">
             <SettingsIcon size={20} />
           </button>
@@ -150,15 +196,21 @@ export function ChatScreen({
       </header>
 
       <div className="chat-scroll" ref={scrollRef}>
-        {messages.length === 0 && (
+        {canLoadMore && (
+          <button className="load-more" onClick={handleLoadMore}>
+            Load older messages ({messages.length - visibleMessages.length} hidden)
+          </button>
+        )}
+
+        {visibleMessages.length === 0 && (
           <div className="empty-state">
             <Bot size={40} />
             <p>Connected to {url.replace(/\?.*$/, "")}</p>
-            <p className="hint">Type a prompt or / command.</p>
+            <p className="hint">Type a prompt or / for commands.</p>
           </div>
         )}
 
-        {messages.map((m) => {
+        {visibleMessages.map((m) => {
           if (m.role === "thought") {
             return (
               <details key={m.id} className="thinking-bubble">
@@ -197,7 +249,9 @@ export function ChatScreen({
             <button key={c.id} className="slash-item" onClick={() => insertCommand(c.id)}>
               <Command size={14} />
               <div>
-                <div className="slash-cmd">{c.id}</div>
+                <div className="slash-cmd">
+                  {c.id} {c.args ? <span className="slash-args">{c.args}</span> : null}
+                </div>
                 <div className="slash-desc">{c.label}</div>
               </div>
             </button>
@@ -206,6 +260,7 @@ export function ChatScreen({
       ) : null}
 
       <div className="composer">
+        <VoiceButton onTranscript={setVoiceDraft} disabled={thinking} />
         <textarea
           ref={textareaRef}
           rows={1}
@@ -225,6 +280,17 @@ export function ChatScreen({
           selected={model}
           onSelect={handleModelSelect}
           onClose={() => setShowModelPicker(false)}
+        />
+      ) : null}
+
+      {showEffortPicker ? (
+        <EffortPicker
+          effort={effort}
+          onSelect={(e) => {
+            onEffortChange(e);
+            setShowEffortPicker(false);
+          }}
+          onClose={() => setShowEffortPicker(false)}
         />
       ) : null}
 
