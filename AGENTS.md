@@ -5,43 +5,41 @@ This repo is a fork of the open-source `xai-org/grok-build` SpaceXAI harness. We
 ## Project goals
 
 - Keep Grok Build's Rust core untouched as the execution engine.
-- Add the missing harness features found in `oh-my-codex`, `oh-my-pi`, `Command Code`, `Hermes`, etc.: persistent taste learning, team orchestration, git-native safety hooks, session branching helpers, and a mobile relay.
-- Ship as a TypeScript/Bun CLI (`tools/oh-my-grok-build`) plus a Grok plugin (`plugin/`) and a mobile app.
+- Add the missing harness features found in `oh-my-codex`, `oh-my-pi`, `Command Code`, `Hermes`, etc.: BYOK providers, local model discovery, background/cron tasks, subagent orchestration, taste learning, team worktree isolation, git-native safety hooks, session branching helpers, and a mobile relay.
+- Ship as a TypeScript/Node CLI (`tools/oh-my-grok-build`) plus a Grok plugin (`plugin/`) and a Capacitor React mobile app (`apps/mobile`).
 
 ## Repository layout
 
 | Path | Purpose |
 |------|---------|
 | `crates/` | Upstream Grok Build Rust source (do not edit unless upstreaming) |
-| `tools/oh-my-grok-build/` | `omgb` TypeScript harness: relay, taste, team, sessions, exec |
+| `tools/oh-my-grok-build/` | `omgb` TypeScript harness: ACP relay, providers, team, sessions, exec, background scheduler, subagents |
 | `plugin/` | Grok Build plugin: skills, hooks, agents, slash commands |
-| `mobile/` | Mobile web/PWA app (or moved to `.vscode/vibe_app_slop` after cleanup) |
+| `apps/mobile/` | Capacitor React mobile app (linked from `.vscode/vibe_app_slop` for local dev) |
 | `AGENTS.md` | This file |
 
 ## Conventions
 
-- Use **Bun** for JavaScript tooling in `tools/` and `mobile/`.
+- Use **npm/Node** for JavaScript tooling (Bun may be added later).
 - Prefer **TypeScript** with strict `tsconfig.json`.
 - Keep code compact; avoid verbose error handling and unnecessary comments.
 - Never log secrets or API keys.
 - For Rust changes, follow existing `rustfmt.toml` and `clippy.toml`; run `cargo fmt` and `cargo clippy`.
+- Use Grok's extension points: plugins, skills, hooks, agents, MCP, ACP.
 
 ## Build & test
 
 ```bash
-# Rust core (best-effort on Windows)
-cargo check -p xai-grok-pager-bin
-
 # TypeScript harness
 cd tools/oh-my-grok-build
-bun install
-bun run build
-bun test
+npm install
+npm run build
+npm test
 
-# Mobile PWA
-cd mobile
-bun install
-bun run build
+# Mobile app
+cd apps/mobile
+npm install
+npm run build
 ```
 
 ## Key principles
@@ -49,3 +47,4 @@ bun run build
 1. **Privacy-first / local-first**: never phone home. All relay traffic stays between the phone and the local machine.
 2. **Grok-native**: use Grok's existing plugin, hook, skill, subagent, and MCP systems rather than reinventing them.
 3. **Incremental**: small, composable tools. The CLI should be useful with one command (`omgb serve`) and grow from there.
+4. **Industry-standard**: include tests, CI, type safety, clear docs, and secure credential handling.
