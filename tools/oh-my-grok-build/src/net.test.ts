@@ -1,6 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isAllowedHttpUrl, isAllowedProviderUrl, isAllowedWsUrl, isLoopbackHost, isPrivateIp } from "./net.js";
+import {
+  isAllowedHttpUrl,
+  isAllowedProviderUrl,
+  isAllowedWsUrl,
+  isLoopbackHost,
+  isPrivateIp,
+  lookupFromAddresses,
+  resolveProviderUrl,
+} from "./net.js";
+import type { LookupAddress } from "node:dns";
 
 describe("net", () => {
   describe("isPrivateIp", () => {
@@ -86,31 +95,31 @@ describe("net", () => {
   });
 
   describe("isAllowedWsUrl", () => {
-    it("allows local loopback WebSocket servers", () => {
-      assert.strictEqual(isAllowedWsUrl("ws://127.0.0.1:7331/acp").ok, true);
-      assert.strictEqual(isAllowedWsUrl("ws://localhost:8080").ok, true);
+    it("allows local loopback WebSocket servers", async () => {
+      assert.strictEqual((await isAllowedWsUrl("ws://127.0.0.1:7331/acp")).ok, true);
+      assert.strictEqual((await isAllowedWsUrl("ws://localhost:8080")).ok, true);
     });
 
-    it("blocks non-WS(S) protocols", () => {
-      assert.strictEqual(isAllowedWsUrl("http://example.com").ok, false);
+    it("blocks non-WS(S) protocols", async () => {
+      assert.strictEqual((await isAllowedWsUrl("http://example.com")).ok, false);
     });
 
-    it("blocks cloud metadata and link-local endpoints", () => {
-      assert.strictEqual(isAllowedWsUrl("ws://169.254.169.254").ok, false);
-      assert.strictEqual(isAllowedWsUrl("ws://metadata.google.internal").ok, false);
-      assert.strictEqual(isAllowedWsUrl("ws://metadata.google.internal.").ok, false);
+    it("blocks cloud metadata and link-local endpoints", async () => {
+      assert.strictEqual((await isAllowedWsUrl("ws://169.254.169.254")).ok, false);
+      assert.strictEqual((await isAllowedWsUrl("ws://metadata.google.internal")).ok, false);
+      assert.strictEqual((await isAllowedWsUrl("ws://metadata.google.internal.")).ok, false);
     });
 
-    it("blocks RFC1918 private addresses by default", () => {
-      assert.strictEqual(isAllowedWsUrl("ws://10.0.0.1").ok, false);
-      assert.strictEqual(isAllowedWsUrl("ws://192.168.1.1").ok, false);
-      assert.strictEqual(isAllowedWsUrl("ws://172.16.0.1").ok, false);
+    it("blocks RFC1918 private addresses by default", async () => {
+      assert.strictEqual((await isAllowedWsUrl("ws://10.0.0.1")).ok, false);
+      assert.strictEqual((await isAllowedWsUrl("ws://192.168.1.1")).ok, false);
+      assert.strictEqual((await isAllowedWsUrl("ws://172.16.0.1")).ok, false);
     });
 
-    it("allows RFC1918 private addresses when explicitly permitted", () => {
-      assert.strictEqual(isAllowedWsUrl("ws://10.0.0.1", true).ok, true);
-      assert.strictEqual(isAllowedWsUrl("ws://192.168.1.1", true).ok, true);
-      assert.strictEqual(isAllowedWsUrl("ws://172.16.0.1", true).ok, true);
+    it("allows RFC1918 private addresses when explicitly permitted", async () => {
+      assert.strictEqual((await isAllowedWsUrl("ws://10.0.0.1", true)).ok, true);
+      assert.strictEqual((await isAllowedWsUrl("ws://192.168.1.1", true)).ok, true);
+      assert.strictEqual((await isAllowedWsUrl("ws://172.16.0.1", true)).ok, true);
     });
   });
 
@@ -165,6 +174,116 @@ describe("net", () => {
 
     it("blocks URLs with embedded credentials", async () => {
       assert.strictEqual((await isAllowedProviderUrl("https://user:pass@example.com")).ok, false);
+    });
+  });
+
+  describe("lookupFromAddresses", () => {
+    const addresses: LookupAddress[] = [
+      { address: "127.0.0.1", family: 4 },
+      { address: "::1", family: 6 },
+    ];
+
+    it("returns all addresses when options.all is true", () => {
+      const lookup = lookupFromAddresses(addresses);
+      return new Promise<void>((resolve, reject) => {
+        lookup("localhost", { all: true }, (err, result) => {
+          if (err) return reject(err);
+          assert.deepStrictEqual(result, addresses);
+          resolve();
+        });
+      });
+    });
+
+    it("returns the first address and family when options.all is false", () => {
+      const lookup = lookupFromAddresses(addresses);
+      return new Promise<void>((resolve, reject) => {
+        lookup("localhost", { all: false }, (err, address, family) => {
+          if (err) return reject(err);
+          assert.strictEqual(address, "127.0.0.1");
+          assert.strictEqual(family, 4);
+          resolve();
+        });
+      });
+    });
+
+    it("filters by family when options.family is set", () => {
+      const lookup = lookupFromAddresses(addresses);
+      return new Promise<void>((resolve, reject) => {
+        lookup("localhost", { family: 6 }, (err, address, family) => {
+          if (err) return reject(err);
+          assert.strictEqual(address, "::1");
+          assert.strictEqual(family, 6);
+          resolve();
+        });
+      });
+    });
+
+    it("filters by family when family is a string", () => {
+      const lookup = lookupFromAddresses(addresses);
+      return new Promise<void>((resolve, reject) => {
+        lookup("localhost", { family: "IPv6" }, (err, address, family) => {
+          if (err) return reject(err);
+          assert.strictEqual(address, "::1");
+          assert.strictEqual(family, 6);
+          resolve();
+        });
+      });
+    });
+
+    it("returns all matching addresses when family and all are set", () => {
+      const lookup = lookupFromAddresses(addresses);
+      return new Promise<void>((resolve, reject) => {
+        lookup("localhost", { all: true, family: 4 }, (err, result) => {
+          if (err) return reject(err);
+          assert.deepStrictEqual(result, [{ address: "127.0.0.1", family: 4 }]);
+          resolve();
+        });
+      });
+    });
+
+    it("errors when no address matches the requested family", () => {
+      const lookup = lookupFromAddresses([{ address: "127.0.0.1", family: 4 }]);
+      return new Promise<void>((resolve, reject) => {
+        lookup("localhost", { family: 6 }, (err, address, family) => {
+          if (!err) return reject(new Error("expected an error"));
+          assert.strictEqual((err as { code?: string }).code, "ENOTFOUND");
+          resolve();
+        });
+      });
+    });
+  });
+
+  describe("resolveProviderUrl", () => {
+    it("does not return a lookup for IP literals", async () => {
+      const result = await resolveProviderUrl("http://127.0.0.1:8000/v1");
+      assert.strictEqual(result.ok, true);
+      if (!result.ok) return;
+      assert.strictEqual(result.lookup, undefined);
+    });
+
+    it("resolves localhost to a pinned loopback lookup", { timeout: 10000 }, async () => {
+      const result = await resolveProviderUrl("http://localhost:11434/v1");
+      assert.strictEqual(result.ok, true);
+      if (!result.ok) return;
+      assert.ok(result.lookup, "expected a lookup for localhost");
+      const addresses = await new Promise<LookupAddress[]>((resolve, reject) => {
+        result.lookup!("localhost", { all: true }, (err, addrs) => {
+          if (err) return reject(err);
+          resolve(addrs as LookupAddress[]);
+        });
+      });
+      assert.ok(addresses.length > 0, "expected at least one localhost address");
+      assert.ok(
+        addresses.every((a) => isLoopbackHost(a.address)),
+        "expected only loopback addresses"
+      );
+    });
+
+    it("rejects unresolvable hostnames", { timeout: 10000 }, async () => {
+      const result = await resolveProviderUrl("http://omgb-test-does-not-resolve.invalid:8000/v1");
+      assert.strictEqual(result.ok, false);
+      if (result.ok) return;
+      assert.ok(result.reason.includes("DNS lookup failed"), `unexpected reason: ${result.reason}`);
     });
   });
 });

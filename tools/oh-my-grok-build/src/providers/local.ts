@@ -1,10 +1,38 @@
 import type { ProviderConfig } from "../types.js";
 import { loadOmgDotEnv } from "../config.js";
 import { formatProviderError } from "./errors.js";
-import { isAllowedProviderUrl } from "../net.js";
+import { resolveProviderUrl } from "../net.js";
+import { fetch as undiciFetch, Agent } from "undici";
 
 const OLLAMA_DEFAULT = "http://localhost:11434/v1";
 const LMSTUDIO_DEFAULT = "http://localhost:1234/v1";
+
+export class UrlValidationError extends Error {
+  readonly validation = true;
+}
+
+export interface SafeFetchResult {
+  status: number;
+  headers: Headers;
+  body: string;
+}
+
+async function safeFetch(
+  inputUrl: string,
+  init: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal } = {}
+): Promise<SafeFetchResult> {
+  const result = await resolveProviderUrl(inputUrl);
+  if (!result.ok) throw new UrlValidationError(result.reason);
+  const { url, host, lookup } = result;
+  const dispatcher = lookup ? new Agent({ connect: { servername: host, lookup } }) : undefined;
+  try {
+    const res = await undiciFetch(url.toString(), { ...init, dispatcher, redirect: "error" });
+    const body = await res.text();
+    return { status: res.status, headers: res.headers, body };
+  } finally {
+    await dispatcher?.close();
+  }
+}
 
 export async function probeOllama(baseUrl: string = OLLAMA_DEFAULT): Promise<string[]> {
   return listModelsAt(baseUrl);
@@ -24,8 +52,6 @@ export async function fetchModelList(
   apiBackend: string = "chat_completions",
   extraHeaders: Record<string, string> = {}
 ): Promise<string[] | undefined> {
-  const urlCheck = await isAllowedProviderUrl(baseUrl);
-  if (!urlCheck.ok) return undefined;
   const url = `${baseUrl.replace(/\/+$/, "")}/models`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
@@ -38,9 +64,9 @@ export async function fetchModelList(
     }
   }
   try {
-    const res = await fetch(url, { headers, signal: controller.signal });
-    if (!res.ok) return undefined;
-    const json = (await res.json()) as { data?: { id: string }[] };
+    const res = await safeFetch(url, { headers, signal: controller.signal });
+    if (res.status !== 200) return undefined;
+    const json = JSON.parse(res.body) as { data?: { id: string }[] };
     if (!Array.isArray(json?.data)) return undefined;
     return json.data.map((m) => m.id);
   } catch {
@@ -74,9 +100,6 @@ export async function resolveApiKey(provider: ProviderConfig): Promise<string | 
 }
 
 export async function testProvider(provider: ProviderConfig): Promise<{ ok: boolean; error?: string }> {
-  const urlCheck = await isAllowedProviderUrl(provider.baseUrl);
-  if (!urlCheck.ok) return { ok: false, error: urlCheck.reason };
-
   const apiKey = await resolveApiKey(provider);
   const baseUrl = provider.baseUrl.replace(/\/+$/, "");
   const backend = provider.apiBackend ?? "chat_completions";
@@ -114,11 +137,12 @@ async function testModelsList(baseUrl: string, headers: Record<string, string>):
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = await fetch(`${baseUrl}/models`, { headers, signal: controller.signal });
-    if (!res.ok) return false;
-    const json = (await res.json()) as { data?: unknown };
+    const res = await safeFetch(`${baseUrl}/models`, { headers, signal: controller.signal });
+    if (res.status !== 200) return false;
+    const json = JSON.parse(res.body) as { data?: unknown };
     return Array.isArray(json?.data);
-  } catch {
+  } catch (err) {
+    if (err instanceof UrlValidationError) throw err;
     return false;
   } finally {
     clearTimeout(timeout);
@@ -133,7 +157,7 @@ async function testTinyChatCompletion(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
+    const res = await safeFetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       signal: controller.signal,
@@ -143,10 +167,10 @@ async function testTinyChatCompletion(
         max_tokens: 1,
       }),
     });
-    if (res.ok) return { ok: true };
-    const text = await res.text();
-    return { ok: false, error: formatProviderError(res.status, text) };
+    if (res.status === 200) return { ok: true };
+    return { ok: false, error: formatProviderError(res.status, res.body) };
   } catch (err) {
+    if (err instanceof UrlValidationError) throw err;
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
     clearTimeout(timeout);
@@ -161,7 +185,7 @@ async function testTinyResponses(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = await fetch(`${baseUrl}/responses`, {
+    const res = await safeFetch(`${baseUrl}/responses`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       signal: controller.signal,
@@ -171,10 +195,10 @@ async function testTinyResponses(
         max_output_tokens: 1,
       }),
     });
-    if (res.ok) return { ok: true };
-    const text = await res.text();
-    return { ok: false, error: formatProviderError(res.status, text) };
+    if (res.status === 200) return { ok: true };
+    return { ok: false, error: formatProviderError(res.status, res.body) };
   } catch (err) {
+    if (err instanceof UrlValidationError) throw err;
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
     clearTimeout(timeout);
@@ -189,7 +213,7 @@ async function testTinyMessages(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = await fetch(`${baseUrl}/messages`, {
+    const res = await safeFetch(`${baseUrl}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       signal: controller.signal,
@@ -199,10 +223,10 @@ async function testTinyMessages(
         messages: [{ role: "user", content: "ping" }],
       }),
     });
-    if (res.ok) return { ok: true };
-    const text = await res.text();
-    return { ok: false, error: formatProviderError(res.status, text) };
+    if (res.status === 200) return { ok: true };
+    return { ok: false, error: formatProviderError(res.status, res.body) };
   } catch (err) {
+    if (err instanceof UrlValidationError) throw err;
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
     clearTimeout(timeout);

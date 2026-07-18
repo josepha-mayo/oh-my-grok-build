@@ -31,14 +31,15 @@ function startMockServer(
   handler: (
     req: { url?: string },
     res: { writeHead: (code: number, headers?: Record<string, string>) => void; end: (data?: string) => void }
-  ) => void
+  ) => void,
+  urlHost = "127.0.0.1"
 ): Promise<{ baseUrl: string; close: () => Promise<void> }> {
   return new Promise((resolve, reject) => {
     const server = createServer((req, res) => handler(req, res));
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address() as AddressInfo;
       resolve({
-        baseUrl: `http://127.0.0.1:${port}/v1`,
+        baseUrl: `http://${urlHost}:${port}/v1`,
         close: () => new Promise<void>((r) => server.close(() => r())),
       });
     });
@@ -110,6 +111,25 @@ describe("probeOllama", () => {
   it("returns an empty array for unreachable hosts", async () => {
     const models = await probeOllama("http://127.0.0.1:1/v1");
     assert.deepStrictEqual(models, []);
+  });
+
+  it("reads the full response body through the hostname lookup path", { timeout: 10000 }, async () => {
+    const bigBody = JSON.stringify({ data: [{ id: "model-a" }], _padding: "x".repeat(32 * 1024) });
+    const server = await startMockServer((req, res) => {
+      if (req.url === "/v1/models") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(bigBody);
+      } else {
+        res.writeHead(404);
+        res.end("not found");
+      }
+    }, "localhost");
+    try {
+      const models = await probeOllama(server.baseUrl);
+      assert.deepStrictEqual(models, ["model-a"]);
+    } finally {
+      await server.close();
+    }
   });
 });
 
