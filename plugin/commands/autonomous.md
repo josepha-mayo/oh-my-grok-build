@@ -1,12 +1,12 @@
 ---
 name: autonomous
-description: Fully autonomous mode via `omgb devin autonomous`. Runs with --yolo and warns if the Grok sandbox profile is not set to a non-off value.
+description: Fully autonomous mode via `omgb autonomous`. Runs with --yolo and warns if the Grok sandbox profile is not set to a non-off value.
 ---
 
 # /autonomous — high-autonomy mode
 
 1. Treat the user's last message as a mission, not a single question.
-2. Run it with `omgb devin autonomous "<mission>" [--model ...] [--sandbox-profile <profile>]`.
+2. Run it with `omgb autonomous "<mission>" [--model ...] [--sandbox-profile <profile>]`.
 3. The command always passes `--yolo` (auto-approve tool calls) to Grok.
 4. Check `~/.grok/config.toml` for `[sandbox].profile` before launching. Warn on stderr if it is missing or set to `off`, because autonomous mode should only run inside a sandbox.
 5. Pass `--sandbox-profile <profile>` to set the `GROK_SANDBOX_PROFILE` environment variable for the spawned Grok process (best effort).
