@@ -28,7 +28,12 @@ function sanitizeFilename(name: string): string {
 
 function xmlText(tag: string, block: string): string {
   const m = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`));
-  return m ? m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() : "";
+  return m
+    ? m[1]
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    : "";
 }
 
 function xmlAttr(tag: string, attr: string, block: string): string {

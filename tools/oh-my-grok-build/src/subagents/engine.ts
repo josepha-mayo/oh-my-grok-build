@@ -108,7 +108,15 @@ export async function spawnSubagent(
 
   appendFileSync(
     traceFile,
-    JSON.stringify({ ts: new Date().toISOString(), event: "spawn", name: safeName, prompt, model: options.model, yolo: options.yolo, maxTurns: options.maxTurns }) + "\n"
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      event: "spawn",
+      name: safeName,
+      prompt,
+      model: options.model,
+      yolo: options.yolo,
+      maxTurns: options.maxTurns,
+    }) + "\n"
   );
 
   const logFd = openSync(logPath, "a");
