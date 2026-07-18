@@ -168,6 +168,7 @@ function shellQuote(input: string): string {
 function isLocalOrPrivateHost(host: string): boolean {
   const h = host.toLowerCase();
   if (h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1") return true;
+  if (h.endsWith(".local")) return true;
   if (h.startsWith("10.") || h.startsWith("192.168.") || /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)) return true;
   if (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:")) return true;
   return false;
