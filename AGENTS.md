@@ -6,7 +6,7 @@ This repo is a fork of the open-source `xai-org/grok-build` SpaceXAI harness. We
 
 - Keep Grok Build's Rust core untouched as the execution engine.
 - Add the missing harness features found in `oh-my-codex`, `oh-my-pi`, `Command Code`, `Hermes`, etc.: BYOK providers, local model discovery, background/cron tasks, subagent orchestration, taste learning, team worktree isolation, git-native safety hooks, session branching helpers, and a mobile relay.
-- Ship as a TypeScript/Node CLI (`tools/oh-my-grok-build`) plus a Grok plugin (`plugin/`) and a Capacitor React mobile app (`apps/mobile`).
+- Ship as a TypeScript/Node CLI (`tools/oh-my-grok-build`) plus a Grok plugin (`plugin/`). The Capacitor React mobile app lives in its own repository (`github.com/josepha-mayo/grok-build-app`).
 
 ## Repository layout
 
@@ -15,7 +15,7 @@ This repo is a fork of the open-source `xai-org/grok-build` SpaceXAI harness. We
 | `crates/` | Upstream Grok Build Rust source (do not edit unless upstreaming) |
 | `tools/oh-my-grok-build/` | `omgb` TypeScript harness: ACP relay, providers, team, sessions, exec, background scheduler, subagents |
 | `plugin/` | Grok Build plugin: skills, hooks, agents, slash commands |
-| `apps/mobile/` | Capacitor React mobile app (linked from `.vscode/vibe_app_slop` for local dev) |
+| `github.com/josepha-mayo/grok-build-app` | Capacitor React mobile app (now its own repo) |
 | `AGENTS.md` | This file |
 
 ## Conventions
@@ -40,8 +40,8 @@ npm run build
 npm test
 npm run format:check
 
-# Mobile app
-cd apps/mobile
+# Mobile app (separate repo)
+cd ../grok-build-app
 npm install
 npm run typecheck
 npm run build
