@@ -191,7 +191,9 @@ export async function loadOmgDotEnvIntoProcess(): Promise<void> {
     if (idx === -1) continue;
     const key = trimmed.slice(0, idx).trim();
     const value = unquote(trimmed.slice(idx + 1).trim());
-    if (key && process.env[key] === undefined) {
+    // Only load API-key-like variables; never set sensitive process env vars
+    // such as PATH, LD_PRELOAD, or SHELL from a user-editable dotenv file.
+    if (key && process.env[key] === undefined && /^[_A-Z0-9]+_API_KEY$/i.test(key)) {
       process.env[key] = value;
     }
   }

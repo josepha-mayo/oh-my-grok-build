@@ -59,6 +59,10 @@ async function ensurePage(): Promise<any> {
     browser = await chromium.launch({ headless: true });
     context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
     page = await context.newPage();
+    page.consoleLogs = [];
+    page.on("console", (msg: any) => {
+      page.consoleLogs.push(`${msg.type()}: ${msg.text()}`);
+    });
     return page;
   } catch (err) {
     throw new Error(
@@ -194,12 +198,12 @@ const browserScreenshot: McpTool = {
 
 const browserConsole: McpTool = {
   name: "browser_console",
-  description: "Return recent browser console logs.",
+  description: "Return recent browser console logs captured since the last call.",
   inputSchema: { type: "object", properties: {} },
   async handler() {
     const p = await ensurePage();
-    const logs: string[] = [];
-    p.on("console", (msg: any) => logs.push(`${msg.type()}: ${msg.text()}`));
+    const logs = p.consoleLogs ?? [];
+    p.consoleLogs = [];
     return textResult(logs.length ? logs.join("\n") : "No console logs captured.");
   },
 };
