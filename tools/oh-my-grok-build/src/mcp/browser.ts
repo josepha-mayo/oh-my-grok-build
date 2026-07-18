@@ -208,6 +208,112 @@ const browserConsole: McpTool = {
   },
 };
 
+const browserEvaluate: McpTool = {
+  name: "browser_evaluate",
+  description: "Evaluate a JavaScript expression in the page context and return the result.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      script: { type: "string", description: "JavaScript expression or function body to evaluate." },
+    },
+    required: ["script"],
+  },
+  async handler(args) {
+    const script = String(args.script ?? "").trim();
+    if (!script) throw new Error("script is required");
+    const p = await ensurePage();
+    const result = await p.evaluate((s: string) => {
+      const fn = new Function(s);
+      return fn();
+    }, script);
+    return textResult(`Result: ${JSON.stringify(result)}`);
+  },
+};
+
+const browserSetViewport: McpTool = {
+  name: "browser_set_viewport",
+  description: "Set the browser viewport size.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      width: { type: "number", description: "Viewport width in pixels." },
+      height: { type: "number", description: "Viewport height in pixels." },
+    },
+    required: ["width", "height"],
+  },
+  async handler(args) {
+    const width = Number(args.width);
+    const height = Number(args.height);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) {
+      throw new Error("width and height must be positive numbers");
+    }
+    const p = await ensurePage();
+    await p.setViewportSize({ width, height });
+    return textResult(`Viewport set to ${width}x${height}.`);
+  },
+};
+
+const browserScroll: McpTool = {
+  name: "browser_scroll",
+  description: "Scroll the page by a relative amount or to a selector.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      deltaY: { type: "number", description: "Vertical scroll delta in pixels (positive = down)." },
+      ref: { type: "string", description: "Optional element ref or selector to scroll into view." },
+    },
+  },
+  async handler(args) {
+    const p = await ensurePage();
+    const ref = String(args.ref ?? "").trim();
+    if (ref) {
+      const selector = ref.startsWith("@") ? sanitizeAccessibilityRef(ref) : ref;
+      await p.evaluate((sel: string) => document.querySelector(sel)?.scrollIntoView({ behavior: "auto", block: "center" }), selector);
+    } else if (args.deltaY !== undefined) {
+      const deltaY = Number(args.deltaY);
+      if (!Number.isFinite(deltaY)) throw new Error("deltaY must be a number");
+      await p.evaluate((dy: number) => window.scrollBy(0, dy), deltaY);
+    } else {
+      throw new Error("Provide ref or deltaY");
+    }
+    return textResult(`Scrolled.\n\n${await snapshot()}`);
+  },
+};
+
+const browserGetUrl: McpTool = {
+  name: "browser_get_url",
+  description: "Return the current page URL and title.",
+  inputSchema: { type: "object", properties: {} },
+  async handler() {
+    const p = await ensurePage();
+    const url = p.url();
+    const title = await p.title().catch(() => "");
+    return textResult(`URL: ${url}\nTitle: ${title}`);
+  },
+};
+
+const browserSelect: McpTool = {
+  name: "browser_select",
+  description: "Select an option in a <select> element.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      ref: { type: "string", description: "Element ref or selector for the <select>." },
+      value: { type: "string", description: "Option value to select." },
+    },
+    required: ["ref", "value"],
+  },
+  async handler(args) {
+    const ref = String(args.ref ?? "").trim();
+    const value = String(args.value ?? "");
+    if (!ref) throw new Error("ref is required");
+    const p = await ensurePage();
+    const selector = ref.startsWith("@") ? sanitizeAccessibilityRef(ref) : ref;
+    await p.selectOption(selector, value);
+    return textResult(`Selected ${value} in ${ref}.\n\n${await snapshot()}`);
+  },
+};
+
 const browserClose: McpTool = {
   name: "browser_close",
   description: "Close the browser session.",
@@ -236,6 +342,11 @@ startMcpServer({
     browserPress,
     browserScreenshot,
     browserConsole,
+    browserEvaluate,
+    browserSetViewport,
+    browserScroll,
+    browserGetUrl,
+    browserSelect,
     browserClose,
   ],
 });
