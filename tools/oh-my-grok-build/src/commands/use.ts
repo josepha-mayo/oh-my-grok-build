@@ -5,6 +5,8 @@ import { createStdioTransport } from "../acp/stdio.js";
 import { loadOmgConfig } from "../config.js";
 import { builtInMcpServer, toAcpMcpServers } from "../mcp/mcp-config.js";
 import { appendTimelineEvent } from "../timeline.js";
+import { selectPermissionOption } from "../permissions.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import type { AcpPermissionRequest, AcpPermissionResponse, AcpUpdate } from "../types.js";
 
 export interface UseOptions {
@@ -19,27 +21,17 @@ export interface UseOptions {
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000;
 
-function selectPermissionOption(options: { optionId: string; kind?: string }[]): string {
-  const allowOnce = options.find((o) => o.kind === "allow_once" || /allow\.once/i.test(o.optionId));
-  if (allowOnce) return allowOnce.optionId;
-  return options[0]?.optionId ?? "";
-}
-
 function handlePermission(req: AcpPermissionRequest, yolo: boolean): AcpPermissionResponse {
-  const optionId = selectPermissionOption(req.options);
+  const optionId = selectPermissionOption(req.options, yolo);
   const label = req.toolCall.title ?? req.toolCall.command ?? "tool call";
   if (optionId) {
     const optionName = req.options.find((o) => o.optionId === optionId)?.name ?? optionId;
-    const modeMsg = yolo ? "" : " (run with --yolo to suppress these prompts)";
+    const modeMsg = yolo ? "" : " (auto-approving once per turn; use --yolo to always allow)";
     process.stderr.write(chalk.yellow(`Auto-approving ${label}: ${optionName}${modeMsg}\n`));
   } else {
     process.stderr.write(chalk.yellow(`No approval option for ${label}; cancelling\n`));
   }
   return { outcome: optionId ? { outcome: "selected", optionId } : { outcome: "cancelled" } };
-}
-
-function isRateLimited(text: string): boolean {
-  return /rate.?limit|429|too many requests/i.test(text);
 }
 
 export async function useCommand(options: UseOptions): Promise<string> {
@@ -159,7 +151,7 @@ export async function browserCommand(options: Omit<UseOptions, "mode">): Promise
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isRateLimited(message)) {
-      console.error(chalk.yellow("Looks like you hit a rate limit. Please wait a moment and try again."));
+      console.error(chalk.yellow(formatRateLimitMessage()));
     } else {
       console.error(chalk.red(message));
     }
@@ -179,7 +171,7 @@ export async function computerCommand(options: Omit<UseOptions, "mode">): Promis
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isRateLimited(message)) {
-      console.error(chalk.yellow("Looks like you hit a rate limit. Please wait a moment and try again."));
+      console.error(chalk.yellow(formatRateLimitMessage()));
     } else {
       console.error(chalk.red(message));
     }

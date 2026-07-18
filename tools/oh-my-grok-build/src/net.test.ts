@@ -8,6 +8,8 @@ describe("net", () => {
       assert.strictEqual(isPrivateIp("127.0.0.1"), true);
       assert.strictEqual(isPrivateIp("::1"), true);
       assert.strictEqual(isPrivateIp("::ffff:127.0.0.1"), true);
+      // Node URL normalizes IPv4-mapped loopback to the compressed hex form.
+      assert.strictEqual(isPrivateIp("::ffff:7f00:1"), true);
     });
 
     it("detects RFC1918 addresses", () => {
@@ -15,6 +17,8 @@ describe("net", () => {
       assert.strictEqual(isPrivateIp("192.168.1.1"), true);
       assert.strictEqual(isPrivateIp("172.16.0.1"), true);
       assert.strictEqual(isPrivateIp("172.31.255.255"), true);
+      // Compressed IPv4-mapped RFC1918.
+      assert.strictEqual(isPrivateIp("::ffff:c0a8:101"), true);
     });
 
     it("detects link-local and IPv6 link-local", () => {
@@ -44,6 +48,8 @@ describe("net", () => {
       assert.strictEqual(isAllowedHttpUrl("http://localhost:8080").ok, false);
       assert.strictEqual(isAllowedHttpUrl("http://127.0.0.1:8080").ok, false);
       assert.strictEqual(isAllowedHttpUrl("http://[::1]:8080").ok, false);
+      assert.strictEqual(isAllowedHttpUrl("http://[::ffff:127.0.0.1]:8080").ok, false);
+      assert.strictEqual(isAllowedHttpUrl("http://[::ffff:7f00:1]:8080").ok, false);
     });
 
     it("blocks cloud metadata endpoints", () => {
@@ -53,6 +59,12 @@ describe("net", () => {
 
     it("blocks URLs with embedded credentials", () => {
       assert.strictEqual(isAllowedHttpUrl("https://user:pass@example.com").ok, false);
+    });
+
+    it("blocks trailing-dot and percent-encoded FQDN bypasses", () => {
+      assert.strictEqual(isAllowedHttpUrl("http://localhost.:8080").ok, false);
+      assert.strictEqual(isAllowedHttpUrl("http://localhost%2e:8080").ok, false);
+      assert.strictEqual(isAllowedHttpUrl("http://metadata.google.internal.:8080").ok, false);
     });
   });
 
@@ -69,6 +81,7 @@ describe("net", () => {
     it("blocks cloud metadata endpoints", () => {
       assert.strictEqual(isAllowedWsUrl("ws://169.254.169.254").ok, false);
       assert.strictEqual(isAllowedWsUrl("ws://metadata.google.internal").ok, false);
+      assert.strictEqual(isAllowedWsUrl("ws://metadata.google.internal.").ok, false);
     });
   });
 });

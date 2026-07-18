@@ -270,6 +270,12 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
       continue;
     }
 
+    if (trimmed.startsWith("/btw")) {
+      const note = trimmed.slice("/btw".length).trim();
+      console.log(chalk.yellow(note ? `Side note: ${note}` : "Side note: What's on your mind?"));
+      continue;
+    }
+
     try {
       await client.prompt(session.sessionId, [{ type: "text", text: line }]);
     } catch (err) {

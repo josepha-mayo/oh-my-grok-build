@@ -2,13 +2,8 @@ import path from "node:path";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
 import { isAllowedWsUrl } from "../net.js";
+import { makePermissionResponse, selectPermissionOption } from "../permissions.js";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
-
-function selectPermissionOption(options: { optionId: string; kind?: string }[]): string {
-  const allowOnce = options.find((o) => o.kind === "allow_once" || /allow.once/i.test(o.optionId));
-  if (allowOnce) return allowOnce.optionId;
-  return options[0]?.optionId ?? "";
-}
 
 export class OpenCodeConnector implements Connector {
   private client?: AcpClient;
@@ -48,10 +43,7 @@ export class OpenCodeConnector implements Connector {
           turnResolver?.();
         }
       },
-      onPermission: async (req) => {
-        const optionId = selectPermissionOption(req.options);
-        return { outcome: optionId ? { outcome: "selected", optionId } : { outcome: "cancelled" } };
-      },
+      onPermission: async (req) => makePermissionResponse(selectPermissionOption(req.options)),
     });
     this.client = client;
 

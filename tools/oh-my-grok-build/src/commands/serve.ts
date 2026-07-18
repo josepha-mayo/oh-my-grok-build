@@ -31,10 +31,11 @@ export async function serveCommand(options: ServeOptions & { qr?: boolean }): Pr
 
   console.log(chalk.dim("\nPress Ctrl+C to stop the server."));
 
-  const onShutdown = async () => {
+  const onShutdown = () => {
     console.log(chalk.dim("\nShutting down agent server..."));
-    await stopAgentServer(server);
-    process.exit(0);
+    void stopAgentServer(server)
+      .catch(() => undefined)
+      .finally(() => process.exit(0));
   };
 
   process.on("SIGINT", onShutdown);
