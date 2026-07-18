@@ -1,6 +1,7 @@
 import type { ProviderConfig } from "../types.js";
 import { loadOmgDotEnv } from "../config.js";
 import { formatProviderError } from "./errors.js";
+import { isAllowedProviderUrl } from "../net.js";
 
 const OLLAMA_DEFAULT = "http://localhost:11434/v1";
 const LMSTUDIO_DEFAULT = "http://localhost:1234/v1";
@@ -23,6 +24,8 @@ export async function fetchModelList(
   apiBackend: string = "chat_completions",
   extraHeaders: Record<string, string> = {}
 ): Promise<string[] | undefined> {
+  const urlCheck = await isAllowedProviderUrl(baseUrl);
+  if (!urlCheck.ok) return undefined;
   const url = `${baseUrl.replace(/\/+$/, "")}/models`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
@@ -71,6 +74,9 @@ export async function resolveApiKey(provider: ProviderConfig): Promise<string | 
 }
 
 export async function testProvider(provider: ProviderConfig): Promise<{ ok: boolean; error?: string }> {
+  const urlCheck = await isAllowedProviderUrl(provider.baseUrl);
+  if (!urlCheck.ok) return { ok: false, error: urlCheck.reason };
+
   const apiKey = await resolveApiKey(provider);
   const baseUrl = provider.baseUrl.replace(/\/+$/, "");
   const backend = provider.apiBackend ?? "chat_completions";

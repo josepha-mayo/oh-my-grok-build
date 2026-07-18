@@ -1,6 +1,6 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join, resolve, normalize, sep } from "node:path";
-import { getOmgDir, loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, getOmgDir, loadOmgConfig } from "../config.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import spawner from "../spawner.js";
 
@@ -45,7 +45,7 @@ function appendLog(file: string, stream: "stdout" | "stderr", data: Buffer): voi
 
 export async function runPromptTask(prompt: string, options: RunPromptOptions = {}): Promise<void> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
+  const model = options.model ?? cfg.defaultModel ?? DEFAULT_MODEL;
 
   const args = ["-p", prompt, "--model", model];
   if (options.yolo) args.push("--yolo");

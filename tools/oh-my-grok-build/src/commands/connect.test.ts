@@ -8,6 +8,26 @@ import { setupOmgHome, cleanupOmgHome } from "../test-utils.js";
 
 let tempDir: string;
 
+function waitForPrompt(output: PassThrough, n = 1): Promise<void> {
+  return new Promise((resolve) => {
+    let count = 0;
+    let buffer = "";
+    const listener = (chunk: Buffer) => {
+      buffer += chunk.toString();
+      while (buffer.includes("you>")) {
+        count++;
+        buffer = buffer.slice(buffer.indexOf("you>") + 4);
+        if (count >= n) {
+          output.off("data", listener);
+          resolve();
+          return;
+        }
+      }
+    };
+    output.on("data", listener);
+  });
+}
+
 describe("connect command", () => {
   beforeEach(() => {
     tempDir = setupOmgHome();
@@ -49,8 +69,7 @@ describe("connect command", () => {
     const exit = (code: number) => output.write(`exit:${code}\n`);
 
     try {
-      // Give the command time to reach the readline prompt before sending /quit.
-      setTimeout(() => input.write("/quit\n"), 500);
+      waitForPrompt(output).then(() => input.write("/quit\n"));
       await connectCommand({
         url: `${urlBase}/ws?server-key=test`,
         input,
@@ -112,8 +131,8 @@ describe("connect command", () => {
     const exit = (code: number) => output.write(`exit:${code}\n`);
 
     try {
-      setTimeout(() => input.write("/loop 2 hello\n"), 100);
-      setTimeout(() => input.write("/quit\n"), 500);
+      waitForPrompt(output).then(() => input.write("/loop 2 hello\n"));
+      waitForPrompt(output, 2).then(() => input.write("/quit\n"));
       await connectCommand({
         url: `${urlBase}/ws?server-key=test`,
         input,

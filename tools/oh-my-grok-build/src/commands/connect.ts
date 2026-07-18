@@ -8,7 +8,7 @@ import { createNodeWebSocketTransport } from "../acp/transport.js";
 import { parseServerUrl } from "../acp/server.js";
 import { isAllowedWsUrl } from "../net.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
-import { loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
 import { swarmCommand } from "./swarm.js";
 import {
@@ -188,7 +188,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const cfg = await loadOmgConfig();
   const explicitModel = options.model ?? cfg.defaultModel;
-  let currentModel = explicitModel ?? "grok-4.5";
+  let currentModel = explicitModel ?? DEFAULT_MODEL;
   let hasExplicitModel = Boolean(explicitModel);
   let currentEffort: ReasoningEffort = "medium";
   let currentYolo = options.yolo ?? false;

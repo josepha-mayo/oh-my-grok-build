@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { parse, stringify } from "smol-toml";
 import type { OmgConfig, ProviderConfig } from "./types.js";
 
+export const DEFAULT_MODEL = "grok-4.5";
+
 export function getGrokHome(): string {
   return process.env.GROK_HOME ?? join(homedir(), ".grok");
 }

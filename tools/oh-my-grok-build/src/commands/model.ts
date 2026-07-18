@@ -1,6 +1,6 @@
 import readline from "node:readline/promises";
 import chalk from "chalk";
-import { loadGrokConfig, saveGrokConfig, loadOmgConfig, saveOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, loadGrokConfig, saveGrokConfig, loadOmgConfig, saveOmgConfig } from "../config.js";
 
 interface SelectableModel {
   id: string;
@@ -8,7 +8,7 @@ interface SelectableModel {
 }
 
 async function listSelectableModels(): Promise<SelectableModel[]> {
-  const models: SelectableModel[] = [{ id: "grok-4.5", label: "Grok 4.5 (built-in)" }];
+  const models: SelectableModel[] = [{ id: DEFAULT_MODEL, label: "Grok 4.5 (built-in)" }];
 
   const ocfg = await loadOmgConfig();
   for (const p of Object.values(ocfg.providers ?? {})) {
@@ -38,7 +38,7 @@ async function pickModel(rl: readline.Interface, models: SelectableModel[], curr
     if (idx >= 0 && idx < models.length) return models[idx].id;
   }
   if (answer) return answer;
-  return current ?? "grok-4.5";
+  return current ?? DEFAULT_MODEL;
 }
 
 async function interactiveSetModel(): Promise<void> {
@@ -73,8 +73,8 @@ export async function modelCommand(modelId?: string): Promise<void> {
   if (!modelId) {
     const gcfg = await loadGrokConfig();
     const current = (gcfg.models as Record<string, unknown> | undefined)?.default;
-    console.log(chalk.bold(`Current default model: ${chalk.cyan(String(current ?? "grok-4.5"))}`));
-    if (process.stdin.isTTY) {
+    console.log(chalk.bold(`Current default model: ${chalk.cyan(String(current ?? DEFAULT_MODEL))}`));
+    if (process.stdin.isTTY && process.stdout.isTTY) {
       await interactiveSetModel();
     }
     return;
@@ -88,7 +88,7 @@ export async function modelsCommand(): Promise<void> {
   const current = (gcfg.models as Record<string, unknown> | undefined)?.default;
   const models = await listSelectableModels();
 
-  console.log(chalk.bold(`Default model: ${chalk.cyan(String(current ?? "grok-4.5"))}\n`));
+  console.log(chalk.bold(`Default model: ${chalk.cyan(String(current ?? DEFAULT_MODEL))}\n`));
   console.log(chalk.bold("Available models:"));
   for (const m of models) {
     const marker = current && m.id === current ? chalk.yellow(" *") : "";

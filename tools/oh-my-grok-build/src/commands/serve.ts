@@ -1,7 +1,7 @@
 import qrcode from "qrcode";
 import chalk from "chalk";
 import { startAgentServer, stopAgentServer } from "../acp/server.js";
-import { loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, loadOmgConfig } from "../config.js";
 import type { ServeOptions } from "../acp/server.js";
 import type { ServerInfo } from "../types.js";
 
@@ -21,7 +21,7 @@ export async function serveCommand(options: ServeOptions & { qr?: boolean }): Pr
 
   console.log(chalk.green("\nGrok agent server is running."));
   console.log(`  URL:    ${chalk.cyan(server.url)}`);
-  console.log(`  Model:  ${chalk.cyan(model ?? "grok-4.5 (default)")}`);
+  console.log(`  Model:  ${chalk.cyan(model ?? `${DEFAULT_MODEL} (default)`)}`);
   console.log(`  CWD:    ${chalk.cyan(server.cwd)}`);
 
   if (options.qr !== false) {

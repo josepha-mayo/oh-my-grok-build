@@ -1,6 +1,6 @@
 import { openSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteFile, ensureOmgDir, getOmgDir } from "../config.js";
+import { atomicWriteFile, ensureOmgDir, getOmgDir, DEFAULT_MODEL } from "../config.js";
 import spawner from "../spawner.js";
 import { appendTimelineEvent } from "../timeline.js";
 
@@ -121,7 +121,7 @@ export async function spawnSubagent(
 
   const logFd = openSync(logPath, "a");
 
-  const args = ["-p", prompt, "--model", options.model ?? "grok-4.5"];
+  const args = ["-p", prompt, "--model", options.model ?? DEFAULT_MODEL];
   if (options.yolo) args.push("--yolo");
   if (options.maxTurns) args.push("--max-turns", String(options.maxTurns));
 
@@ -213,7 +213,7 @@ export async function subagentTrace(name: string, rawTailLines = 50): Promise<st
 
   const parts: string[] = [];
   parts.push(`Subagent: ${record.name}`);
-  parts.push(`Model: ${record.model ?? "grok-4.5"}`);
+  parts.push(`Model: ${record.model ?? DEFAULT_MODEL}`);
   parts.push(`Spawned: ${record.spawnedAt}`);
   parts.push(`Worktree: ${record.worktree}`);
   parts.push(`Prompt: ${record.prompt}`);

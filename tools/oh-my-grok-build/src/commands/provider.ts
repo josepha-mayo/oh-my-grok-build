@@ -4,6 +4,7 @@ import chalk from "chalk";
 import { addProvider, getProvider, listProviders, removeProvider, setDefaultProvider } from "../providers/manager.js";
 import { listProviderTemplates, getProviderTemplate } from "../providers/registry.js";
 import { discoverLocalModels, testProvider, fetchModelList } from "../providers/local.js";
+import { isAllowedProviderUrl, isLoopbackHost } from "../net.js";
 import type { ProviderConfig } from "../types.js";
 
 export interface ProviderAddOptions {
@@ -12,7 +13,6 @@ export interface ProviderAddOptions {
   id?: string;
   baseUrl?: string;
   model?: string;
-  apiKey?: string;
   apiBackend?: ProviderConfig["apiBackend"];
 }
 
@@ -22,7 +22,8 @@ function pickProviderEnvKey(
   apiKey?: string
 ): string | string[] | undefined {
   if (apiKey) return undefined;
-  if (baseUrl.startsWith("http://localhost") || baseUrl.startsWith("https://localhost")) return undefined;
+  const url = new URL(baseUrl);
+  if (isLoopbackHost(url.hostname)) return undefined;
   if (!template.envKey) return undefined;
   if (typeof template.envKey === "string") return template.envKey;
   const filtered = template.envKey.filter((k) => k.endsWith("_API_KEY"));
@@ -118,13 +119,17 @@ export async function providerAddCommand(options: ProviderAddOptions = {}): Prom
       throw new Error("--base-url is required");
     }
     if (!baseUrl) throw new Error("API base URL is required");
+    const urlCheck = await isAllowedProviderUrl(baseUrl);
+    if (!urlCheck.ok) throw new Error(urlCheck.reason);
 
     const apiBackend = options.apiBackend ?? template.apiBackend ?? "chat_completions";
+    const allowedBackends: ProviderConfig["apiBackend"][] = ["chat_completions", "responses", "messages"];
+    if (!allowedBackends.includes(apiBackend)) {
+      throw new Error(`Unsupported API backend: ${apiBackend}. Must be one of: ${allowedBackends.join(", ")}`);
+    }
 
     let apiKey: string | undefined;
-    if (options.apiKey !== undefined) {
-      apiKey = options.apiKey || undefined;
-    } else if (options.interactive !== false) {
+    if (options.interactive !== false) {
       const suffix = " (leave blank to use env var or for no auth)";
       const key = template.apiKeyLabel
         ? await questionHidden(rl, `${template.apiKeyLabel}${suffix}: `)

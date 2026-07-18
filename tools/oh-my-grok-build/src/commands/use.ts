@@ -2,7 +2,7 @@ import path from "node:path";
 import chalk from "chalk";
 import { AcpClient, type AcpTransport } from "../acp/client.js";
 import { createStdioTransport } from "../acp/stdio.js";
-import { loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, loadOmgConfig } from "../config.js";
 import { builtInMcpServer, toAcpMcpServers } from "../mcp/mcp-config.js";
 import { appendTimelineEvent } from "../timeline.js";
 import { selectPermissionOption } from "../permissions.js";
@@ -38,7 +38,7 @@ function handlePermission(req: AcpPermissionRequest, yolo: boolean): AcpPermissi
 
 export async function useCommand(options: UseOptions): Promise<string> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
+  const model = options.model ?? cfg.defaultModel ?? DEFAULT_MODEL;
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const timeoutMs = Number.isNaN(options.timeoutMs) ? DEFAULT_TIMEOUT : (options.timeoutMs ?? DEFAULT_TIMEOUT);
 
