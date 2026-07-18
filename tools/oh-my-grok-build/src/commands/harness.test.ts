@@ -74,4 +74,32 @@ describe("harness command", () => {
     assert.ok(captured!.args.includes("do work"));
     assert.ok(lines.some((l) => l.includes("hello harness")));
   });
+
+  it("runs a prompt through the pi connector", async () => {
+    await harnessAddCommand("pi-main", "pi", { command: "pi" });
+
+    let captured: { cmd: string; args: string[] } | undefined;
+    (spawner as any).spawn = (cmd: string, args: string[]) => {
+      captured = { cmd, args };
+      const proc = fakeProcess();
+      setImmediate(() => proc.stdout.write(Buffer.from("pi output")));
+      proc.finish(0);
+      return proc;
+    };
+
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => lines.push(args.join(" "));
+    try {
+      await harnessRunCommand("pi-main", "do work");
+    } finally {
+      console.log = original;
+    }
+
+    assert.ok(captured);
+    assert.strictEqual(captured!.cmd, "pi");
+    assert.ok(captured!.args.includes("-p"));
+    assert.ok(captured!.args.includes("do work"));
+    assert.ok(lines.some((l) => l.includes("pi output")));
+  });
 });

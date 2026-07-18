@@ -2,9 +2,12 @@ import type {
   AcpAuthMethod,
   AcpInitializeResponse,
   AcpMessage,
+  AcpNewSessionResponse,
   AcpPermissionRequest,
   AcpPermissionResponse,
   AcpPromptPart,
+  AcpSessionConfigOption,
+  AcpSetConfigOptionResponse,
   AcpUpdate,
 } from "../types.js";
 
@@ -40,6 +43,7 @@ export class AcpClient {
   private pending = new Map<string | number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private idCounter = 0;
   private initialized = false;
+  private sessionConfigOptions = new Map<string, AcpSessionConfigOption[]>();
 
   constructor(transport: AcpTransport, handlers: AcpClientHandlers = {}) {
     this.transport = transport;
@@ -94,7 +98,7 @@ export class AcpClient {
   }
 
   async authenticate(authMethod: AcpAuthMethod, timeoutMs = 60_000): Promise<unknown> {
-    return this.request("authenticate", { authMethod: authMethod.id, meta: { headless: true } }, timeoutMs);
+    return this.request("authenticate", { methodId: authMethod.id, _meta: { headless: true } }, timeoutMs);
   }
 
   async newSession(
@@ -102,18 +106,98 @@ export class AcpClient {
     mcpServers: unknown[] = [],
     meta: Record<string, unknown> = {},
     timeoutMs = 120_000
-  ): Promise<{ sessionId: string }> {
+  ): Promise<AcpNewSessionResponse> {
     const params: Record<string, unknown> = { cwd, mcpServers };
     if (Object.keys(meta).length) params._meta = meta;
-    return (await this.request("session/new", params, timeoutMs)) as { sessionId: string };
+    const response = (await this.request("session/new", params, timeoutMs)) as AcpNewSessionResponse;
+    if (response.configOptions) {
+      this.sessionConfigOptions.set(response.sessionId, response.configOptions);
+    }
+    return response;
   }
 
-  async setModel(sessionId: string, modelId: string, timeoutMs = 60_000): Promise<unknown> {
-    return this.request("session/set_model", { sessionId, modelId }, timeoutMs);
+  private findConfigOption(sessionId: string, category: string): AcpSessionConfigOption | undefined {
+    return this.sessionConfigOptions.get(sessionId)?.find((o) => o.category === category);
+  }
+
+  private updateConfigOptions(sessionId: string, configOptions: AcpSessionConfigOption[] | undefined): void {
+    if (configOptions) {
+      this.sessionConfigOptions.set(sessionId, configOptions);
+    }
+  }
+
+  async setConfigOption(
+    sessionId: string,
+    configId: string,
+    value: string | boolean,
+    timeoutMs = 60_000
+  ): Promise<AcpSetConfigOptionResponse> {
+    const params: Record<string, unknown> = { sessionId, configId, value };
+    if (typeof value === "boolean") {
+      params.type = "boolean";
+    }
+    const response = (await this.request("session/set_config_option", params, timeoutMs)) as AcpSetConfigOptionResponse;
+    this.updateConfigOptions(sessionId, response.configOptions);
+    return response;
+  }
+
+  async setModel(
+    sessionId: string,
+    modelId: string,
+    meta?: Record<string, unknown>,
+    timeoutMs = 60_000
+  ): Promise<unknown> {
+    const modelOption = this.findConfigOption(sessionId, "model");
+    if (modelOption) {
+      return this.setConfigOption(sessionId, modelOption.id, modelId, timeoutMs);
+    }
+    const params: Record<string, unknown> = { sessionId, modelId };
+    if (meta && Object.keys(meta).length) params._meta = meta;
+    return this.request("session/set_model", params, timeoutMs);
+  }
+
+  async setModelWithEffort(
+    sessionId: string,
+    modelId: string,
+    reasoningEffort: string,
+    timeoutMs = 60_000
+  ): Promise<unknown> {
+    const modelOption = this.findConfigOption(sessionId, "model");
+    if (modelOption) {
+      await this.setConfigOption(sessionId, modelOption.id, modelId, timeoutMs);
+      return this.setEffort(sessionId, reasoningEffort, timeoutMs);
+    }
+    const params: Record<string, unknown> = { sessionId, modelId, _meta: { reasoningEffort } };
+    return this.request("session/set_model", params, timeoutMs);
+  }
+
+  async setEffort(sessionId: string, effort: string, timeoutMs = 60_000): Promise<boolean> {
+    const options = this.sessionConfigOptions.get(sessionId) ?? [];
+    const option =
+      options.find((o) => o.category === "thought_level") ??
+      options.find((o) => o.category === "model_config" && /effort|reason|thinking/i.test(`${o.id} ${o.name ?? ""}`));
+    if (option) {
+      await this.setConfigOption(sessionId, option.id, effort, timeoutMs);
+      return true;
+    }
+    return false;
+  }
+
+  async setMode(sessionId: string, mode: string, timeoutMs = 60_000): Promise<boolean> {
+    const option = this.findConfigOption(sessionId, "mode");
+    if (option?.options?.some((o) => o.value === mode)) {
+      await this.setConfigOption(sessionId, option.id, mode, timeoutMs);
+      return true;
+    }
+    return false;
   }
 
   async prompt(sessionId: string, prompt: AcpPromptPart[], timeoutMs = 120_000): Promise<unknown> {
     return this.request("session/prompt", { sessionId, prompt }, timeoutMs);
+  }
+
+  async cancel(sessionId: string, timeoutMs = 30_000): Promise<unknown> {
+    return this.request("session/cancel", { sessionId }, timeoutMs).catch(() => undefined);
   }
 
   close(): void {
@@ -150,6 +234,7 @@ export class AcpClient {
     if (msg.method && msg.method === "session/update") {
       const params = (msg.params ?? {}) as { sessionId?: string; update?: AcpUpdate };
       if (params.sessionId && params.update) {
+        this.updateConfigOptions(params.sessionId, params.update.configOptions);
         this.handlers.onUpdate?.(params.sessionId, params.update);
       }
       return;
@@ -161,7 +246,10 @@ export class AcpClient {
       const wrapper = msg.params as { method?: string; params?: unknown } | undefined;
       if (wrapper?.method === "session/update" && wrapper.params) {
         const p = wrapper.params as { sessionId?: string; update?: AcpUpdate };
-        if (p.sessionId && p.update) this.handlers.onUpdate?.(p.sessionId, p.update);
+        if (p.sessionId && p.update) {
+          this.updateConfigOptions(p.sessionId, p.update.configOptions);
+          this.handlers.onUpdate?.(p.sessionId, p.update);
+        }
       }
     }
   }
@@ -179,8 +267,7 @@ export class AcpClient {
         const answer = await this.handlers.onAskUser?.({ question: q });
         result = { answer: answer ?? "" };
       } else {
-        // Unknown server->client request: respond with empty object so the agent can continue.
-        result = {};
+        throw new Error(`Unsupported server request: ${method}`);
       }
     } catch (err) {
       this.send({

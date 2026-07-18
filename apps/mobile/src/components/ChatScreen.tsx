@@ -10,9 +10,11 @@ import {
   RefreshCw,
   Zap,
   ChevronUp,
+  Layers,
 } from "lucide-react";
 import type { AcpPermissionRequest } from "../acp/client";
 import { PermissionCard } from "./PermissionCard";
+import { AskUserModal } from "./AskUserModal";
 import { ToolOutput, type ToolOutputData } from "./ToolOutput";
 import { ModelPicker } from "./ModelPicker";
 import { EffortPicker, type ReasoningEffort } from "./EffortPicker";
@@ -34,10 +36,11 @@ interface ChatScreenProps {
   messages: Message[];
   thinking: boolean;
   permission: AcpPermissionRequest | null;
+  askUser: string | null;
   connectionStatus: "connecting" | "connected" | "disconnected";
   availableModels: string[];
   onSend: (text: string) => void;
-  onPermissionSelect: (optionId: string) => void;
+  onPermissionSelect: (optionId: string | null) => void;
   onDisconnect: () => void;
   onReconnect: () => void;
   onQuickSync: () => void;
@@ -45,6 +48,9 @@ interface ChatScreenProps {
   onEffortChange: (effort: ReasoningEffort) => void;
   onConnectSaved: (url: string) => void;
   onClear: () => void;
+  onAskUserSubmit: (value: string) => void;
+  onAskUserCancel: () => void;
+  onOpenSessions?: () => void;
 }
 
 export const SLASH_COMMANDS = [
@@ -52,10 +58,11 @@ export const SLASH_COMMANDS = [
   { id: "/effort", label: "Set reasoning effort", args: "low|medium|high|max" },
   { id: "/loop", label: "Auto-iterate on a prompt", args: "<prompt>" },
   { id: "/devin loop", label: "Devin-style diff loop", args: "<prompt>" },
-  { id: "/autonomous", label: "Toggle auto-approve" },
+  { id: "/autonomous", label: "Toggle auto-approve (classifier)" },
   { id: "/devin autonomous", label: "Devin-style autonomous mode" },
   { id: "/swarm", label: "Run swarm (desktop CLI)", args: "<prompt>" },
-  { id: "/yolo", label: "Toggle auto-approve" },
+  { id: "/sessions", label: "List sessions" },
+  { id: "/yolo", label: "Toggle always-approve" },
   { id: "/plan", label: "Enter plan mode" },
   { id: "/clear", label: "Clear conversation" },
   { id: "/new", label: "New session" },
@@ -72,6 +79,7 @@ export function ChatScreen({
   messages,
   thinking,
   permission,
+  askUser,
   connectionStatus,
   availableModels,
   onSend,
@@ -83,6 +91,9 @@ export function ChatScreen({
   onEffortChange,
   onConnectSaved,
   onClear,
+  onAskUserSubmit,
+  onAskUserCancel,
+  onOpenSessions,
 }: ChatScreenProps) {
   const [input, setInput] = useState("");
   const [slashQuery, setSlashQuery] = useState("");
@@ -189,6 +200,9 @@ export function ChatScreen({
           <button className="icon-button" onClick={() => setShowEffortPicker(true)} title="Effort">
             <ChevronUp size={20} />
           </button>
+          <button className="icon-button" onClick={() => onOpenSessions?.()} title="Sessions">
+            <Layers size={20} />
+          </button>
           <button className="icon-button" onClick={() => setShowSettings(true)} title="Settings">
             <SettingsIcon size={20} />
           </button>
@@ -245,6 +259,8 @@ export function ChatScreen({
       </div>
 
       {permission ? <PermissionCard request={permission} onSelect={onPermissionSelect} /> : null}
+
+      {askUser ? <AskUserModal question={askUser} onSubmit={onAskUserSubmit} onCancel={onAskUserCancel} /> : null}
 
       {filteredCommands.length > 0 ? (
         <div className="slash-menu">

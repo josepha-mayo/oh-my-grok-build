@@ -46,24 +46,22 @@ export function VoiceButton({ onTranscript, disabled }: VoiceButtonProps) {
 
     const recognition = new (RecognitionCtor as new () => any)();
     recognition.continuous = false;
-    recognition.interimResults = true;
+    recognition.interimResults = false;
     recognition.lang = navigator.language || "en-US";
 
     recognitionRef.current = recognition;
     stoppedByUser.current = false;
-    let finalTranscript = "";
 
     recognition.onresult = (event: any) => {
-      let interim = "";
+      const parts: string[] = [];
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript as string;
         if (event.results[i].isFinal) {
-          finalTranscript += transcript;
-        } else {
-          interim += transcript;
+          parts.push(event.results[i][0].transcript as string);
         }
       }
-      onTranscript(finalTranscript + interim);
+      if (parts.length > 0) {
+        onTranscript(parts.join(""));
+      }
     };
 
     recognition.onerror = () => {
@@ -74,9 +72,6 @@ export function VoiceButton({ onTranscript, disabled }: VoiceButtonProps) {
     recognition.onend = () => {
       recognitionRef.current = null;
       setListening(false);
-      if (!stoppedByUser.current && finalTranscript) {
-        onTranscript(finalTranscript);
-      }
     };
 
     try {

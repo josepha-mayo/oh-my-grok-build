@@ -31,7 +31,34 @@ export interface AcpAuthMethod {
 export interface AcpInitializeResponse {
   protocolVersion?: number;
   authMethods?: AcpAuthMethod[];
+  meta?: Record<string, unknown>;
   [key: string]: unknown;
+}
+
+export interface AcpSessionConfigOptionValue {
+  value: string;
+  name?: string;
+  description?: string;
+}
+
+export interface AcpSessionConfigOption {
+  id: string;
+  name?: string;
+  description?: string;
+  category?: "model" | "mode" | "thought_level" | "model_config" | string;
+  type?: "select" | "boolean" | string;
+  currentValue?: string | boolean | unknown;
+  options?: AcpSessionConfigOptionValue[];
+  [key: string]: unknown;
+}
+
+export interface AcpNewSessionResponse {
+  sessionId: string;
+  configOptions?: AcpSessionConfigOption[];
+}
+
+export interface AcpSetConfigOptionResponse {
+  configOptions?: AcpSessionConfigOption[];
 }
 
 export interface AcpUpdate {
@@ -43,11 +70,16 @@ export interface AcpUpdate {
     | "turn_completed"
     | "plan"
     | "stop"
+    | "config_option_update"
+    | "model_changed"
     | string;
   content?: AcpTextContent | unknown;
   title?: string;
   status?: string;
   stopReason?: string;
+  configOptions?: AcpSessionConfigOption[];
+  model_id?: string;
+  reasoning_effort?: string;
   [key: string]: unknown;
 }
 

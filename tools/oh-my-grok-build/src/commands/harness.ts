@@ -9,7 +9,7 @@ import {
 
 export async function harnessAddCommand(
   name: string,
-  type: "opencode" | "codex" | "claude",
+  type: "opencode" | "codex" | "claude" | "hermes" | "pi" | "omp",
   options: { url?: string; command?: string; cwd?: string; secret?: string }
 ): Promise<void> {
   await addConnector({ name, type, ...options });

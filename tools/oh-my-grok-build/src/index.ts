@@ -275,7 +275,7 @@ subagent.addCommand(
 
 const harness = program
   .command("harness")
-  .description("Connect and run other agent harnesses (OpenCode, Codex, Claude)");
+  .description("Connect and run other agent harnesses (OpenCode, Codex, Claude, Hermes, Pi, OMP)");
 
 harness.addCommand(
   new Command("add")

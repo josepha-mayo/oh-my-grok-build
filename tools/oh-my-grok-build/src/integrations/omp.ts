@@ -1,27 +1,32 @@
 import path from "node:path";
 import { AcpClient } from "../acp/client.js";
-import { createNodeWebSocketTransport } from "../acp/transport.js";
+import { createStdioTransport } from "../acp/stdio.js";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
 
-function selectPermissionOption(options: { optionId: string; kind?: string }[]): string {
-  const allowOnce = options.find((o) => o.kind === "allow_once" || /allow.once/i.test(o.optionId));
-  if (allowOnce) return allowOnce.optionId;
-  return options[0]?.optionId ?? "";
+const INTERACTIVE_AUTH_IDS = new Set(["omp-setup", "oauth", "browser", "grok.com"]);
+
+function selectAuthMethod(methods: { id: string }[] | undefined): { id: string } | undefined {
+  return methods?.find((m) => !INTERACTIVE_AUTH_IDS.has(m.id.toLowerCase())) ?? methods?.[0];
 }
 
-export class OpenCodeConnector implements Connector {
+export class OmpConnector implements Connector {
   private client?: AcpClient;
   constructor(readonly config: ConnectorConfig) {}
 
   async run(prompt: string): Promise<ConnectorResult> {
-    const rawUrl = this.config.url ?? "ws://127.0.0.1:7331/acp";
-    const urlObj = new URL(rawUrl);
-    const secret = this.config.secret ?? urlObj.searchParams.get("server-key") ?? undefined;
-    urlObj.searchParams.delete("server-key");
-    const url = urlObj.toString();
-    const headers: Record<string, string> = {};
-    if (secret) headers.Authorization = `Bearer ${secret}`;
-    const transport = await createNodeWebSocketTransport(url, headers);
+    const command = this.config.command ?? "omp";
+    const args = ["acp"];
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries({ ...process.env, ...this.config.env })) {
+      if (v !== undefined) env[k] = v;
+    }
+
+    const transport = createStdioTransport({
+      command,
+      args,
+      cwd: this.config.cwd ?? process.cwd(),
+      env,
+    });
 
     const chunks: string[] = [];
     let turnResolver: (() => void) | undefined;
@@ -31,7 +36,7 @@ export class OpenCodeConnector implements Connector {
       turnRejecter = reject;
     });
     const timeout = setTimeout(() => {
-      turnRejecter?.(new Error("OpenCode prompt timed out"));
+      turnRejecter?.(new Error("OMP prompt timed out"));
     }, 600_000);
 
     const client = new AcpClient(transport, {
@@ -46,8 +51,11 @@ export class OpenCodeConnector implements Connector {
         }
       },
       onPermission: async (req) => {
-        const optionId = selectPermissionOption(req.options);
-        return { outcome: optionId ? { outcome: "selected", optionId } : { outcome: "cancelled" } };
+        const option = req.options.find((o) => o.kind === "allow_once") ?? req.options[0];
+        return { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } };
+      },
+      onError: (err) => {
+        turnRejecter?.(err);
       },
     });
     this.client = client;
@@ -58,8 +66,8 @@ export class OpenCodeConnector implements Connector {
         { terminal: true, fs: { readTextFile: true, writeTextFile: true } },
         30_000
       );
-      const authMethod = init.authMethods?.find((m) => m.id === "xai.api_key") ?? init.authMethods?.[0];
-      if (authMethod) {
+      const authMethod = selectAuthMethod(init.authMethods);
+      if (authMethod && !INTERACTIVE_AUTH_IDS.has(authMethod.id.toLowerCase())) {
         await client.authenticate(authMethod, 60_000);
       }
       const { sessionId } = await client.newSession(path.resolve(this.config.cwd ?? process.cwd()), [], {}, 60_000);

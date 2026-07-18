@@ -38,9 +38,63 @@ function normalizeOutput(raw: unknown): ToolOutputData | null {
   return out;
 }
 
+function detectImageMime(base64: string): string | undefined {
+  try {
+    const prefixChars = Math.min(base64.length, 32) & ~3;
+    if (prefixChars === 0) return undefined;
+    const decoded = atob(base64.slice(0, prefixChars));
+    const bytes = new Uint8Array(decoded.length);
+    for (let i = 0; i < decoded.length; i++) {
+      bytes[i] = decoded.charCodeAt(i);
+    }
+    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+      return "image/png";
+    }
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+      return "image/jpeg";
+    }
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) {
+      return "image/gif";
+    }
+    if (
+      bytes[0] === 0x52 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x46 &&
+      bytes[8] === 0x57 &&
+      bytes[9] === 0x45 &&
+      bytes[10] === 0x42 &&
+      bytes[11] === 0x50
+    ) {
+      return "image/webp";
+    }
+    const text = new TextDecoder().decode(bytes);
+    const trimmed = text.trimStart().toLowerCase();
+    if (trimmed.startsWith("<svg") || trimmed.startsWith("<?xml")) {
+      return "image/svg+xml";
+    }
+  } catch {
+    // not valid base64 or too short
+  }
+  return undefined;
+}
+
 function imageSrc(value: string): string {
-  if (value.startsWith("data:") || value.startsWith("http")) return value;
-  return `data:image/png;base64,${value}`;
+  const trimmed = value.trim();
+  if (/^(data:|https?:|\/\/)/i.test(trimmed)) return trimmed;
+
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith("<svg") || lower.startsWith("<?xml")) {
+    return `data:image/svg+xml,${encodeURIComponent(trimmed)}`;
+  }
+
+  const base64 = value.replace(/\s/g, "");
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(base64) && base64.length % 4 === 0) {
+    const mime = detectImageMime(base64) ?? "image/png";
+    return `data:${mime};base64,${base64}`;
+  }
+
+  return value;
 }
 
 function DiffView({ diff }: { diff: ToolOutputData["diff"] }) {

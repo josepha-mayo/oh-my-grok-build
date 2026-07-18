@@ -777,3 +777,48 @@ button.header-meta {
   font-size: 0.75rem;
   font-weight: 500;
 }
+
+/* Ask user modal */
+.ask-user-body {
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.ask-user-body .input {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  background: var(--surface-2);
+  border: 1px solid var(--surface-3);
+  border-radius: var(--radius);
+  font-size: 0.9375rem;
+  color: var(--text);
+}
+
+.ask-user-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+}
+
+.ask-user-actions .button {
+  padding: 0.625rem 1rem;
+  border-radius: var(--radius);
+  font-weight: 500;
+  font-size: 0.9375rem;
+}
+
+.ask-user-actions .button.secondary {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.ask-user-actions .button.primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.permission-cancel {
+  color: var(--text-muted);
+}

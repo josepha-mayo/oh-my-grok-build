@@ -3,7 +3,10 @@ import { join } from "node:path";
 import { getOmgDir, atomicWriteFile } from "../config.js";
 import { ClaudeConnector } from "./claude.js";
 import { CodexConnector } from "./codex.js";
+import { HermesConnector } from "./hermes.js";
+import { OmpConnector } from "./omp.js";
 import { OpenCodeConnector } from "./opencode.js";
+import { PiConnector } from "./pi.js";
 import type { Connector, ConnectorConfig, ConnectorRegistry } from "./types.js";
 
 const REGISTRY_PATH = () => join(getOmgDir(), "connectors.json");
@@ -77,6 +80,12 @@ export function buildConnector(config: ConnectorConfig): Connector {
       return new CodexConnector(config);
     case "claude":
       return new ClaudeConnector(config);
+    case "hermes":
+      return new HermesConnector(config);
+    case "pi":
+      return new PiConnector(config);
+    case "omp":
+      return new OmpConnector(config);
     default:
       throw new Error(`Unknown connector type: ${config.type}`);
   }

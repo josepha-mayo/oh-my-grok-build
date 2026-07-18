@@ -40,4 +40,17 @@ describe("integrations manager", () => {
     assert.strictEqual(c.config.type, "opencode");
     assert.ok(c.close);
   });
+
+  it("builds hermes, pi, and omp connectors", async () => {
+    const hermes = buildConnector({ name: "h", type: "hermes" });
+    assert.strictEqual(hermes.config.type, "hermes");
+    assert.ok(hermes.close);
+
+    const pi = buildConnector({ name: "p", type: "pi" });
+    assert.strictEqual(pi.config.type, "pi");
+
+    const omp = buildConnector({ name: "m", type: "omp" });
+    assert.strictEqual(omp.config.type, "omp");
+    assert.ok(omp.close);
+  });
 });

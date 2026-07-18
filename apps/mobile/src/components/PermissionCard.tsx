@@ -2,7 +2,7 @@ import type { AcpPermissionRequest } from "../acp/client";
 
 interface Props {
   request: AcpPermissionRequest;
-  onSelect: (optionId: string) => void;
+  onSelect: (optionId: string | null) => void;
 }
 
 export function PermissionCard({ request, onSelect }: Props) {
@@ -19,6 +19,9 @@ export function PermissionCard({ request, onSelect }: Props) {
             {opt.kind ? <span className="option-kind">{opt.kind}</span> : null}
           </button>
         ))}
+        <button className="permission-option permission-cancel" onClick={() => onSelect(null)}>
+          <span>Cancel</span>
+        </button>
       </div>
     </div>
   );
