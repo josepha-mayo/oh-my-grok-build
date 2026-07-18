@@ -5,6 +5,7 @@ import chalk from "chalk";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
 import { parseServerUrl } from "../acp/server.js";
+import { isAllowedWsUrl } from "../net.js";
 import { swarmCommand } from "./swarm.js";
 import { loadMcpConfig, toAcpMcpServers } from "../mcp/mcp-config.js";
 import type { AcpNewSessionResponse, AcpPermissionRequest, AcpPermissionResponse, AcpUpdate } from "../types.js";
@@ -39,6 +40,11 @@ const SLASH_COMMANDS = [
 const EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "max"];
 
 export async function connectCommand(options: ConnectOptions): Promise<void> {
+  const allowed = isAllowedWsUrl(options.url);
+  if (!allowed.ok) {
+    throw new Error(`Cannot connect: ${allowed.reason}`);
+  }
+
   const parsed = parseServerUrl(options.url);
   if (!parsed.secret) {
     throw new Error("URL must include a server-key query parameter, e.g. ws://host:port/ws?server-key=XYZ");

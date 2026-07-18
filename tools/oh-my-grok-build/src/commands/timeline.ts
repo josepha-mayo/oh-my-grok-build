@@ -7,7 +7,8 @@ export interface TimelineOptions {
 }
 
 export function timelineCommand(options: TimelineOptions): void {
-  const events = readTimelineEvents({ count: options.count ?? 50, type: options.type });
+  const count = Number.isNaN(options.count) ? 50 : (options.count ?? 50);
+  const events = readTimelineEvents({ count, type: options.type });
 
   if (events.length === 0) {
     console.log("No timeline events yet.");

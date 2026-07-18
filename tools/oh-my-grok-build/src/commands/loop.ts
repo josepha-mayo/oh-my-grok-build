@@ -90,7 +90,7 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
   const cfg = await loadOmgConfig();
   const model = options.model ?? cfg.defaultModel ?? "grok-build";
-  const maxIterations = options.maxIterations ?? 5;
+  const maxIterations = Number.isNaN(options.maxIterations) ? 5 : (options.maxIterations ?? 5);
 
   appendTimelineEvent({ type: "loop_start", model, maxIterations, prompt: options.prompt, cwd });
 

@@ -1,6 +1,7 @@
 import path from "node:path";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
+import { isAllowedWsUrl } from "../net.js";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
 
 function selectPermissionOption(options: { optionId: string; kind?: string }[]): string {
@@ -15,6 +16,8 @@ export class OpenCodeConnector implements Connector {
 
   async run(prompt: string): Promise<ConnectorResult> {
     const rawUrl = this.config.url ?? "ws://127.0.0.1:7331/acp";
+    const allowed = isAllowedWsUrl(rawUrl);
+    if (!allowed.ok) throw new Error(allowed.reason);
     const urlObj = new URL(rawUrl);
     const secret = this.config.secret ?? urlObj.searchParams.get("server-key") ?? undefined;
     urlObj.searchParams.delete("server-key");

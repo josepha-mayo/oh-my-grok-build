@@ -9,9 +9,12 @@ A productivity and orchestration layer for [Grok Build](https://github.com/xai-o
 - **Local model discovery**: `omgb provider discover` finds Ollama/LM Studio models automatically.
 - **Interactive ACP client**: `omgb connect <url>` lets you chat with a running agent server from the terminal.
 - **Headless execution**: `omgb exec <prompt>` and `omgb team <count> <prompt>`.
-- **Background tasks**: `omgb loop` and `omgb schedule` for cron-style runs.
-- **Subagent orchestration**: `omgb subagent spawn/list/kill/logs`.
-- **Cross-harness connector**: drive OpenCode, Codex, and Claude CLI from `omgb`.
+- **Autonomous loops**: `omgb loop` iterates until the working tree is clean, and `omgb cron`/`omgb schedule` run prompts on a schedule.
+- **Computer & browser use**: `omgb use <prompt>` controls the desktop via the `omgb-computer` MCP server (and can use browser tools), while `omgb browser <prompt>` drives the `omgb-browser` MCP server.
+- **Research**: `omgb research <topic>` searches arXiv, synthesizes a report, and proposes a patch.
+- **Subagent orchestration**: `omgb subagent spawn/list/kill/logs/trace` and `omgb swarm` parallelize work across subagents.
+- **Timeline**: `omgb timeline` shows recent session/job events.
+- **Cross-harness connector**: drive OpenCode, Codex, Claude, Hermes, and other CLI agents from `omgb`.
 
 ## Install
 
@@ -33,6 +36,16 @@ omgb provider add openai
 
 # Run a headless task
 omgb exec "refactor the auth module"
+
+# Use the desktop/browser (requires OMGB_ALLOW_DESKTOP_CONTROL=1 for computer use)
+omgb use "open Notepad and type hello"
+omgb browser "go to arxiv.org and search for grok"
+
+# Research an arXiv topic
+omgb research "mechanistic interpretability"
+
+# View recent activity
+omgb timeline
 
 # Connect as a CLI client
 omgb connect ws://host:port/ws?server-key=...

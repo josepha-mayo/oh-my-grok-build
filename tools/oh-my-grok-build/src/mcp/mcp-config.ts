@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
 import { loadOmgConfig } from "../config.js";
+import { sanitizeUserEnv } from "../env.js";
 import type { McpServerConfig } from "../types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,6 +22,10 @@ function findScript(name: string): string | undefined {
     if (existsSync(c)) return c;
   }
   return undefined;
+}
+
+export function builtInMcpServer(name: string): McpServerConfig | undefined {
+  return builtInMcpServers().find((s) => s.name === name);
 }
 
 export function builtInMcpServers(): McpServerConfig[] {
@@ -61,8 +66,9 @@ export function toAcpMcpServers(servers: McpServerConfig[]): AcpMcpServerEntry[]
     .filter((s) => s.enabled)
     .map((s) => {
       const entry: AcpMcpServerEntry = { type: "stdio", name: s.name, command: s.command, args: s.args };
-      if (s.env && Object.keys(s.env).length) {
-        entry.env = Object.entries(s.env).map(([name, value]) => ({ name, value }));
+      const safeEnv = sanitizeUserEnv(s.env);
+      if (Object.keys(safeEnv).length) {
+        entry.env = Object.entries(safeEnv).map(([name, value]) => ({ name, value }));
       }
       return entry;
     });

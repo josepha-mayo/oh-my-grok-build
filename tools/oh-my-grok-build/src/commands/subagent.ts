@@ -40,11 +40,13 @@ export async function subagentKillCommand(name: string): Promise<void> {
 }
 
 export async function subagentLogsCommand(name: string, lines: number): Promise<void> {
-  const output = await subagentOutput(name, lines);
+  const safeLines = Number.isNaN(lines) ? 50 : lines;
+  const output = await subagentOutput(name, safeLines);
   console.log(output || chalk.dim("(no log output)"));
 }
 
 export async function subagentTraceCommand(name: string, lines: number): Promise<void> {
-  const output = await subagentTrace(name, lines);
+  const safeLines = Number.isNaN(lines) ? 50 : lines;
+  const output = await subagentTrace(name, safeLines);
   console.log(output || chalk.dim("(no trace output)"));
 }

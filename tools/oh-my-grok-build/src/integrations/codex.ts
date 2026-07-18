@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
+import { sanitizeUserEnv } from "../env.js";
 import spawner from "../spawner.js";
 
 export class CodexConnector implements Connector {
@@ -17,7 +18,7 @@ export class CodexConnector implements Connector {
       const chunks: Buffer[] = [];
       const proc = spawner.spawn("codex", args, {
         cwd: this.config.cwd ?? process.cwd(),
-        env: { ...process.env, ...this.config.env },
+        env: { ...process.env, ...sanitizeUserEnv(this.config.env) },
         stdio: ["ignore", "pipe", "pipe"],
       });
 

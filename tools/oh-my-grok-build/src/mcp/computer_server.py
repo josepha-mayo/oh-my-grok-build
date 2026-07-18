@@ -152,6 +152,8 @@ def call_tool(name: str, args: dict, pyautogui):
         y = int(args.get("y", 0))
         width = int(args.get("width", 0))
         height = int(args.get("height", 0))
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive integers")
         img = pyautogui.screenshot(region=(x, y, width, height))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -159,6 +161,8 @@ def call_tool(name: str, args: dict, pyautogui):
         return {"type": "image", "data": data, "mimeType": "image/png"}
     if name == "computer_wait":
         seconds = float(args.get("seconds", 0))
+        if seconds < 0:
+            raise ValueError("seconds must be non-negative")
         pyautogui.sleep(seconds)
         return f"Waited {seconds}s."
     raise RuntimeError(f"Unknown tool: {name}")

@@ -189,7 +189,8 @@ export async function killSubagent(name: string): Promise<void> {
   await saveRegistry(records);
 }
 
-export async function subagentOutput(name: string, tailLines = 50): Promise<string> {
+export async function subagentOutput(name: string, rawTailLines = 50): Promise<string> {
+  const tailLines = Number.isNaN(rawTailLines) ? 50 : rawTailLines;
   const safeName = sanitizeSubagentName(name);
   const records = await loadRegistry();
   const record = records.find((r) => r.name === safeName);
@@ -203,7 +204,8 @@ export async function subagentOutput(name: string, tailLines = 50): Promise<stri
   }
 }
 
-export async function subagentTrace(name: string, tailLines = 50): Promise<string> {
+export async function subagentTrace(name: string, rawTailLines = 50): Promise<string> {
+  const tailLines = Number.isNaN(rawTailLines) ? 50 : rawTailLines;
   const safeName = sanitizeSubagentName(name);
   const records = await loadRegistry();
   const record = records.find((r) => r.name === safeName);

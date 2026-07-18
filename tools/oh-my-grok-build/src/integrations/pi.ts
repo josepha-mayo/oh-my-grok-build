@@ -1,4 +1,5 @@
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
+import { sanitizeUserEnv } from "../env.js";
 import spawner from "../spawner.js";
 
 export class PiConnector implements Connector {
@@ -12,7 +13,7 @@ export class PiConnector implements Connector {
       const chunks: Buffer[] = [];
       const proc = spawner.spawn(cmd, args, {
         cwd: this.config.cwd ?? process.cwd(),
-        env: { ...process.env, ...this.config.env },
+        env: { ...process.env, ...sanitizeUserEnv(this.config.env) },
       });
 
       proc.stdout?.on("data", (d) => chunks.push(d));

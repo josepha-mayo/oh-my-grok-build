@@ -18,7 +18,9 @@ export async function execCommand(options: ExecOptions): Promise<void> {
 
   const args = ["-p", options.prompt, "--model", model];
   if (options.yolo) args.push("--yolo");
-  if (options.maxTurns) args.push("--max-turns", String(options.maxTurns));
+  if (typeof options.maxTurns === "number" && !Number.isNaN(options.maxTurns) && options.maxTurns > 0) {
+    args.push("--max-turns", String(options.maxTurns));
+  }
 
   return new Promise((resolve, reject) => {
     const proc = spawner.spawn("grok", args, {
