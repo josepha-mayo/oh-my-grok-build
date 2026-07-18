@@ -39,6 +39,7 @@ import { harnessAddCommand, harnessListCommand, harnessRemoveCommand, harnessRun
 import { devinAutonomousCommand } from "./commands/devin.js";
 import { cronCommand } from "./commands/cron.js";
 import { timelineCommand } from "./commands/timeline.js";
+import { researchCommand } from "./commands/research.js";
 import { swarmCommand } from "./commands/swarm.js";
 import { loadOmgDotEnvIntoProcess } from "./config.js";
 
@@ -163,6 +164,16 @@ program
   .option("--max-turns <n>", "Maximum agent turns", parseInt)
   .action(async (prompt, options) => {
     await swarmCommand({ prompt, ...options });
+  });
+
+program
+  .command("research <topic>")
+  .description("Deep-research an arXiv topic and synthesize a report with a proposed patch")
+  .option("-n, --count <n>", "Number of papers to fetch", parseInt, 5)
+  .option("-m, --model <model>", "Model to use")
+  .option("--yolo", "Auto-approve tool calls")
+  .action(async (topic, options) => {
+    await researchCommand({ topic, ...options });
   });
 
 program
