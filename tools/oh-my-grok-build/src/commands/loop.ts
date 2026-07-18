@@ -148,7 +148,7 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
       break;
     }
 
-    currentPrompt = `Review the following diff and fix any issues:\n\n${diff || status}`;
+    currentPrompt = `Original task: ${options.prompt}\n\nReview the following diff and fix any issues:\n\n${diff || status}`;
   }
 
   const finalDirty = (await gitStatusShort(cwd)).trim().length > 0;

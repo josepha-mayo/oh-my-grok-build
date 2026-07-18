@@ -4,6 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
 import { getOmgDir, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import { appendTimelineEvent } from "../timeline.js";
 
 export interface ResearchOptions {
@@ -97,8 +98,13 @@ function buildPrompt(topic: string, entries: ArxivEntry[]): string {
 }
 
 function extractPatch(markdown: string): string | undefined {
-  const match = markdown.match(/```[\s\S]*?```/);
-  return match ? match[0] : undefined;
+  const section = markdown.match(/##\s*Proposed (?:patch|implementation)[^\n]*\n([\s\S]*?)(?:\n## |$)/i);
+  if (section) {
+    const block = section[1].match(/```[\s\S]*?```/);
+    if (block) return block[0];
+  }
+  const fallback = markdown.match(/```[\s\S]*?```/);
+  return fallback ? fallback[0] : undefined;
 }
 
 function runGrok(prompt: string, options: { model: string; yolo?: boolean }): Promise<string> {
@@ -117,8 +123,13 @@ function runGrok(prompt: string, options: { model: string; yolo?: boolean }): Pr
     proc.on("error", reject);
     proc.on("exit", (code) => {
       const output = Buffer.concat(chunks).toString("utf8");
-      if (code === 0) resolve(output);
-      else reject(new Error(`grok exited with code ${code}\n${output}`));
+      if (code === 0) {
+        resolve(output);
+      } else if (isRateLimited(output)) {
+        reject(new Error(formatRateLimitMessage()));
+      } else {
+        reject(new Error(`grok exited with code ${code}\n${output}`));
+      }
     });
   });
 }

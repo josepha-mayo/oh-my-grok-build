@@ -69,7 +69,7 @@ describe("net", () => {
   });
 
   describe("isAllowedWsUrl", () => {
-    it("allows local WebSocket servers", () => {
+    it("allows local loopback WebSocket servers", () => {
       assert.strictEqual(isAllowedWsUrl("ws://127.0.0.1:7331/acp").ok, true);
       assert.strictEqual(isAllowedWsUrl("ws://localhost:8080").ok, true);
     });
@@ -78,10 +78,22 @@ describe("net", () => {
       assert.strictEqual(isAllowedWsUrl("http://example.com").ok, false);
     });
 
-    it("blocks cloud metadata endpoints", () => {
+    it("blocks cloud metadata and link-local endpoints", () => {
       assert.strictEqual(isAllowedWsUrl("ws://169.254.169.254").ok, false);
       assert.strictEqual(isAllowedWsUrl("ws://metadata.google.internal").ok, false);
       assert.strictEqual(isAllowedWsUrl("ws://metadata.google.internal.").ok, false);
+    });
+
+    it("blocks RFC1918 private addresses by default", () => {
+      assert.strictEqual(isAllowedWsUrl("ws://10.0.0.1").ok, false);
+      assert.strictEqual(isAllowedWsUrl("ws://192.168.1.1").ok, false);
+      assert.strictEqual(isAllowedWsUrl("ws://172.16.0.1").ok, false);
+    });
+
+    it("allows RFC1918 private addresses when explicitly permitted", () => {
+      assert.strictEqual(isAllowedWsUrl("ws://10.0.0.1", true).ok, true);
+      assert.strictEqual(isAllowedWsUrl("ws://192.168.1.1", true).ok, true);
+      assert.strictEqual(isAllowedWsUrl("ws://172.16.0.1", true).ok, true);
     });
   });
 });

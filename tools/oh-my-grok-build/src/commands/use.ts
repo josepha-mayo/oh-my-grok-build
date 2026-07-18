@@ -160,8 +160,14 @@ export async function browserCommand(options: Omit<UseOptions, "mode">): Promise
 }
 
 export async function computerCommand(options: Omit<UseOptions, "mode">): Promise<void> {
+  const alreadyEnabled = process.env.OMGB_ALLOW_DESKTOP_CONTROL === "1";
   console.log(
-    chalk.bold("Running computer-use agent. This can control your desktop; review any tool prompts carefully.\n")
+    chalk.bold(
+      `Running computer-use agent. This can control your desktop; review any tool prompts carefully.\n` +
+        (alreadyEnabled
+          ? "Desktop control is already enabled for this shell."
+          : "Temporarily enabling desktop control for this run only.")
+    )
   );
   try {
     const result = await useCommand({ ...options, mode: "computer" });

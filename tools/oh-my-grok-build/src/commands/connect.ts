@@ -40,7 +40,7 @@ const SLASH_COMMANDS = [
 const EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "max"];
 
 export async function connectCommand(options: ConnectOptions): Promise<void> {
-  const allowed = isAllowedWsUrl(options.url);
+  const allowed = isAllowedWsUrl(options.url, true);
   if (!allowed.ok) {
     throw new Error(`Cannot connect: ${allowed.reason}`);
   }

@@ -27,11 +27,17 @@ def check_desktop_control_allowed():
 def send(msg: dict):
     print(json.dumps(msg), flush=True)
 
+MAX_IMAGE_DIMENSION = 4096
+
+
 def screenshot(pyautogui, width: int | None = None, height: int | None = None):
     img = pyautogui.screenshot()
     if width is not None and height is not None:
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive integers")
+        screen_w, screen_h = pyautogui.size()
+        width = min(width, screen_w, MAX_IMAGE_DIMENSION)
+        height = min(height, screen_h, MAX_IMAGE_DIMENSION)
         img = img.resize((width, height))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -53,6 +59,11 @@ def handle(msg: dict, pyautogui):
         send({"jsonrpc": "2.0", "id": id_, "error": {"code": -32002, "message": "Server not initialized"}})
         return
     if method == "tools/list":
+        try:
+            check_desktop_control_allowed()
+        except Exception as exc:
+            send({"jsonrpc": "2.0", "id": id_, "error": {"code": -32000, "message": str(exc)}})
+            return
         tools = [
             {"name": "computer_screenshot", "description": "Take a screenshot of the desktop.", "inputSchema": {"type": "object", "properties": {}}},
             {"name": "computer_get_size", "description": "Return the screen width and height.", "inputSchema": {"type": "object", "properties": {}}},
@@ -89,6 +100,25 @@ def handle(msg: dict, pyautogui):
         return
     send({"jsonrpc": "2.0", "id": id_, "error": {"code": -32601, "message": f"Method not found: {method}"}})
 
+MAX_WAIT_SECONDS = 300
+
+VALID_BUTTONS = {"left", "middle", "right"}
+
+
+def _screen_size(pyautogui):
+    width, height = pyautogui.size()
+    return width, height
+
+
+def _clamp(value, min_value, max_value):
+    return max(min_value, min(value, max_value))
+
+
+def _valid_button(button):
+    if button not in VALID_BUTTONS:
+        raise ValueError(f"button must be one of {VALID_BUTTONS}, got {button}")
+
+
 def call_tool(name: str, args: dict, pyautogui):
     if name == "computer_screenshot":
         data = screenshot(pyautogui)
@@ -100,6 +130,10 @@ def call_tool(name: str, args: dict, pyautogui):
         x = int(args.get("x", 0))
         y = int(args.get("y", 0))
         button = str(args.get("button", "left"))
+        _valid_button(button)
+        screen_w, screen_h = _screen_size(pyautogui)
+        x = _clamp(x, 0, screen_w)
+        y = _clamp(y, 0, screen_h)
         pyautogui.click(x, y, button=button)
         return f"Clicked ({x}, {y}) with {button} button."
     if name == "computer_type":
@@ -131,8 +165,11 @@ def call_tool(name: str, args: dict, pyautogui):
         clicks = int(args.get("clicks", 0))
         x = args.get("x")
         y = args.get("y")
+        screen_w, screen_h = _screen_size(pyautogui)
         if x is not None and y is not None:
-            pyautogui.scroll(clicks, int(x), int(y))
+            x = _clamp(int(x), 0, screen_w)
+            y = _clamp(int(y), 0, screen_h)
+            pyautogui.scroll(clicks, x, y)
         elif x is not None or y is not None:
             raise ValueError("provide both x and y or neither")
         else:
@@ -141,12 +178,19 @@ def call_tool(name: str, args: dict, pyautogui):
     if name == "computer_move":
         x = int(args.get("x", 0))
         y = int(args.get("y", 0))
+        screen_w, screen_h = _screen_size(pyautogui)
+        x = _clamp(x, 0, screen_w)
+        y = _clamp(y, 0, screen_h)
         pyautogui.moveTo(x, y)
         return f"Moved to ({x}, {y})."
     if name == "computer_double_click":
         x = int(args.get("x", 0))
         y = int(args.get("y", 0))
         button = str(args.get("button", "left"))
+        _valid_button(button)
+        screen_w, screen_h = _screen_size(pyautogui)
+        x = _clamp(x, 0, screen_w)
+        y = _clamp(y, 0, screen_h)
         pyautogui.doubleClick(x, y, button=button)
         return f"Double-clicked ({x}, {y}) with {button} button."
     if name == "computer_drag":
@@ -155,6 +199,12 @@ def call_tool(name: str, args: dict, pyautogui):
         x2 = int(args.get("x2", 0))
         y2 = int(args.get("y2", 0))
         button = str(args.get("button", "left"))
+        _valid_button(button)
+        screen_w, screen_h = _screen_size(pyautogui)
+        x1 = _clamp(x1, 0, screen_w)
+        y1 = _clamp(y1, 0, screen_h)
+        x2 = _clamp(x2, 0, screen_w)
+        y2 = _clamp(y2, 0, screen_h)
         pyautogui.moveTo(x1, y1)
         pyautogui.dragTo(x2, y2, button=button)
         return f"Dragged from ({x1}, {y1}) to ({x2}, {y2}) with {button} button."
@@ -168,6 +218,11 @@ def call_tool(name: str, args: dict, pyautogui):
         height = int(args.get("height", 0))
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive integers")
+        screen_w, screen_h = _screen_size(pyautogui)
+        x = _clamp(x, 0, screen_w)
+        y = _clamp(y, 0, screen_h)
+        width = _clamp(width, 1, screen_w - x)
+        height = _clamp(height, 1, screen_h - y)
         img = pyautogui.screenshot(region=(x, y, width, height))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -177,6 +232,8 @@ def call_tool(name: str, args: dict, pyautogui):
         seconds = float(args.get("seconds", 0))
         if seconds < 0:
             raise ValueError("seconds must be non-negative")
+        if seconds > MAX_WAIT_SECONDS:
+            raise ValueError(f"seconds must be at most {MAX_WAIT_SECONDS}")
         pyautogui.sleep(seconds)
         return f"Waited {seconds}s."
     raise RuntimeError(f"Unknown tool: {name}")

@@ -2,6 +2,7 @@ import { hostname } from "node:os";
 
 const CLOUD_METADATA_HOSTS = new Set(["metadata.google.internal", "169.254.169.254"]);
 const PRIVATE_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0"]);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 function normalizeHost(raw: string): string {
   let host = raw.toLowerCase();
@@ -67,7 +68,7 @@ export function isAllowedHttpUrl(raw: string): { ok: true } | { ok: false; reaso
   return { ok: true };
 }
 
-export function isAllowedWsUrl(raw: string): { ok: true } | { ok: false; reason: string } {
+export function isAllowedWsUrl(raw: string, allowPrivate = false): { ok: true } | { ok: false; reason: string } {
   let url: URL;
   try {
     url = new URL(raw);
@@ -83,6 +84,12 @@ export function isAllowedWsUrl(raw: string): { ok: true } | { ok: false; reason:
   }
   if (host.startsWith("169.254.")) {
     return { ok: false, reason: "Blocked link-local IP address" };
+  }
+  if (host === "0.0.0.0") {
+    return { ok: false, reason: "Blocked broadcast address" };
+  }
+  if (!allowPrivate && !LOOPBACK_HOSTS.has(host) && isPrivateIp(host)) {
+    return { ok: false, reason: "Blocked private IP address (use --bind 127.0.0.1 or pass an explicit loopback URL)" };
   }
   if (url.username || url.password) {
     return { ok: false, reason: "URLs with embedded credentials are not allowed" };
