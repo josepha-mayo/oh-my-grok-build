@@ -141,8 +141,16 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
 
   const rl = readline.createInterface({ input, output });
 
+  let closing = false;
   let turnResolver: (() => void) | undefined;
   let turnRejecter: ((err: Error) => void) | undefined;
+
+  rl.on("close", () => {
+    if (closing) return;
+    closing = true;
+    client.close();
+    exit(0);
+  });
 
   const client = new AcpClient(transport, {
     onUpdate: (_sessionId, update) => {
@@ -163,6 +171,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
       turnRejecter?.(err);
     },
     onClose: () => {
+      if (closing) return;
       console.log(chalk.dim("\nConnection closed."));
       rl.close();
       exit(0);
@@ -250,7 +259,13 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
   }
 
   while (true) {
-    const line = await rl.question(chalk.bold("you> "));
+    let line: string;
+    try {
+      line = await rl.question(chalk.bold("you> "));
+    } catch {
+      if (closing) return;
+      throw new Error("Readline closed unexpectedly");
+    }
     if (!line.trim()) continue;
     const trimmed = line.trim();
 
@@ -261,8 +276,10 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
     }
 
     if (trimmed === "/quit" || trimmed === "/exit") {
+      closing = true;
       client.close();
-      break;
+      rl.close();
+      return;
     }
 
     if (trimmed === "/clear") {

@@ -1,11 +1,34 @@
 import { spawn as cpSpawn, spawnSync as cpSpawnSync } from "node:child_process";
 
-export function spawn(...args: Parameters<typeof cpSpawn>): ReturnType<typeof cpSpawn> {
-  return cpSpawn(...args);
+type SpawnArgs = Parameters<typeof cpSpawn>;
+type SpawnSyncArgs = Parameters<typeof cpSpawnSync>;
+
+function resolveGrokCommand(
+  command: string,
+  args: string[] = [],
+  options?: object
+): { command: string; args: string[]; options?: object } {
+  if (command !== "grok") return { command, args, options };
+  const override = process.env.OMGB_GROK_COMMAND?.trim();
+  if (!override) return { command, args, options };
+  const parts = override.split(/\s+/);
+  return { command: parts[0], args: [...parts.slice(1), ...args], options };
 }
 
-export function spawnSync(...args: Parameters<typeof cpSpawnSync>): ReturnType<typeof cpSpawnSync> {
-  return cpSpawnSync(...args);
+export function spawn(...args: SpawnArgs): ReturnType<typeof cpSpawn> {
+  const command = args[0] as string;
+  const procArgs = (args[1] as string[] | undefined) ?? [];
+  const options = args[2] as object | undefined;
+  const resolved = resolveGrokCommand(command, procArgs, options);
+  return cpSpawn(resolved.command, resolved.args, resolved.options);
+}
+
+export function spawnSync(...args: SpawnSyncArgs): ReturnType<typeof cpSpawnSync> {
+  const command = args[0] as string;
+  const procArgs = (args[1] as string[] | undefined) ?? [];
+  const options = args[2] as object | undefined;
+  const resolved = resolveGrokCommand(command, procArgs, options);
+  return cpSpawnSync(resolved.command, resolved.args, resolved.options);
 }
 
 export default { spawn, spawnSync };

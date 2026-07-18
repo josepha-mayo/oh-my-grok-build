@@ -145,8 +145,11 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
   const runId = Date.now();
   appendTimelineEvent({ type: "swarm_start", model, workers, prompt: options.prompt, runId });
 
+  console.log(chalk.bold(`Decomposing task into up to ${workers} subtasks with model ${chalk.cyan(model)}...`));
+  const subtasks = await decomposeTask(options.prompt, workers, { model, yolo: options.yolo, cwd: options.cwd });
+
   const names: string[] = [];
-  for (let i = 0; i < workers; i++) {
+  for (let i = 0; i < subtasks.length; i++) {
     names.push(`swarm-${runId}-${i}`);
   }
 
@@ -159,9 +162,6 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
       // not running; ignore
     }
   }
-
-  console.log(chalk.bold(`Decomposing task into up to ${workers} subtasks with model ${chalk.cyan(model)}...`));
-  const subtasks = await decomposeTask(options.prompt, workers, { model, yolo: options.yolo, cwd: options.cwd });
 
   console.log(chalk.bold(`Spawning ${subtasks.length} subagent(s)...`));
   for (let i = 0; i < subtasks.length; i++) {
