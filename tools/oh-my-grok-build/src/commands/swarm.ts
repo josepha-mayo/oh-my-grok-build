@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import chalk from "chalk";
 import { loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import { listSubagents, spawnSubagent, subagentOutput, killSubagent } from "../subagents/engine.js";
 import { appendTimelineEvent } from "../timeline.js";
 
@@ -103,7 +104,10 @@ async function decomposeTask(
       attempt > 1 ? "\nYour previous response was not valid JSON. Please reply with only the JSON array." : ""
     );
     const { code, output } = await runGrokCapture(task, options);
-    if (code !== 0) throw new Error(`grok decompose exited with code ${code}`);
+    if (code !== 0) {
+      if (isRateLimited(output)) throw new Error(formatRateLimitMessage());
+      throw new Error(`grok decompose exited with code ${code}`);
+    }
 
     const parsed = extractJsonArray(output);
     const valid = validateSubtasks(parsed, workers);

@@ -1,6 +1,6 @@
 import { openSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
-import { ensureOmgDir, getOmgDir } from "../config.js";
+import { atomicWriteFile, ensureOmgDir, getOmgDir } from "../config.js";
 import spawner from "../spawner.js";
 import { appendTimelineEvent } from "../timeline.js";
 
@@ -50,7 +50,7 @@ export async function loadRegistry(): Promise<SubagentRecord[]> {
 
 export async function saveRegistry(records: SubagentRecord[]): Promise<void> {
   await ensureOmgDir();
-  writeFileSync(registryPath(), JSON.stringify(records, null, 2));
+  await atomicWriteFile(registryPath(), JSON.stringify(records, null, 2));
 }
 
 export function isRunning(pid: number): boolean {

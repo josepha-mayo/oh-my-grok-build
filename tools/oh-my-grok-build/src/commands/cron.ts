@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import { runPromptTask } from "../background/runner.js";
-import { startJob, stopJob } from "../background/scheduler.js";
+import { loadJobs, startJob, stopJob } from "../background/scheduler.js";
 import { appendTimelineEvent } from "../timeline.js";
 
 export interface CronOptions {
@@ -11,8 +11,17 @@ export interface CronOptions {
   yolo?: boolean;
 }
 
+async function uniqueCronName(base = "cron"): Promise<string> {
+  const jobs = await loadJobs();
+  const names = new Set(jobs.map((j) => j.name));
+  if (!names.has(base)) return base;
+  let i = 1;
+  while (names.has(`${base}-${i}`)) i++;
+  return `${base}-${i}`;
+}
+
 export async function cronCommand(options: CronOptions): Promise<void> {
-  const name = options.name ?? "cron";
+  const name = options.name ?? (await uniqueCronName());
 
   appendTimelineEvent({
     type: "cron_start",
