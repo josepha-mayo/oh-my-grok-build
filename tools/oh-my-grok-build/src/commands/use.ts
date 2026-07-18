@@ -25,8 +25,16 @@ function selectPermissionOption(options: { optionId: string; kind?: string }[]):
   return options[0]?.optionId ?? "";
 }
 
-function handlePermission(req: AcpPermissionRequest): AcpPermissionResponse {
+function handlePermission(req: AcpPermissionRequest, yolo: boolean): AcpPermissionResponse {
   const optionId = selectPermissionOption(req.options);
+  const label = req.toolCall.title ?? req.toolCall.command ?? "tool call";
+  if (optionId) {
+    const optionName = req.options.find((o) => o.optionId === optionId)?.name ?? optionId;
+    const modeMsg = yolo ? "" : " (run with --yolo to suppress these prompts)";
+    process.stderr.write(chalk.yellow(`Auto-approving ${label}: ${optionName}${modeMsg}\n`));
+  } else {
+    process.stderr.write(chalk.yellow(`No approval option for ${label}; cancelling\n`));
+  }
   return { outcome: optionId ? { outcome: "selected", optionId } : { outcome: "cancelled" } };
 }
 
@@ -57,11 +65,9 @@ export async function useCommand(options: UseOptions): Promise<string> {
     args.push("--max-turns", String(options.maxTurns));
   }
 
-  // The omgb-computer MCP server requires an explicit opt-in. Setting it for this
-  // child process is equivalent to the tools enable guard, but scoped to this run.
-  const originalDesktop = process.env.OMGB_ALLOW_DESKTOP_CONTROL;
+  const childEnv: Record<string, string> = { GROK_DISABLE_AUTOUPDATER: "1" };
   if (options.mode === "computer") {
-    process.env.OMGB_ALLOW_DESKTOP_CONTROL = "1";
+    childEnv.OMGB_ALLOW_DESKTOP_CONTROL = "1";
   }
 
   appendTimelineEvent({
@@ -75,7 +81,7 @@ export async function useCommand(options: UseOptions): Promise<string> {
     command: "grok",
     args,
     cwd,
-    env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
+    env: childEnv,
   });
 
   try {
@@ -103,7 +109,7 @@ export async function useCommand(options: UseOptions): Promise<string> {
           turnResolver?.();
         }
       },
-      onPermission: async (req) => handlePermission(req),
+      onPermission: async (req) => handlePermission(req, options.yolo ?? false),
       onError: (err) => {
         clearTimeout(timeout);
         turnRejecter?.(err);
@@ -124,7 +130,7 @@ export async function useCommand(options: UseOptions): Promise<string> {
       if (authMethod) {
         await client.authenticate(authMethod, 60_000);
       }
-      const { sessionId } = await client.newSession(cwd, mcpServers as Record<string, unknown>[], {}, 60_000);
+      const { sessionId } = await client.newSession(cwd, mcpServers, {}, 60_000);
       await client.setMode(sessionId, options.yolo ? "code" : "ask", 60_000).catch(() => false);
       await client.prompt(sessionId, [{ type: "text", text: options.prompt }], timeoutMs);
       await turnDone;
@@ -140,13 +146,7 @@ export async function useCommand(options: UseOptions): Promise<string> {
       client.close();
     }
   } finally {
-    if (options.mode === "computer") {
-      if (originalDesktop === undefined) {
-        delete process.env.OMGB_ALLOW_DESKTOP_CONTROL;
-      } else {
-        process.env.OMGB_ALLOW_DESKTOP_CONTROL = originalDesktop;
-      }
-    }
+    transport.close();
   }
 }
 

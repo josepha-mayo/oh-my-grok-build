@@ -29,7 +29,9 @@ def send(msg: dict):
 
 def screenshot(pyautogui, width: int | None = None, height: int | None = None):
     img = pyautogui.screenshot()
-    if width and height:
+    if width is not None and height is not None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive integers")
         img = img.resize((width, height))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -97,23 +99,33 @@ def call_tool(name: str, args: dict, pyautogui):
     if name == "computer_click":
         x = int(args.get("x", 0))
         y = int(args.get("y", 0))
-        button = args.get("button", "left")
+        button = str(args.get("button", "left"))
         pyautogui.click(x, y, button=button)
         return f"Clicked ({x}, {y}) with {button} button."
     if name == "computer_type":
-        text = args.get("text", "")
+        text = str(args.get("text", ""))
         pyautogui.typewrite(text, interval=0.01)
         return f"Typed: {text}"
     if name == "computer_key":
-        key = args.get("key", "")
+        key = str(args.get("key", ""))
+        if not key:
+            raise ValueError("key is required")
         modifiers = args.get("modifiers", [])
-        if modifiers:
-            pyautogui.keyDown(*modifiers)
+        if not isinstance(modifiers, list):
+            modifiers = [modifiers]
+        modifiers = [str(m) for m in modifiers if m]
+        try:
+            for m in modifiers:
+                pyautogui.keyDown(m)
             pyautogui.keyDown(key)
             pyautogui.keyUp(key)
-            pyautogui.keyUp(*modifiers)
-        else:
-            pyautogui.press(key)
+            for m in reversed(modifiers):
+                pyautogui.keyUp(m)
+        except Exception:
+            for m in modifiers:
+                pyautogui.keyUp(m)
+            pyautogui.keyUp(key)
+            raise
         return f"Pressed: {'+'.join(modifiers + [key])}"
     if name == "computer_scroll":
         clicks = int(args.get("clicks", 0))
@@ -121,6 +133,8 @@ def call_tool(name: str, args: dict, pyautogui):
         y = args.get("y")
         if x is not None and y is not None:
             pyautogui.scroll(clicks, int(x), int(y))
+        elif x is not None or y is not None:
+            raise ValueError("provide both x and y or neither")
         else:
             pyautogui.scroll(clicks)
         return f"Scrolled {clicks} clicks."
@@ -132,7 +146,7 @@ def call_tool(name: str, args: dict, pyautogui):
     if name == "computer_double_click":
         x = int(args.get("x", 0))
         y = int(args.get("y", 0))
-        button = args.get("button", "left")
+        button = str(args.get("button", "left"))
         pyautogui.doubleClick(x, y, button=button)
         return f"Double-clicked ({x}, {y}) with {button} button."
     if name == "computer_drag":
@@ -140,7 +154,7 @@ def call_tool(name: str, args: dict, pyautogui):
         y1 = int(args.get("y1", 0))
         x2 = int(args.get("x2", 0))
         y2 = int(args.get("y2", 0))
-        button = args.get("button", "left")
+        button = str(args.get("button", "left"))
         pyautogui.moveTo(x1, y1)
         pyautogui.dragTo(x2, y2, button=button)
         return f"Dragged from ({x1}, {y1}) to ({x2}, {y2}) with {button} button."
