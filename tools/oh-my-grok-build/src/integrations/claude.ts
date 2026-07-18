@@ -1,5 +1,6 @@
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
 import { sanitizeUserEnv } from "../env.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import spawner from "../spawner.js";
 
 export class ClaudeConnector implements Connector {
@@ -23,8 +24,12 @@ export class ClaudeConnector implements Connector {
       proc.on("exit", (code) => {
         const text = Buffer.concat(chunks).toString("utf8");
         if (code !== 0 && code !== null) {
-          const snippet = text.slice(-500);
-          reject(new Error(`${cmd} exited with code ${code}${snippet ? `: ${snippet}` : ""}`));
+          if (isRateLimited(text)) {
+            reject(new Error(formatRateLimitMessage()));
+          } else {
+            const snippet = text.slice(-500);
+            reject(new Error(`${cmd} exited with code ${code}${snippet ? `: ${snippet}` : ""}`));
+          }
           return;
         }
         resolve({ text, usage: { exitCode: code ?? 0 } });

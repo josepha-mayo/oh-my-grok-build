@@ -176,7 +176,11 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
   for (const name of names) {
     const output = await subagentOutput(name, 50);
     console.log(chalk.cyan(`--- ${name} ---`));
-    console.log(output.trim() || chalk.dim("(no output)"));
+    if (isRateLimited(output)) {
+      console.log(chalk.yellow(formatRateLimitMessage()));
+    } else {
+      console.log(output.trim() || chalk.dim("(no output)"));
+    }
     console.log("");
     outputs.push({ name, output });
   }

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
 import { sanitizeUserEnv } from "../env.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import spawner from "../spawner.js";
 
 export class CodexConnector implements Connector {
@@ -92,8 +93,13 @@ export class CodexConnector implements Connector {
       proc.on("exit", async (code) => {
         try {
           if (code !== 0 && code !== null) {
-            const stderrText = Buffer.concat(chunks).toString("utf8").slice(-500);
-            reject(new Error(`codex exited with code ${code}${stderrText ? `: ${stderrText}` : ""}`));
+            const stderrText = Buffer.concat(chunks).toString("utf8");
+            if (isRateLimited(stderrText)) {
+              reject(new Error(formatRateLimitMessage()));
+            } else {
+              const snippet = stderrText.slice(-500);
+              reject(new Error(`codex exited with code ${code}${snippet ? `: ${snippet}` : ""}`));
+            }
             return;
           }
 
