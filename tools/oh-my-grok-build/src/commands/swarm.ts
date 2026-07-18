@@ -138,7 +138,7 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
   const workers = clampWorkers(options.workers);
   const timeoutMs = Number.isNaN(options.timeout) ? DEFAULT_TIMEOUT : (options.timeout ?? DEFAULT_TIMEOUT);
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-build";
+  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
   const spawnOptions = { model, yolo: options.yolo, maxTurns: options.maxTurns, cwd: options.cwd };
 
   // Use a unique run prefix so repeated swarms do not collide with old worktrees.

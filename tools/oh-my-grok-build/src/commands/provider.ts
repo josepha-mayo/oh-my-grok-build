@@ -3,15 +3,26 @@ import { Writable } from "node:stream";
 import chalk from "chalk";
 import { addProvider, getProvider, listProviders, removeProvider, setDefaultProvider } from "../providers/manager.js";
 import { listProviderTemplates, getProviderTemplate } from "../providers/registry.js";
-import { discoverLocalModels, testProvider } from "../providers/local.js";
+import { discoverLocalModels, testProvider, fetchModelList } from "../providers/local.js";
 import type { ProviderConfig } from "../types.js";
 
+export interface ProviderAddOptions {
+  interactive?: boolean;
+  presetId?: string;
+  id?: string;
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
+  apiBackend?: ProviderConfig["apiBackend"];
+}
+
 function pickProviderEnvKey(
-  template: { id: string; envKey?: string | string[] },
+  template: { id: string; baseUrl: string; envKey?: string | string[] },
+  baseUrl: string,
   apiKey?: string
 ): string | string[] | undefined {
   if (apiKey) return undefined;
-  if (template.id === "ollama" || template.id === "lmstudio") return undefined;
+  if (baseUrl.startsWith("http://localhost") || baseUrl.startsWith("https://localhost")) return undefined;
   if (!template.envKey) return undefined;
   if (typeof template.envKey === "string") return template.envKey;
   const filtered = template.envKey.filter((k) => k.endsWith("_API_KEY"));
@@ -20,7 +31,6 @@ function pickProviderEnvKey(
 
 async function questionHidden(rl: readline.Interface, query: string): Promise<string> {
   process.stdout.write(query);
-  // Pause the main readline interface so it does not compete with the hidden one.
   rl.pause();
   const hidden = readline.createInterface({
     input: process.stdin,
@@ -41,12 +51,38 @@ async function questionHidden(rl: readline.Interface, query: string): Promise<st
   }
 }
 
-export async function providerAddCommand(interactive = true, presetId?: string): Promise<void> {
+async function chooseModel(
+  rl: readline.Interface,
+  baseUrl: string,
+  apiKey: string | undefined,
+  apiBackend: string,
+  extraHeaders: Record<string, string> = {},
+  defaultValue = ""
+): Promise<string> {
+  const models = await fetchModelList(baseUrl, apiKey, apiBackend, extraHeaders);
+
+  if (models && models.length > 0) {
+    console.log(chalk.bold("\nAvailable models:"));
+    models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
+    const choice = (await rl.question("\nPick a model (number or id): ")).trim();
+    if (/^\d+$/.test(choice)) {
+      const idx = parseInt(choice, 10) - 1;
+      if (idx >= 0 && idx < models.length) return models[idx];
+    }
+    if (choice) return choice;
+  }
+
+  const prompt = defaultValue ? `Model id [${defaultValue}]: ` : "Model id: ";
+  const answer = (await rl.question(prompt)).trim();
+  return answer || defaultValue;
+}
+
+export async function providerAddCommand(options: ProviderAddOptions = {}): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
   try {
-    let templateId = presetId;
-    if (interactive && !templateId) {
+    let templateId = options.presetId;
+    if (options.interactive !== false && !templateId) {
       const templates = listProviderTemplates();
       console.log(chalk.bold("\nAvailable providers:"));
       templates.forEach((t, i) => console.log(`  ${i + 1}. ${t.id} - ${t.name}`));
@@ -58,36 +94,64 @@ export async function providerAddCommand(interactive = true, presetId?: string):
     const template = getProviderTemplate(templateId ?? "custom-openai");
     if (!template) throw new Error(`Unknown provider template: ${templateId}`);
 
-    const id =
-      templateId === "custom-openai" || templateId === undefined
-        ? (await rl.question("Provider id (e.g. my-corp): ")).trim()
-        : templateId;
+    const isCustom = template.id === "custom-openai";
 
-    const baseUrl = template.baseUrl
-      ? template.baseUrl
-      : (await rl.question("API base URL (OpenAI-compatible): ")).trim();
+    let id: string;
+    if (options.id) {
+      id = options.id;
+    } else if (isCustom) {
+      if (options.interactive === false) throw new Error("--id is required for custom providers");
+      id = (await rl.question("Provider id (e.g. my-corp): ")).trim();
+    } else {
+      id = template.id;
+    }
+    if (!id) throw new Error("Provider id is required");
 
-    const defaultModel = template.defaultModel
-      ? template.defaultModel
-      : (await rl.question("Default model id: ")).trim();
+    let baseUrl: string;
+    if (options.baseUrl) {
+      baseUrl = options.baseUrl;
+    } else if (template.baseUrl) {
+      baseUrl = template.baseUrl;
+    } else if (options.interactive !== false) {
+      baseUrl = (await rl.question("API base URL (OpenAI-compatible): ")).trim();
+    } else {
+      throw new Error("--base-url is required");
+    }
+    if (!baseUrl) throw new Error("API base URL is required");
+
+    const apiBackend = options.apiBackend ?? template.apiBackend ?? "chat_completions";
 
     let apiKey: string | undefined;
-    if (template.apiKeyLabel) {
-      const suffix = template.id === "ollama" || template.id === "lmstudio" ? " (optional)" : "";
-      const key = await questionHidden(rl, `${template.apiKeyLabel}${suffix}: `);
+    if (options.apiKey !== undefined) {
+      apiKey = options.apiKey || undefined;
+    } else if (options.interactive !== false) {
+      const suffix = " (leave blank to use env var or for no auth)";
+      const key = template.apiKeyLabel
+        ? await questionHidden(rl, `${template.apiKeyLabel}${suffix}: `)
+        : await questionHidden(rl, `API key${suffix}: `);
       apiKey = key || undefined;
     }
 
-    const model = defaultModel || (await rl.question("Model id: ")).trim();
+    let model: string;
+    if (options.model) {
+      model = options.model;
+    } else if (options.interactive !== false) {
+      model = await chooseModel(rl, baseUrl, apiKey, apiBackend, template.extraHeaders, template.defaultModel ?? "");
+    } else if (template.defaultModel) {
+      model = template.defaultModel;
+    } else {
+      throw new Error("--model is required");
+    }
+    if (!model) throw new Error("Model id is required");
 
     const provider = await addProvider({
       id,
       name: template.name,
       model,
       baseUrl,
-      apiBackend: template.apiBackend,
+      apiBackend,
       apiKey,
-      envKey: pickProviderEnvKey(template, apiKey),
+      envKey: pickProviderEnvKey(template, baseUrl, apiKey),
       extraHeaders: template.extraHeaders,
       contextWindow: template.contextWindow,
     });
@@ -145,7 +209,7 @@ export async function providerDiscoverCommand(): Promise<void> {
     const template = getProviderTemplate(group.provider);
     if (!template) continue;
 
-    const envKey = pickProviderEnvKey(template);
+    const envKey = pickProviderEnvKey(template, template.baseUrl);
 
     for (const model of group.models) {
       const safeModel = sanitizeModelId(model);

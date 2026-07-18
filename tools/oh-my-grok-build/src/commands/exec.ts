@@ -13,7 +13,7 @@ export interface ExecOptions {
 
 export async function execCommand(options: ExecOptions): Promise<void> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-build";
+  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
 
   appendTimelineEvent({ type: "exec_start", model, prompt: options.prompt, cwd: options.cwd ?? process.cwd() });
 

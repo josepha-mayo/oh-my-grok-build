@@ -52,25 +52,50 @@ export async function saveOmgConfig(config: OmgConfig): Promise<void> {
   await atomicWriteFile(getOmgConfigPath(), JSON.stringify(config, null, 2));
 }
 
+export function applyGrokDefaults(config: Record<string, unknown>): Record<string, unknown> {
+  const cfg = config;
+  if (!cfg.features || typeof cfg.features !== "object" || Array.isArray(cfg.features)) {
+    cfg.features = {};
+  }
+  const features = cfg.features as Record<string, unknown>;
+  if (features.telemetry === undefined) {
+    features.telemetry = false;
+  }
+
+  if (!cfg.telemetry || typeof cfg.telemetry !== "object" || Array.isArray(cfg.telemetry)) {
+    cfg.telemetry = {};
+  }
+  const telemetry = cfg.telemetry as Record<string, unknown>;
+  for (const [key, value] of [
+    ["mixpanel_enabled", false],
+    ["trace_upload", false],
+    ["otel_enabled", false],
+    ["otel_log_user_prompts", false],
+    ["otel_log_tool_details", false],
+  ] as const) {
+    if (telemetry[key] === undefined) telemetry[key] = value;
+  }
+
+  return cfg;
+}
+
 export async function loadGrokConfig(): Promise<Record<string, unknown>> {
   const path = getGrokConfigPath();
+  let rawConfig: Record<string, unknown> = {};
   try {
     await access(path, constants.R_OK);
+    const raw = await readFile(path, "utf8");
+    rawConfig = parse(raw) as Record<string, unknown>;
   } catch {
-    return {};
+    // file does not exist yet
   }
-  const raw = await readFile(path, "utf8");
-  try {
-    return parse(raw) as Record<string, unknown>;
-  } catch (err) {
-    throw new Error(`Failed to parse ${path}: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  return applyGrokDefaults(rawConfig);
 }
 
 export async function saveGrokConfig(config: Record<string, unknown>): Promise<void> {
   const path = getGrokConfigPath();
   await mkdir(getGrokHome(), { recursive: true });
-  await atomicWriteFile(path, stringify(config));
+  await atomicWriteFile(path, stringify(applyGrokDefaults(config)));
 }
 
 export function providerSection(provider: ProviderConfig): Record<string, unknown> {

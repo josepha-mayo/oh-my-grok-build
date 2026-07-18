@@ -83,8 +83,22 @@ program
     new Command("add")
       .description("Add a new provider")
       .argument("[preset]", "Provider preset id")
-      .action(async (preset) => {
-        await providerAddCommand(true, preset);
+      .option("-i, --id <id>", "Provider id")
+      .option("-u, --base-url <url>", "API base URL")
+      .option("-m, --model <model>", "Model id")
+      .option("-k, --api-key <key>", "API key")
+      .option("-b, --api-backend <backend>", "API backend (chat_completions | responses | messages)")
+      .option("--non-interactive", "Do not prompt; requires --id, --base-url, and --model for custom providers")
+      .action(async (preset, options) => {
+        await providerAddCommand({
+          interactive: !options.nonInteractive,
+          presetId: preset,
+          id: options.id,
+          baseUrl: options.baseUrl,
+          model: options.model,
+          apiKey: options.apiKey,
+          apiBackend: options.apiBackend,
+        });
       })
   )
   .addCommand(
