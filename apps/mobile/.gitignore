@@ -1,7 +1,5 @@
 node_modules
 dist
-android
-ios
 .vscode
 *.log
 .DS_Store

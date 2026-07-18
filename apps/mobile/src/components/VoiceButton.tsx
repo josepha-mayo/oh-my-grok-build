@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Mic, MicOff } from "lucide-react";
 
 interface VoiceButtonProps {
@@ -9,6 +9,8 @@ interface VoiceButtonProps {
 export function VoiceButton({ onTranscript, disabled }: VoiceButtonProps) {
   const [supported, setSupported] = useState(false);
   const [listening, setListening] = useState(false);
+  const recognitionRef = useRef<any>(null);
+  const stoppedByUser = useRef(false);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -16,14 +18,25 @@ export function VoiceButton({ onTranscript, disabled }: VoiceButtonProps) {
     setSupported(!!w.SpeechRecognition || !!w.webkitSpeechRecognition);
   }, []);
 
+  useEffect(() => {
+    return () => {
+      recognitionRef.current?.abort?.();
+      recognitionRef.current = null;
+    };
+  }, []);
+
   if (!supported) return null;
 
-  const toggle = () => {
-    if (listening) {
-      setListening(false);
-      return;
+  const stopListening = () => {
+    stoppedByUser.current = true;
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      // Ignore errors from stopping an inactive recognition.
     }
+  };
 
+  const startListening = () => {
     const w = window as unknown as {
       SpeechRecognition?: new () => unknown;
       webkitSpeechRecognition?: new () => unknown;
@@ -36,6 +49,8 @@ export function VoiceButton({ onTranscript, disabled }: VoiceButtonProps) {
     recognition.interimResults = true;
     recognition.lang = navigator.language || "en-US";
 
+    recognitionRef.current = recognition;
+    stoppedByUser.current = false;
     let finalTranscript = "";
 
     recognition.onresult = (event: any) => {
@@ -52,19 +67,32 @@ export function VoiceButton({ onTranscript, disabled }: VoiceButtonProps) {
     };
 
     recognition.onerror = () => {
+      recognitionRef.current = null;
       setListening(false);
     };
 
     recognition.onend = () => {
+      recognitionRef.current = null;
       setListening(false);
-      if (finalTranscript) onTranscript(finalTranscript);
+      if (!stoppedByUser.current && finalTranscript) {
+        onTranscript(finalTranscript);
+      }
     };
 
     try {
       recognition.start();
       setListening(true);
     } catch {
+      recognitionRef.current = null;
       setListening(false);
+    }
+  };
+
+  const toggle = () => {
+    if (listening) {
+      stopListening();
+    } else {
+      startListening();
     }
   };
 

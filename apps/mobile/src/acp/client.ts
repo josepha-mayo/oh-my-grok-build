@@ -73,6 +73,20 @@ export interface AcpInitializeResponse {
   [key: string]: unknown;
 }
 
+function extractSecretAsProtocol(url: string): { cleanUrl: string; protocols?: string[] } {
+  try {
+    const u = new URL(url);
+    const secret = u.searchParams.get("server-key");
+    if (secret) {
+      u.searchParams.delete("server-key");
+      return { cleanUrl: u.toString(), protocols: [secret] };
+    }
+  } catch {
+    // not a valid URL, pass through
+  }
+  return { cleanUrl: url };
+}
+
 /**
  * Browser ACP client. Uses the global `WebSocket` so it works inside a
  * Capacitor WebView without extra native dependencies.
@@ -86,7 +100,8 @@ export class AcpClient {
 
   constructor(url: string, handlers: AcpHandlers = {}) {
     this.handlers = handlers;
-    this.ws = new WebSocket(url);
+    const { cleanUrl, protocols } = extractSecretAsProtocol(url);
+    this.ws = new WebSocket(cleanUrl, protocols);
     this.ws.onopen = () => {
       this.flushQueue();
       handlers.onOpen?.();

@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import chalk from "chalk";
 import { loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
-import { listSubagents, spawnSubagent, subagentOutput } from "../subagents/engine.js";
+import { listSubagents, spawnSubagent, subagentOutput, killSubagent } from "../subagents/engine.js";
 
 export interface SwarmOptions {
   prompt: string;
@@ -136,15 +136,29 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
   const model = options.model ?? cfg.defaultModel ?? "grok-build";
   const spawnOptions = { model, yolo: options.yolo, maxTurns: options.maxTurns, cwd: options.cwd };
 
+  // Use a unique run prefix so repeated swarms do not collide with old worktrees.
+  const runId = Date.now();
+  const names: string[] = [];
+  for (let i = 0; i < workers; i++) {
+    names.push(`swarm-${runId}-${i}`);
+  }
+
+  // Clean up any previous swarm worktrees with the same index names to avoid
+  // stale processes and git worktree conflicts.
+  for (const name of names) {
+    try {
+      await killSubagent(name);
+    } catch {
+      // not running; ignore
+    }
+  }
+
   console.log(chalk.bold(`Decomposing task into up to ${workers} subtasks with model ${chalk.cyan(model)}...`));
   const subtasks = await decomposeTask(options.prompt, workers, { model, yolo: options.yolo, cwd: options.cwd });
 
   console.log(chalk.bold(`Spawning ${subtasks.length} subagent(s)...`));
-  const names: string[] = [];
   for (let i = 0; i < subtasks.length; i++) {
-    const name = `swarm-${i}`;
-    await spawnSubagent(name, subtasks[i], spawnOptions);
-    names.push(name);
+    await spawnSubagent(names[i], subtasks[i], spawnOptions);
   }
 
   console.log(chalk.dim(`Waiting up to ${timeoutMs / 1000}s for subagents...`));

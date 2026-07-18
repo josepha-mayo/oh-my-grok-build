@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile, access, constants } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile, access, constants, rename } from "node:fs/promises";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { parse, stringify } from "smol-toml";
 import type { OmgConfig, ProviderConfig } from "./types.js";
@@ -24,6 +24,18 @@ export async function ensureOmgDir(): Promise<void> {
   await mkdir(getOmgDir(), { recursive: true });
 }
 
+export async function atomicWriteFile(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp.${Date.now()}`;
+  try {
+    await writeFile(tmp, content, { mode: 0o600 });
+    await rename(tmp, path);
+  } catch {
+    // Fallback for platforms where cross-device rename fails.
+    await writeFile(path, content, { mode: 0o600 });
+  }
+}
+
 export async function loadOmgConfig(): Promise<OmgConfig> {
   const path = getOmgConfigPath();
   await ensureOmgDir();
@@ -37,7 +49,7 @@ export async function loadOmgConfig(): Promise<OmgConfig> {
 
 export async function saveOmgConfig(config: OmgConfig): Promise<void> {
   await ensureOmgDir();
-  await writeFile(getOmgConfigPath(), JSON.stringify(config, null, 2));
+  await atomicWriteFile(getOmgConfigPath(), JSON.stringify(config, null, 2));
 }
 
 export async function loadGrokConfig(): Promise<Record<string, unknown>> {
@@ -58,30 +70,7 @@ export async function loadGrokConfig(): Promise<Record<string, unknown>> {
 export async function saveGrokConfig(config: Record<string, unknown>): Promise<void> {
   const path = getGrokConfigPath();
   await mkdir(getGrokHome(), { recursive: true });
-  await writeFile(path, stringify(config));
-}
-
-/**
- * Write a provider into Grok's config as `[model.omgb-<id>]`.
- * NOTE: this round-trips through smol-toml, so comments in the file are not preserved.
- */
-export async function syncProviderToGrokConfig(provider: ProviderConfig): Promise<void> {
-  const config = await loadGrokConfig();
-  const section = providerSection(provider);
-  const models = (config["model"] as Record<string, unknown> | undefined) ?? {};
-  models[`omgb-${provider.id}`] = section;
-  config["model"] = models;
-
-  if (config.models && typeof config.models === "object" && !Array.isArray(config.models)) {
-    const modelsTable = config.models as Record<string, unknown>;
-    if (!modelsTable.default) {
-      modelsTable.default = `omgb-${provider.id}`;
-    }
-  } else {
-    config.models = { default: `omgb-${provider.id}` };
-  }
-
-  await saveGrokConfig(config);
+  await atomicWriteFile(path, stringify(config));
 }
 
 export function providerSection(provider: ProviderConfig): Record<string, unknown> {
@@ -100,6 +89,37 @@ export function providerSection(provider: ProviderConfig): Record<string, unknow
   if (provider.topP !== undefined) section.top_p = provider.topP;
   if (provider.maxCompletionTokens) section.max_completion_tokens = provider.maxCompletionTokens;
   return section;
+}
+
+/**
+ * Write a provider into Grok's config as `[model.omgb-<id>]`.
+ * The file is round-tripped through smol-toml, so comments are not preserved.
+ * The file is written atomically and a `.bak` copy is kept.
+ */
+export async function syncProviderToGrokConfig(provider: ProviderConfig): Promise<void> {
+  const path = getGrokConfigPath();
+  await mkdir(getGrokHome(), { recursive: true });
+
+  let config = await loadGrokConfig();
+  try {
+    const raw = await readFile(path, "utf8");
+    await atomicWriteFile(`${path}.bak`, raw);
+  } catch {
+    // file does not exist yet
+  }
+
+  const modelKey = `omgb-${provider.id}`;
+  const modelTable = (config["model"] as Record<string, unknown> | undefined) ?? {};
+  modelTable[modelKey] = providerSection(provider);
+  config["model"] = modelTable;
+
+  const modelsTable = (config["models"] as Record<string, unknown> | undefined) ?? {};
+  if (!modelsTable.default) {
+    modelsTable.default = modelKey;
+    config["models"] = modelsTable;
+  }
+
+  await saveGrokConfig(config);
 }
 
 export async function loadOmgProviders(): Promise<Record<string, ProviderConfig>> {
@@ -123,24 +143,31 @@ export async function removeOmgProvider(id: string): Promise<void> {
 }
 
 export async function removeProviderFromGrokConfig(id: string): Promise<void> {
-  const config = await loadGrokConfig();
-  if (config["model"] && typeof config["model"] === "object" && !Array.isArray(config["model"])) {
-    delete (config["model"] as Record<string, unknown>)[`omgb-${id}`];
+  const path = getGrokConfigPath();
+  let config = await loadGrokConfig();
+  try {
+    const raw = await readFile(path, "utf8");
+    await atomicWriteFile(`${path}.bak`, raw);
+  } catch {
+    return;
   }
-  if (
-    config["models"] &&
-    typeof config["models"] === "object" &&
-    !Array.isArray(config["models"]) &&
-    (config["models"] as Record<string, unknown>).default === `omgb-${id}`
-  ) {
-    const modelsTable = config["models"] as Record<string, unknown>;
-    const remaining = Object.keys((config["model"] as Record<string, unknown>) ?? {});
+
+  const modelKey = `omgb-${id}`;
+  const modelTable = (config["model"] as Record<string, unknown> | undefined) ?? {};
+  delete modelTable[modelKey];
+  config["model"] = modelTable;
+
+  const modelsTable = (config["models"] as Record<string, unknown> | undefined) ?? {};
+  if (modelsTable.default === modelKey) {
+    const remaining = Object.keys(modelTable);
     if (remaining.length > 0) {
       modelsTable.default = remaining[0];
     } else {
       delete modelsTable.default;
     }
+    config["models"] = modelsTable;
   }
+
   await saveGrokConfig(config);
 }
 

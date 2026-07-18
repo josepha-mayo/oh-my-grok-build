@@ -1,8 +1,21 @@
 import { LocalNotifications } from "@capacitor/local-notifications";
 import { Capacitor } from "@capacitor/core";
 
+const LAST_NOTIFICATION_ID_KEY = "omgb:lastNotificationId";
 let requested = false;
-let notificationId = 1;
+
+function nextNotificationId(): number {
+  try {
+    const raw = localStorage.getItem(LAST_NOTIFICATION_ID_KEY);
+    let id = Number(raw) || 0;
+    id = (id + 1) % 2_147_483_647;
+    localStorage.setItem(LAST_NOTIFICATION_ID_KEY, String(id));
+    return id;
+  } catch {
+    // localStorage may be unavailable; fall back to a time-based id.
+    return Math.floor(Date.now() / 1000) % 2_147_483_647;
+  }
+}
 
 export async function requestNotificationPermission(): Promise<void> {
   if (requested) return;
@@ -38,7 +51,7 @@ export async function notifyCompletion(title: string, body?: string): Promise<vo
             {
               title,
               body: body ?? "",
-              id: notificationId++,
+              id: nextNotificationId(),
               schedule: { at: new Date(Date.now() + 1000) },
             },
           ],
@@ -52,7 +65,7 @@ export async function notifyCompletion(title: string, body?: string): Promise<vo
 
   if ("Notification" in window && Notification.permission === "granted") {
     try {
-      new Notification(title, { body, icon: "/favicon.ico" });
+      new Notification(title, { body });
     } catch {
       // ignore
     }

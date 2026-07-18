@@ -1,6 +1,6 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getOmgDir } from "../config.js";
+import { getOmgDir, atomicWriteFile } from "../config.js";
 import { ClaudeConnector } from "./claude.js";
 import { CodexConnector } from "./codex.js";
 import { OpenCodeConnector } from "./opencode.js";
@@ -8,17 +8,39 @@ import type { Connector, ConnectorConfig, ConnectorRegistry } from "./types.js";
 
 const REGISTRY_PATH = () => join(getOmgDir(), "connectors.json");
 
+const RESERVED_CONNECTOR_NAMES = new Set(["__proto__", "prototype", "constructor"]);
+
+function createNullRegistry(): ConnectorRegistry {
+  return { connectors: Object.create(null) as Record<string, ConnectorConfig> };
+}
+
 export async function loadRegistry(): Promise<ConnectorRegistry> {
   try {
     const raw = await readFile(REGISTRY_PATH(), "utf8");
-    return JSON.parse(raw) as ConnectorRegistry;
+    const parsed = JSON.parse(raw) as ConnectorRegistry;
+    const registry = createNullRegistry();
+    if (parsed && typeof parsed === "object" && parsed.connectors && typeof parsed.connectors === "object") {
+      for (const [k, v] of Object.entries(parsed.connectors)) {
+        (registry.connectors as Record<string, ConnectorConfig>)[k] = v;
+      }
+    }
+    return registry;
   } catch {
-    return { connectors: {} };
+    return createNullRegistry();
   }
 }
 
 export async function saveRegistry(registry: ConnectorRegistry): Promise<void> {
-  await writeFile(REGISTRY_PATH(), JSON.stringify(registry, null, 2));
+  await atomicWriteFile(REGISTRY_PATH(), JSON.stringify(registry, null, 2));
+}
+
+function validateName(name: string): void {
+  if (RESERVED_CONNECTOR_NAMES.has(name)) {
+    throw new Error(`Reserved connector name: ${name}`);
+  }
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+    throw new Error(`Invalid connector name: ${name}`);
+  }
 }
 
 export async function listConnectors(): Promise<ConnectorConfig[]> {
@@ -27,11 +49,13 @@ export async function listConnectors(): Promise<ConnectorConfig[]> {
 }
 
 export async function getConnector(name: string): Promise<ConnectorConfig | undefined> {
+  validateName(name);
   const registry = await loadRegistry();
   return registry.connectors[name];
 }
 
 export async function addConnector(config: ConnectorConfig): Promise<ConnectorConfig> {
+  validateName(config.name);
   const registry = await loadRegistry();
   registry.connectors[config.name] = config;
   await saveRegistry(registry);
@@ -39,6 +63,7 @@ export async function addConnector(config: ConnectorConfig): Promise<ConnectorCo
 }
 
 export async function removeConnector(name: string): Promise<void> {
+  validateName(name);
   const registry = await loadRegistry();
   delete registry.connectors[name];
   await saveRegistry(registry);

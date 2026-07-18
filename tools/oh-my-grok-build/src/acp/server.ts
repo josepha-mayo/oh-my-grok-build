@@ -15,8 +15,14 @@ export interface ServeOptions {
   yolo?: boolean;
 }
 
+const MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
+const MAX_CONNECTIONS_PER_IP = 10;
+const CONNECTION_WINDOW_MS = 60_000;
+const MAX_MESSAGES_PER_CONNECTION = 100;
+const MESSAGE_WINDOW_MS = 10_000;
+
 export function makeSecret(): string {
-  return randomBytes(16).toString("hex").toUpperCase();
+  return randomBytes(32).toString("hex").toUpperCase();
 }
 
 export interface ParsedServerUrl {
@@ -53,20 +59,74 @@ export function getLocalIp(): string | undefined {
   return undefined;
 }
 
+function isLocalOrigin(origin: string): boolean {
+  if (!origin) return true;
+  try {
+    const u = new URL(origin);
+    if (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "::1") return true;
+    if (u.protocol === "capacitor:" || u.protocol === "ionic:" || u.protocol === "file:") return true;
+    if (u.protocol === "https:" && u.hostname.endsWith(".localhost")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function isPrivateIp(ip: string): boolean {
+  // Handle IPv4-mapped IPv6 addresses first.
+  if (ip.startsWith("::ffff:")) {
+    return isPrivateIp(ip.slice(7));
+  }
+  if (
+    ip === "127.0.0.1" ||
+    ip === "::1" ||
+    ip.startsWith("10.") ||
+    ip.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip) ||
+    ip.startsWith("fe80:") ||
+    ip.startsWith("fc") ||
+    ip.startsWith("fd")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isOriginAllowed(origin: string, clientIp: string): boolean {
+  // Only allow same-machine origins. The server-key provides the actual
+  // authentication, but this prevents cross-site WebSocket abuse from
+  // non-browser clients that still send an Origin header.
+  if (!origin || isLocalOrigin(origin)) return true;
+  console.warn(`[omgb serve] rejected origin '${origin}' from ${clientIp}`);
+  return false;
+}
+
 interface Client {
   ws: any;
   proc: ChildProcess;
   stderrTail: string[];
+  messageCount: number;
+  messageWindowStart: number;
+}
+
+interface ConnectionRateEntry {
+  count: number;
+  windowStart: number;
 }
 
 export async function startAgentServer(options: ServeOptions = {}): Promise<ServerInfo & { process?: ChildProcess }> {
-  const bind = options.bind ?? "0.0.0.0";
+  const bind = options.bind ?? "127.0.0.1";
   const secret = options.secret ?? makeSecret();
   const cwd = options.cwd ?? process.cwd();
 
-  const wss = new WebSocketServer({ host: bind, port: options.port ?? 0 });
+  const wss = new WebSocketServer({
+    host: bind,
+    port: options.port ?? 0,
+    maxPayload: MAX_MESSAGE_BYTES,
+  });
 
   const clients = new Set<Client>();
+  const connectionRates = new Map<string, ConnectionRateEntry>();
   let address: { port: number; address: string } | null = null;
 
   const getHostForClient = () => {
@@ -86,6 +146,19 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
   });
 
   wss.on("connection", (ws: any, req: any) => {
+    const clientIp = getClientIp(req);
+
+    if (!checkConnectionRate(clientIp)) {
+      ws.close(1008, "rate limit exceeded");
+      return;
+    }
+
+    const origin = req.headers.origin ?? "";
+    if (!isOriginAllowed(origin, clientIp)) {
+      ws.close(1008, "origin not allowed");
+      return;
+    }
+
     const clientSecret = extractSecret(ws, req);
     if (clientSecret !== secret) {
       console.warn("[omgb serve] rejected client: invalid server-key");
@@ -103,7 +176,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
       env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     });
 
-    const client: Client = { ws, proc, stderrTail: [] };
+    const client: Client = { ws, proc, stderrTail: [], messageCount: 0, messageWindowStart: Date.now() };
     clients.add(client);
 
     proc.on("error", (err) => {
@@ -135,11 +208,19 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
     });
 
     ws.on("message", (data: unknown) => {
+      if (!checkMessageRate(client)) {
+        ws.close(1009, "message rate exceeded");
+        return;
+      }
       const buf = Buffer.isBuffer(data)
         ? data
         : Array.isArray(data)
           ? Buffer.concat(data)
           : Buffer.from(data as ArrayBuffer);
+      if (buf.length > MAX_MESSAGE_BYTES) {
+        ws.close(1009, "message too large");
+        return;
+      }
       if (proc.stdin?.writable) {
         proc.stdin.write(buf.toString() + "\n");
       }
@@ -160,10 +241,17 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
   const hostForClient = getHostForClient();
   const actualPort = (address as any)?.port ?? 0;
 
+  if (bind === "0.0.0.0") {
+    console.warn(
+      "[omgb serve] listening on all interfaces. Ensure you trust the network or use --bind 127.0.0.1 to restrict to localhost."
+    );
+  }
+
   const close = async (): Promise<void> => {
     for (const client of Array.from(clients)) {
       cleanupClient(client, 1000, "server closing");
     }
+    connectionRates.clear();
     return new Promise((resolve, reject) => {
       wss.close((err: Error | undefined) => (err ? reject(err) : resolve()));
     });
@@ -175,6 +263,42 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
     cwd,
     close,
   };
+
+  function getClientIp(req: import("http").IncomingMessage): string {
+    const socket = (req as any).socket;
+    const remoteAddress = socket?.remoteAddress ? String(socket.remoteAddress) : "unknown";
+
+    // Only trust X-Forwarded-For from loopback. If a real reverse proxy is
+    // in use, the operator can set --bind 127.0.0.1 and proxy to that.
+    if (isPrivateIp(remoteAddress)) {
+      const forwarded = req.headers["x-forwarded-for"];
+      if (typeof forwarded === "string") {
+        return forwarded.split(",")[0].trim();
+      }
+    }
+    return remoteAddress;
+  }
+
+  function checkConnectionRate(ip: string): boolean {
+    const now = Date.now();
+    let entry = connectionRates.get(ip);
+    if (!entry || now - entry.windowStart > CONNECTION_WINDOW_MS) {
+      entry = { count: 0, windowStart: now };
+    }
+    entry.count++;
+    connectionRates.set(ip, entry);
+    return entry.count <= MAX_CONNECTIONS_PER_IP;
+  }
+
+  function checkMessageRate(client: Client): boolean {
+    const now = Date.now();
+    if (now - client.messageWindowStart > MESSAGE_WINDOW_MS) {
+      client.messageWindowStart = now;
+      client.messageCount = 0;
+    }
+    client.messageCount++;
+    return client.messageCount <= MAX_MESSAGES_PER_CONNECTION;
+  }
 
   function cleanupClient(client: Client, code?: number, reason?: string): void {
     if (!clients.has(client)) return;
@@ -199,14 +323,29 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
   }
 
   function extractSecret(_ws: WebSocket, req: import("http").IncomingMessage): string | undefined {
-    // Prefer the Authorization header when available (Node clients). Browsers/WebViews that
-    // cannot set headers continue to pass the key in the URL query as a fallback.
+    // Prefer the Authorization header (Node clients).
     const auth = req.headers.authorization ?? "";
     const m = auth.match(/^Bearer\s+(.+)$/i);
     if (m) return m[1];
 
+    // Browser-based WebViews cannot set arbitrary headers, but they can supply
+    // the secret as a WebSocket subprotocol, which is sent in the handshake and
+    // avoids putting it in the URL query string.
+    const protocols = req.headers["sec-websocket-protocol"];
+    if (typeof protocols === "string" && protocols.trim()) {
+      const protocol = protocols.split(",")[0]?.trim();
+      if (protocol) return protocol;
+    }
+
+    // Fallback for clients that can only pass the key in the URL query.
+    // This is used for the initial QR-code pairing but should be avoided
+    // for persistent connections.
     try {
-      return new URL(req.url ?? "", "http://localhost").searchParams.get("server-key") ?? undefined;
+      const fromUrl = new URL(req.url ?? "", "http://localhost").searchParams.get("server-key") ?? undefined;
+      if (fromUrl) {
+        console.warn("[omgb serve] client authenticated via URL query; prefer Authorization header or subprotocol");
+      }
+      return fromUrl;
     } catch {
       return undefined;
     }

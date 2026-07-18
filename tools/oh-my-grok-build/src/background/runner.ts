@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, normalize, sep } from "node:path";
 import { getOmgDir, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
 
@@ -11,10 +11,26 @@ export interface RunPromptOptions {
   cwd?: string;
 }
 
+function sanitizeJobName(name?: string): string {
+  const safe = (name ?? "default")
+    .toString()
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return safe || "default";
+}
+
 function logPath(jobName?: string): string {
-  const logsDir = join(getOmgDir(), "logs");
+  const logsDir = resolve(join(getOmgDir(), "logs"));
   mkdirSync(logsDir, { recursive: true });
-  return join(logsDir, `${jobName ?? "default"}.jsonl`);
+  const safeName = sanitizeJobName(jobName);
+  const candidate = resolve(join(logsDir, `${safeName}.jsonl`));
+  const normalized = normalize(candidate);
+  const normalizedLogs = normalize(logsDir);
+  if (!normalized.toLowerCase().startsWith(normalizedLogs.toLowerCase() + sep) && normalized !== normalizedLogs) {
+    throw new Error(`Invalid job name: ${jobName ?? "default"}`);
+  }
+  return candidate;
 }
 
 function appendLog(file: string, stream: "stdout" | "stderr", data: Buffer): void {

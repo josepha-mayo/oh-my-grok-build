@@ -39,7 +39,7 @@ program.name("omgb").description("Productivity and orchestration layer for Grok 
 program
   .command("serve")
   .description("Start the Grok Build agent server and print a mobile pairing QR code")
-  .option("-b, --bind <addr>", "Bind address", "0.0.0.0")
+  .option("-b, --bind <addr>", "Bind address", "127.0.0.1")
   .option("-p, --port <port>", "Port (0 for auto)", parseInt, 0)
   .option("-s, --secret <secret>", "Server secret")
   .option("--cwd <cwd>", "Working directory")

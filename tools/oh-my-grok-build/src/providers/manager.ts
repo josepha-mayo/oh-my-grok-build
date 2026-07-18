@@ -1,4 +1,4 @@
-import { writeFile, chmod, mkdir, readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProviderConfig } from "../types.js";
 import {
@@ -9,6 +9,7 @@ import {
   syncProviderToGrokConfig,
   removeProviderFromGrokConfig,
   getOmgDir,
+  atomicWriteFile,
 } from "../config.js";
 
 export type ProviderInput = {
@@ -123,7 +124,8 @@ export async function writeApiKeyToEnv(providerId: string, key: string): Promise
   }
   const lines = content.split("\n").filter((l) => !l.startsWith(`${varName}=`));
   lines.push(line);
-  await writeFile(envPath, lines.join("\n") + (lines[lines.length - 1]?.endsWith("\n") ? "" : "\n"));
+  const newContent = lines.join("\n") + (lines[lines.length - 1]?.endsWith("\n") ? "" : "\n");
+  await atomicWriteFile(envPath, newContent);
   if (process.platform !== "win32") {
     await chmod(envPath, 0o600);
   }
@@ -146,9 +148,9 @@ export async function removeApiKeyFromEnv(providerId: string): Promise<void> {
   const lines = content.split("\n").filter((l) => !l.startsWith(`${varName}=`));
   const newContent = lines.join("\n").trimEnd();
   if (newContent) {
-    await writeFile(envPath, newContent + "\n");
+    await atomicWriteFile(envPath, newContent + "\n");
   } else {
-    await writeFile(envPath, "");
+    await atomicWriteFile(envPath, "");
   }
 
   delete process.env[varName];

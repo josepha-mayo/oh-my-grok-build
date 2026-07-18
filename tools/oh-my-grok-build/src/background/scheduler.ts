@@ -1,7 +1,7 @@
 import { CronJob } from "cron";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ensureOmgDir, getOmgDir } from "../config.js";
+import { ensureOmgDir, getOmgDir, atomicWriteFile } from "../config.js";
 
 export interface JobMeta {
   name: string;
@@ -18,6 +18,12 @@ function schedulerPath(): string {
   return join(getOmgDir(), "scheduler.json");
 }
 
+function validateName(name: string): void {
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+    throw new Error(`Invalid job name: ${name}`);
+  }
+}
+
 export async function loadJobs(): Promise<JobMeta[]> {
   await ensureOmgDir();
   try {
@@ -30,10 +36,11 @@ export async function loadJobs(): Promise<JobMeta[]> {
 
 export async function saveJobs(jobs: JobMeta[]): Promise<void> {
   await ensureOmgDir();
-  await writeFile(schedulerPath(), JSON.stringify(jobs, null, 2));
+  await atomicWriteFile(schedulerPath(), JSON.stringify(jobs, null, 2));
 }
 
 async function updateLastRun(name: string): Promise<void> {
+  validateName(name);
   const jobs = await loadJobs();
   const job = jobs.find((j) => j.name === name);
   if (job) {
@@ -48,6 +55,7 @@ export async function startJob(
   taskFn: () => Promise<void>,
   meta?: Record<string, unknown>
 ): Promise<CronJob> {
+  validateName(name);
   if (activeJobs.has(name)) {
     const old = activeJobs.get(name)!;
     old.stop();
@@ -88,10 +96,10 @@ export async function startJob(
 }
 
 export async function stopJob(name: string): Promise<void> {
+  validateName(name);
   const job = activeJobs.get(name);
   if (job) {
-    const stopped = job.stop();
-    if (stopped) await stopped;
+    job.stop();
     activeJobs.delete(name);
   }
 
@@ -104,6 +112,7 @@ export async function stopJob(name: string): Promise<void> {
 }
 
 export async function deleteJob(name: string): Promise<void> {
+  validateName(name);
   await stopJob(name);
   const jobs = await loadJobs();
   await saveJobs(jobs.filter((j) => j.name !== name));
@@ -119,6 +128,7 @@ export async function listJobs(): Promise<JobMeta[]> {
 }
 
 export async function runJobNow(name: string): Promise<boolean> {
+  validateName(name);
   const job = activeJobs.get(name);
   if (!job) return false;
   await job.fireOnTick();

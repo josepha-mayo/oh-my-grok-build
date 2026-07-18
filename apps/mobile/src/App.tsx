@@ -148,7 +148,6 @@ function parseToolOutput(raw: unknown): ToolOutputData | undefined {
 export default function App() {
   const [view, setView] = useState<View>("connect");
   const [url, setUrl] = useState(loadLastUrl);
-  const [sessionId, setSessionId] = useState("");
   const [model, setModel] = useState("grok-build");
   const [effort, setEffort] = useState<ReasoningEffort>("medium");
   const [yolo, setYolo] = useState(false);
@@ -163,6 +162,7 @@ export default function App() {
   const permissionResolver = useRef<((value: AcpPermissionResponse) => void) | null>(null);
   const closingRef = useRef(false);
   const loopRef = useRef<LoopState | null>(null);
+  const sessionIdRef = useRef<string>("");
 
   useEffect(() => {
     closingRef.current = false;
@@ -183,7 +183,7 @@ export default function App() {
   const maybeContinueLoop = useCallback(async () => {
     const client = clientRef.current;
     const loop = loopRef.current;
-    if (!client || !loop || loop.remaining <= 0 || !sessionId) return;
+    if (!client || !loop || loop.remaining <= 0 || !sessionIdRef.current) return;
 
     loop.remaining -= 1;
     if (loop.remaining < 0) {
@@ -199,16 +199,17 @@ export default function App() {
     setThinking(true);
     appendMessage("agent", { text: `[loop] ${loop.remaining} iteration${loop.remaining === 1 ? "" : "s"} remaining` });
     try {
-      await client.prompt(sessionId, [{ type: "text", text: prompt }]);
+      await client.prompt(sessionIdRef.current, [{ type: "text", text: prompt }]);
     } catch (err) {
       appendMessage("agent", { text: `Loop error: ${err instanceof Error ? err.message : String(err)}` });
       setThinking(false);
       loopRef.current = null;
     }
-  }, [appendMessage, sessionId]);
+  }, [appendMessage]);
 
   const handleUpdate = useCallback(
     (_sessionId: string, update: AcpUpdate) => {
+      if (closingRef.current || _sessionId !== sessionIdRef.current) return;
       switch (update.sessionUpdate) {
         case "agent_message_chunk": {
           appendMessage("agent", { text: getText(update.content) });
@@ -225,12 +226,18 @@ export default function App() {
         case "tool_call_update": {
           const output = parseToolOutput(update.output ?? update.content);
           setMessages((prev) => {
+            const toolIndex = [...prev].reverse().findIndex((m) => m.tool);
+            if (toolIndex === -1) return prev;
+            const actualIndex = prev.length - 1 - toolIndex;
             const next = [...prev];
-            const lastTool = [...next].reverse().find((m) => m.tool);
-            if (lastTool?.tool) {
-              lastTool.tool.status = update.status ?? lastTool.tool.status;
-              if (output) lastTool.tool.output = output;
-            }
+            next[actualIndex] = {
+              ...next[actualIndex],
+              tool: {
+                ...next[actualIndex].tool,
+                status: update.status ?? next[actualIndex].tool?.status ?? "running",
+                ...(output ? { output } : {}),
+              },
+            };
             return next;
           });
           break;
@@ -270,8 +277,10 @@ export default function App() {
 
   const startSessionWithProfile = useCallback(
     async (client: AcpClient, modelId: string, yoloMode: boolean, reasoningEffort: ReasoningEffort) => {
-      const { sessionId: sid } = await client.newSession("/", [], { modelId, yoloMode, reasoningEffort }, 60_000);
-      setSessionId(sid);
+      const { sessionId: sid } = await client.newSession(".", [], { modelId, yoloMode, reasoningEffort }, 60_000);
+      sessionIdRef.current = sid;
+      setThinking(false);
+      loopRef.current = null;
       return sid;
     },
     []
@@ -290,7 +299,8 @@ export default function App() {
   const onSend = useCallback(
     async (text: string) => {
       const client = clientRef.current;
-      if (!client || !sessionId) return;
+      const currentSessionId = sessionIdRef.current;
+      if (!client || !currentSessionId) return;
 
       const slash = matchSlashCommand(text);
       if (slash) {
@@ -308,22 +318,20 @@ export default function App() {
             const next = !yolo;
             setYolo(next);
             appendMessage("agent", { text: `Auto-approve ${next ? "enabled" : "disabled"}.` });
-            if (client && sessionId) {
-              try {
-                await startSessionWithProfile(client, model, next, effort);
-                appendMessage("agent", { text: `Session restarted with auto-approve ${next ? "on" : "off"}.` });
-              } catch (err) {
-                appendMessage("agent", {
-                  text: `Failed to switch mode: ${err instanceof Error ? err.message : String(err)}`,
-                });
-              }
+            try {
+              await startSessionWithProfile(client, model, next, effort);
+              appendMessage("agent", { text: `Session restarted with auto-approve ${next ? "on" : "off"}.` });
+            } catch (err) {
+              appendMessage("agent", {
+                text: `Failed to switch mode: ${err instanceof Error ? err.message : String(err)}`,
+              });
             }
             return;
           }
           case "/model":
             if (arg) {
               try {
-                await client.setModel(sessionId, arg);
+                await client.setModel(currentSessionId, arg);
                 setModel(arg);
                 appendMessage("agent", { text: `Model set to ${arg}.` });
               } catch (err) {
@@ -356,7 +364,7 @@ export default function App() {
             appendMessage("user", { text: arg });
             setThinking(true);
             try {
-              await client.prompt(sessionId, [{ type: "text", text: arg }]);
+              await client.prompt(currentSessionId, [{ type: "text", text: arg }]);
             } catch (err) {
               appendMessage("agent", { text: `Error: ${err instanceof Error ? err.message : String(err)}` });
               setThinking(false);
@@ -365,9 +373,9 @@ export default function App() {
             return;
           }
           case "/swarm": {
-            const swarmCmd = `omgb swarm "${arg.replace(/"/g, '\\"')}"`;
+            const quoted = JSON.stringify(arg);
             appendMessage("agent", {
-              text: `Swarm mode runs on the desktop CLI. Copy and run:\n\`\`\`\n${swarmCmd}\n\`\`\``,
+              text: `Swarm mode runs on the desktop CLI. Copy and run:\n\`\`\`\nomgb swarm ${quoted}\n\`\`\``,
             });
             return;
           }
@@ -390,21 +398,21 @@ export default function App() {
       appendMessage("user", { text });
       setThinking(true);
       try {
-        await client.prompt(sessionId, [{ type: "text", text }]);
+        await client.prompt(currentSessionId, [{ type: "text", text }]);
       } catch (err) {
         appendMessage("agent", { text: `Error: ${err instanceof Error ? err.message : String(err)}` });
         setThinking(false);
       }
     },
-    [sessionId, appendMessage, yolo, model, effort, startSessionWithProfile]
+    [appendMessage, yolo, model, effort, startSessionWithProfile]
   );
 
   const handleModelChange = useCallback(
     async (modelId: string) => {
       const client = clientRef.current;
-      if (client && sessionId) {
+      if (client && sessionIdRef.current) {
         try {
-          await client.setModel(sessionId, modelId);
+          await client.setModel(sessionIdRef.current, modelId);
           setModel(modelId);
           appendMessage("agent", { text: `Model set to ${modelId}.` });
         } catch (err) {
@@ -417,14 +425,14 @@ export default function App() {
         appendMessage("agent", { text: `Model preference set to ${modelId}.` });
       }
     },
-    [appendMessage, sessionId]
+    [appendMessage]
   );
 
   const handleEffortChange = useCallback(
     async (e: ReasoningEffort) => {
       const client = clientRef.current;
       setEffort(e);
-      if (client && sessionId) {
+      if (client && sessionIdRef.current) {
         try {
           await startSessionWithProfile(client, model, yolo, e);
           appendMessage("agent", { text: `Reasoning effort set to ${e}.` });
@@ -437,7 +445,7 @@ export default function App() {
         appendMessage("agent", { text: `Effort preference set to ${e}.` });
       }
     },
-    [appendMessage, model, sessionId, yolo, startSessionWithProfile]
+    [appendMessage, model, yolo, startSessionWithProfile]
   );
 
   const connect = useCallback(
@@ -507,8 +515,8 @@ export default function App() {
     clientRef.current?.close();
     clientRef.current = null;
     loopRef.current = null;
+    sessionIdRef.current = "";
     setView("connect");
-    setSessionId("");
     setMessages([]);
     setPermission(null);
     setError(null);
