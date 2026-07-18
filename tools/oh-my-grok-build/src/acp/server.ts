@@ -128,7 +128,8 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
 
   const clients = new Set<Client>();
   const connectionRates = new Map<string, ConnectionRateEntry>();
-  let address: { port: number; address: string } | null = null;
+  let serverPort = 0;
+  let serverAddress = "";
 
   const getHostForClient = () => {
     if (bind === "0.0.0.0") return getLocalIp() ?? "127.0.0.1";
@@ -137,9 +138,10 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
 
   const serverReady = new Promise<void>((resolve, reject) => {
     wss.on("listening", () => {
-      const addr = wss.address() as any;
+      const addr = wss.address();
       if (addr && typeof addr === "object") {
-        address = { port: (addr as any).port as number, address: (addr as any).address as string };
+        serverPort = (addr as { port?: number }).port ?? 0;
+        serverAddress = (addr as { address?: string }).address ?? "";
       }
       resolve();
     });
@@ -240,7 +242,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
   await serverReady;
 
   const hostForClient = getHostForClient();
-  const actualPort = (address as any)?.port ?? 0;
+  const actualPort = serverPort;
 
   if (bind === "0.0.0.0") {
     console.warn(
@@ -266,8 +268,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
   };
 
   function getClientIp(req: import("http").IncomingMessage): string {
-    const socket = (req as any).socket;
-    const remoteAddress = socket?.remoteAddress ? String(socket.remoteAddress) : "unknown";
+    const remoteAddress = req.socket?.remoteAddress ? String(req.socket.remoteAddress) : "unknown";
 
     // Only trust X-Forwarded-For from loopback. If a real reverse proxy is
     // in use, the operator can set --bind 127.0.0.1 and proxy to that.

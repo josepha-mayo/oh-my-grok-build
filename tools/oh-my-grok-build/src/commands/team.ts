@@ -16,9 +16,12 @@ export async function teamCommand(options: TeamOptions): Promise<void> {
   const cfg = await loadOmgConfig();
   const model = options.model ?? cfg.defaultModel ?? "grok-build";
 
-  console.log(chalk.bold(`Spawning ${options.count} Grok worker(s) with model ${chalk.cyan(model)}...\n`));
+  let count = Number.isNaN(options.count) ? 1 : options.count;
+  count = Math.max(1, Math.min(20, count));
 
-  const workers = Array.from({ length: options.count }, async (_, i) => {
+  console.log(chalk.bold(`Spawning ${count} Grok worker(s) with model ${chalk.cyan(model)}...\n`));
+
+  const workers = Array.from({ length: count }, async (_, i) => {
     const workdir = await mkdtemp(join(tmpdir(), `omgb-team-${i}-`));
     const args = ["-p", options.prompt, "--model", model];
     if (options.yolo) args.push("--yolo");
