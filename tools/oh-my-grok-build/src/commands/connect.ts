@@ -6,7 +6,7 @@ import chalk from "chalk";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
 import { parseServerUrl } from "../acp/server.js";
-import { isAllowedWsUrl } from "../net.js";
+import { isAllowedWsUrl, createWsLookup } from "../net.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import { DEFAULT_MODEL, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
@@ -121,7 +121,7 @@ async function buildLoopPrompt(cwd: string, original: string, iteration: number,
 }
 
 export async function connectCommand(options: ConnectOptions): Promise<void> {
-  const allowed = isAllowedWsUrl(options.url, true);
+  const allowed = await isAllowedWsUrl(options.url, true);
   if (!allowed.ok) {
     throw new Error(`Cannot connect: ${allowed.reason}`);
   }
@@ -131,9 +131,12 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
     throw new Error("URL must include a server-key query parameter, e.g. ws://host:port/ws?server-key=XYZ");
   }
 
-  const transport = await createNodeWebSocketTransport(parsed.baseUrl, {
-    Authorization: `Bearer ${parsed.secret}`,
-  });
+  const lookup = await createWsLookup(options.url, true);
+  const transport = await createNodeWebSocketTransport(
+    parsed.baseUrl,
+    { Authorization: `Bearer ${parsed.secret}` },
+    lookup
+  );
 
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;

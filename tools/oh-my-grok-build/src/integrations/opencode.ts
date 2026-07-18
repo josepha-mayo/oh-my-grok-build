@@ -1,7 +1,7 @@
 import path from "node:path";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
-import { isAllowedWsUrl } from "../net.js";
+import { isAllowedWsUrl, createWsLookup } from "../net.js";
 import { makePermissionResponse, selectPermissionOption } from "../permissions.js";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
 
@@ -11,7 +11,7 @@ export class OpenCodeConnector implements Connector {
 
   async run(prompt: string): Promise<ConnectorResult> {
     const rawUrl = this.config.url ?? "ws://127.0.0.1:7331/acp";
-    const allowed = isAllowedWsUrl(rawUrl);
+    const allowed = await isAllowedWsUrl(rawUrl);
     if (!allowed.ok) throw new Error(allowed.reason);
     const urlObj = new URL(rawUrl);
     const secret = this.config.secret ?? urlObj.searchParams.get("server-key") ?? undefined;
@@ -19,7 +19,8 @@ export class OpenCodeConnector implements Connector {
     const url = urlObj.toString();
     const headers: Record<string, string> = {};
     if (secret) headers.Authorization = `Bearer ${secret}`;
-    const transport = await createNodeWebSocketTransport(url, headers);
+    const lookup = await createWsLookup(rawUrl);
+    const transport = await createNodeWebSocketTransport(url, headers, lookup);
 
     const chunks: string[] = [];
     let turnResolver: (() => void) | undefined;

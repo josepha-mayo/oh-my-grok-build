@@ -1,4 +1,5 @@
 import type { AcpTransport } from "./client.js";
+import type { LookupFn } from "../net.js";
 
 export interface WebSocketLike {
   send(data: string): void;
@@ -89,10 +90,11 @@ function getGlobalWebSocket(): WebSocketConstructor {
  */
 export async function createNodeWebSocketTransport(
   url: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  lookup?: LookupFn
 ): Promise<AcpTransport> {
   const { default: WebSocket } = await import("ws");
   return createWebSocketTransport(url, {
-    createWs: (u) => new WebSocket(u, { headers }) as unknown as WebSocketLike,
+    createWs: (u) => new WebSocket(u, { headers, lookup }) as unknown as WebSocketLike,
   });
 }
