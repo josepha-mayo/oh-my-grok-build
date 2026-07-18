@@ -219,33 +219,37 @@ function socketCommand(cmd: "ping" | "stop"): Promise<{ ok?: boolean; pid?: numb
   const socketPath = controlSocketPath();
   return new Promise((resolve) => {
     const socket = createConnection(socketPath);
+    const finish = (value: { ok?: boolean; pid?: number } | undefined) => {
+      clearTimeout(timer);
+      try {
+        socket.end();
+        socket.destroy();
+      } catch {
+        // ignore
+      }
+      resolve(value);
+    };
+
     const timer = setTimeout(() => {
-      socket.destroy();
-      resolve(undefined);
+      finish(undefined);
     }, SOCKET_TIMEOUT_MS);
 
     socket.on("connect", () => {
       socket.write(JSON.stringify({ cmd }) + "\n");
     });
-    socket.on("error", () => {
-      clearTimeout(timer);
-      resolve(undefined);
-    });
+    socket.on("error", () => finish(undefined));
+    socket.on("close", () => finish(undefined));
 
     const rl = createInterface({ input: socket, terminal: false });
     rl.on("line", (line) => {
-      clearTimeout(timer);
       rl.close();
       try {
-        resolve(JSON.parse(line) as { ok?: boolean; pid?: number });
+        finish(JSON.parse(line) as { ok?: boolean; pid?: number });
       } catch {
-        resolve(undefined);
+        finish(undefined);
       }
     });
-    rl.on("error", () => {
-      clearTimeout(timer);
-      resolve(undefined);
-    });
+    rl.on("error", () => finish(undefined));
   });
 }
 
