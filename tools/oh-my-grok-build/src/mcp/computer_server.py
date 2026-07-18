@@ -149,21 +149,37 @@ def call_tool(name: str, args: dict, pyautogui):
         key = str(args.get("key", ""))
         if not key:
             raise ValueError("key is required")
+        valid_keys = set(getattr(pyautogui, "KEYBOARD_KEYS", []))
+        if valid_keys and key not in valid_keys:
+            raise ValueError(f"unrecognized key: {key}")
         modifiers = args.get("modifiers", [])
         if not isinstance(modifiers, list):
             modifiers = [modifiers]
         modifiers = [str(m) for m in modifiers if m]
+        for m in modifiers:
+            if valid_keys and m not in valid_keys:
+                raise ValueError(f"unrecognized modifier: {m}")
+        pressed = list(modifiers)
+
+        def _release_all():
+            for k in reversed(pressed):
+                try:
+                    pyautogui.keyUp(k)
+                except Exception:
+                    pass
+
         try:
             for m in modifiers:
                 pyautogui.keyDown(m)
             pyautogui.keyDown(key)
+            pressed.append(key)
             pyautogui.keyUp(key)
+            pressed.remove(key)
             for m in reversed(modifiers):
                 pyautogui.keyUp(m)
+                pressed.remove(m)
         except Exception:
-            for m in modifiers:
-                pyautogui.keyUp(m)
-            pyautogui.keyUp(key)
+            _release_all()
             raise
         return f"Pressed: {'+'.join(modifiers + [key])}"
     if name == "computer_scroll":

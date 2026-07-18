@@ -1,6 +1,13 @@
 import chalk from "chalk";
 import { runPromptTask } from "../background/runner.js";
-import { loadJobs, startJob, stopJob } from "../background/scheduler.js";
+import {
+  loadJobs,
+  saveCronJob,
+  startJob,
+  startSchedulerDaemon,
+  stopJob,
+  validateName,
+} from "../background/scheduler.js";
 import { appendTimelineEvent } from "../timeline.js";
 
 export interface CronOptions {
@@ -9,6 +16,8 @@ export interface CronOptions {
   name?: string;
   model?: string;
   yolo?: boolean;
+  cwd?: string;
+  daemon?: boolean;
 }
 
 async function uniqueCronName(base = "cron"): Promise<string> {
@@ -22,6 +31,7 @@ async function uniqueCronName(base = "cron"): Promise<string> {
 
 export async function cronCommand(options: CronOptions): Promise<void> {
   const name = options.name ?? (await uniqueCronName());
+  validateName(name);
 
   appendTimelineEvent({
     type: "cron_start",
@@ -29,6 +39,20 @@ export async function cronCommand(options: CronOptions): Promise<void> {
     prompt: options.prompt,
     model: options.model,
   });
+
+  const meta = { prompt: options.prompt, model: options.model, yolo: options.yolo, cwd: options.cwd ?? process.cwd() };
+
+  if (options.daemon) {
+    await saveCronJob(name, options.expression, meta);
+    const started = await startSchedulerDaemon();
+    console.log(
+      chalk.bold(`Scheduled cron job:`),
+      chalk.cyan(name),
+      chalk.dim(options.expression),
+      started ? chalk.dim("(scheduler daemon started)") : ""
+    );
+    return;
+  }
 
   await startJob(
     name,
@@ -38,18 +62,21 @@ export async function cronCommand(options: CronOptions): Promise<void> {
         jobName: name,
         model: options.model,
         yolo: options.yolo,
+        cwd: options.cwd ?? process.cwd(),
       });
     },
-    { prompt: options.prompt, model: options.model, yolo: options.yolo }
+    meta
   );
 
   console.log(chalk.bold(`Cron started:`), chalk.cyan(name), chalk.dim(options.expression));
   console.log(chalk.dim(`Press Ctrl+C to stop.`));
 
-  process.on("SIGINT", () => {
+  const onShutdown = () => {
     appendTimelineEvent({ type: "cron_stop", expression: options.expression, name });
     void stopJob(name)
       .catch(() => undefined)
       .finally(() => process.exit(0));
-  });
+  };
+  process.on("SIGINT", onShutdown);
+  process.on("SIGTERM", onShutdown);
 }

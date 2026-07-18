@@ -65,4 +65,67 @@ describe("connect command", () => {
     assert.ok(received.includes("initialize"));
     assert.ok(received.includes("session/new"));
   });
+
+  it("waits for turn_completed before each /loop iteration", async () => {
+    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    const urlBase = await new Promise<string>((resolve) => {
+      wss.on("listening", () => {
+        const addr = wss.address();
+        resolve(`ws://127.0.0.1:${(addr as { port: number }).port}`);
+      });
+    });
+
+    const received: string[] = [];
+    let promptCount = 0;
+    wss.on("connection", (ws: WebSocket) => {
+      ws.on("message", (data) => {
+        const msg = JSON.parse(data.toString());
+        received.push(msg.method);
+
+        if (msg.method === "initialize") {
+          ws.send(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { authMethods: [{ id: "xai.api_key" }] } }));
+        } else if (msg.method === "authenticate") {
+          ws.send(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }));
+        } else if (msg.method === "session/new") {
+          ws.send(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s1" } }));
+        } else if (msg.method === "session/prompt") {
+          promptCount++;
+          ws.send(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }));
+          setTimeout(() => {
+            ws.send(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: {
+                  sessionId: "s1",
+                  update: { sessionUpdate: "turn_completed" },
+                },
+              })
+            );
+          }, 20);
+        }
+      });
+    });
+
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const exit = (code: number) => output.write(`exit:${code}\n`);
+
+    try {
+      setTimeout(() => input.write("/loop 2 hello\n"), 100);
+      setTimeout(() => input.write("/quit\n"), 500);
+      await connectCommand({
+        url: `${urlBase}/ws?server-key=test`,
+        input,
+        output,
+        exit,
+      });
+    } finally {
+      wss.clients.forEach((client) => client.close());
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+
+    assert.strictEqual(promptCount, 2);
+    assert.ok(received.filter((m) => m === "session/prompt").length >= 2);
+  });
 });

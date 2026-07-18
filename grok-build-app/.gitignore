@@ -1,0 +1,10 @@
+node_modules
+dist
+android
+ios
+*.keystore
+*.jks
+*.p8
+*.p12
+*.mobileprovision
+.vscode

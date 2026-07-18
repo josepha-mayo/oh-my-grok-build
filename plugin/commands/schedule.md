@@ -12,5 +12,7 @@ allowed-tools: run_terminal_cmd
    - To stop a job: run `omgb schedule stop <name>`.
    - To run a job now: run `omgb schedule run <name>`.
    - To delete a job: run `omgb schedule delete <name>`.
+   - To start the persistent scheduler daemon: run `omgb schedule start`.
+   - To stop the persistent scheduler daemon: run `omgb schedule stop-daemon`.
 2. Confirm the action with the user if unclear.
 3. Report the result.

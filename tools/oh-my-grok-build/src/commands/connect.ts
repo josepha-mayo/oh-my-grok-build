@@ -1,12 +1,24 @@
 import path from "node:path";
 import readline from "node:readline/promises";
 import type { Readable as ReadableStream, Writable as WritableStream } from "node:stream";
+import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
 import { parseServerUrl } from "../acp/server.js";
 import { isAllowedWsUrl } from "../net.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
+import { loadOmgConfig } from "../config.js";
+import spawner from "../spawner.js";
 import { swarmCommand } from "./swarm.js";
+import {
+  scheduleListCommand,
+  scheduleStopCommand,
+  scheduleRunCommand,
+  scheduleDeleteCommand,
+  scheduleStartCommand,
+  scheduleStopDaemonCommand,
+} from "./schedule.js";
 import { loadMcpConfig, toAcpMcpServers } from "../mcp/mcp-config.js";
 import type { AcpNewSessionResponse, AcpPermissionRequest, AcpPermissionResponse, AcpUpdate } from "../types.js";
 
@@ -31,6 +43,8 @@ const SLASH_COMMANDS = [
   "/plan",
   "/loop [count] <prompt>",
   "/swarm <prompt>",
+  "/schedule [list|start|stop-daemon|stop <name>|run <name>|delete <name>]",
+  "/btw <note>",
   "/new",
   "/clear",
   "/quit",
@@ -38,6 +52,73 @@ const SLASH_COMMANDS = [
 ];
 
 const EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "max"];
+const GIT_DIFF_MAX_BYTES = 100_000;
+const TURN_TIMEOUT_MS = 120_000;
+
+function formatUserError(err: unknown, label: string): string {
+  const message = err instanceof Error ? err.message : String(err);
+  if (isRateLimited(message)) {
+    return chalk.yellow(formatRateLimitMessage());
+  }
+  return chalk.red(`${label}: ${message}`);
+}
+
+function gitOutput(cwd: string, args: string[], maxBytes = GIT_DIFF_MAX_BYTES): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    let stderr = "";
+    let killed = false;
+    const proc = spawner.spawn("git", args, { cwd, env: process.env }) as ChildProcess;
+    proc.stdout?.setEncoding("utf8");
+    proc.stdout?.on("data", (chunk: string) => {
+      if (killed) return;
+      output += chunk;
+      if (Buffer.byteLength(output, "utf8") > maxBytes) {
+        killed = true;
+        proc.kill("SIGTERM");
+        output += "\n[truncated: output exceeded size limit]";
+      }
+    });
+    proc.stderr?.setEncoding("utf8");
+    proc.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    proc.on("error", (err) => reject(new Error(`git ${args.join(" ")} failed to start: ${err.message}`)));
+    proc.on("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`git ${args.join(" ")} exited with code ${code}: ${stderr.trim() || "(no stderr)"}`));
+        return;
+      }
+      resolve(output);
+    });
+  });
+}
+
+function gitStatusShort(cwd: string): Promise<string> {
+  return gitOutput(cwd, ["status", "--short"]);
+}
+
+function gitDiff(cwd: string): Promise<string> {
+  return gitOutput(cwd, ["diff"]);
+}
+
+async function buildLoopPrompt(cwd: string, original: string, iteration: number, total: number): Promise<string> {
+  if (iteration === 0) return original;
+  if (iteration === total - 1) return `Wrap up and finalize. Original task: ${original}`;
+  const status = await gitStatusShort(cwd);
+  const diff = await gitDiff(cwd);
+  return [
+    `Original task: ${original}`,
+    "",
+    "Working tree status:",
+    status.trim() || "(no changes)",
+    "",
+    "Diff:",
+    diff.trim() || "(no diff)",
+    "",
+    "Review the result above, fix any issues, and continue.",
+  ].join("\n");
+}
 
 export async function connectCommand(options: ConnectOptions): Promise<void> {
   const allowed = isAllowedWsUrl(options.url, true);
@@ -60,14 +141,27 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
 
   const rl = readline.createInterface({ input, output });
 
+  let turnResolver: (() => void) | undefined;
+  let turnRejecter: ((err: Error) => void) | undefined;
+
   const client = new AcpClient(transport, {
-    onUpdate: (_sessionId, update) => renderUpdate(update),
+    onUpdate: (_sessionId, update) => {
+      renderUpdate(update);
+      if (update.sessionUpdate === "turn_completed" || update.sessionUpdate === "stop") {
+        turnResolver?.();
+        turnResolver = undefined;
+        turnRejecter = undefined;
+      }
+    },
     onPermission: async (req) => handlePermission(req, rl),
     onAskUser: async ({ question }) => {
       console.log(chalk.yellow(`\n${question}`));
       return rl.question("Your answer: ");
     },
-    onError: (err) => console.error(chalk.red(`ACP error: ${err.message}`)),
+    onError: (err) => {
+      console.error(chalk.red(`ACP error: ${err.message}`));
+      turnRejecter?.(err);
+    },
     onClose: () => {
       console.log(chalk.dim("\nConnection closed."));
       rl.close();
@@ -83,7 +177,10 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
   }
 
   const cwd = path.resolve(options.cwd ?? process.cwd());
-  let currentModel = options.model ?? "grok-build";
+  const cfg = await loadOmgConfig();
+  const explicitModel = options.model ?? cfg.defaultModel;
+  let currentModel = explicitModel ?? "grok-build";
+  let hasExplicitModel = Boolean(explicitModel);
   let currentEffort: ReasoningEffort = "medium";
   let currentYolo = options.yolo ?? false;
   let currentAuto = false;
@@ -94,7 +191,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
       autoMode: currentAuto,
       reasoningEffort: currentEffort,
     };
-    if (currentModel) meta.modelId = currentModel;
+    if (hasExplicitModel) meta.modelId = currentModel;
     return meta;
   }
 
@@ -107,24 +204,48 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
 
   let session = await startSession();
 
+  try {
+    await applyMode(currentAuto ? "autonomous" : currentYolo ? "code" : "ask");
+  } catch (err) {
+    console.warn(formatUserError(err, "Could not set mode"));
+  }
+
+  if (hasExplicitModel) {
+    try {
+      await applyModel(currentModel);
+    } catch (err) {
+      console.warn(formatUserError(err, "Could not apply model/effort"));
+    }
+  }
+
   async function applyMode(desired: string): Promise<void> {
-    const applied = await client.setMode(session.sessionId, desired, 60_000).catch(() => false);
+    let applied = await client.setMode(session.sessionId, desired, 10_000).catch(() => false);
+    if (!applied && desired === "autonomous") {
+      applied = await client.setMode(session.sessionId, "code", 10_000).catch(() => false);
+      if (applied) {
+        console.log(chalk.dim("Autonomous mode not available; using code mode with auto-approval classifier."));
+        return;
+      }
+    }
     if (applied) {
       console.log(chalk.dim(`Mode set to ${desired}.`));
-      return;
+    } else if (desired !== "ask") {
+      console.log(chalk.dim(`${desired} mode is not available on this agent.`));
     }
-    session = await startSession();
-    console.log(chalk.dim(`Started new session in ${desired} mode.`));
   }
 
   async function applyEffort(): Promise<void> {
-    await client.setModelWithEffort(session.sessionId, currentModel, currentEffort, 60_000);
+    const ok = await client.setEffort(session.sessionId, currentEffort, 10_000).catch(() => false);
+    if (!ok) {
+      throw new Error("Reasoning effort is not configurable on this agent.");
+    }
     console.log(chalk.dim(`Reasoning effort set to ${currentEffort}.`));
   }
 
   async function applyModel(modelId: string): Promise<void> {
-    await client.setModelWithEffort(session.sessionId, modelId, currentEffort, 60_000);
+    await client.setModelWithEffort(session.sessionId, modelId, currentEffort, 10_000);
     currentModel = modelId;
+    hasExplicitModel = true;
     console.log(chalk.dim(`Model set to ${modelId}.`));
   }
 
@@ -162,7 +283,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
         try {
           await applyModel(modelId);
         } catch (err) {
-          console.error(chalk.red(`Failed to set model: ${err instanceof Error ? err.message : String(err)}`));
+          console.error(formatUserError(err, "Failed to set model"));
         }
       }
       continue;
@@ -177,7 +298,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
         try {
           await applyEffort();
         } catch (err) {
-          console.error(chalk.red(`Failed to set effort: ${err instanceof Error ? err.message : String(err)}`));
+          console.error(formatUserError(err, "Failed to set effort"));
         }
       }
       continue;
@@ -189,7 +310,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
       try {
         await applyMode(desired);
       } catch (err) {
-        console.error(chalk.red(`Failed to set mode: ${err instanceof Error ? err.message : String(err)}`));
+        console.error(formatUserError(err, "Failed to set mode"));
       }
       continue;
     }
@@ -200,7 +321,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
       try {
         await applyMode(desired);
       } catch (err) {
-        console.error(chalk.red(`Failed to set mode: ${err instanceof Error ? err.message : String(err)}`));
+        console.error(formatUserError(err, "Failed to set mode"));
       }
       continue;
     }
@@ -216,7 +337,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
           console.log(chalk.yellow("Plan mode is not available on this agent."));
         }
       } catch (err) {
-        console.error(chalk.red(`Failed to set plan mode: ${err instanceof Error ? err.message : String(err)}`));
+        console.error(formatUserError(err, "Failed to set plan mode"));
       }
       continue;
     }
@@ -225,10 +346,10 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
       const rest = trimmed.slice("/loop".length).trim();
       let count = 3;
       let promptText = rest;
-      const match = rest.match(/^(\d+)\s+(.*)$/s);
+      const match = rest.match(/^(\d+)(?:\s+(.*))?$/s);
       if (match) {
         count = Math.max(1, Math.min(20, parseInt(match[1], 10)));
-        promptText = match[2];
+        promptText = match[2]?.trim() ?? "";
       }
       if (!promptText) {
         console.log(chalk.yellow("Usage: /loop [count] <prompt>"));
@@ -236,16 +357,31 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
       }
       try {
         for (let i = 0; i < count; i++) {
-          const text =
-            i === 0
-              ? promptText
-              : i === count - 1
-                ? `Wrap up and finalize. Original task: ${promptText}`
-                : `Review the result above, fix any issues, and continue. Original task: ${promptText}`;
-          await client.prompt(session.sessionId, [{ type: "text", text }]);
+          const text = await buildLoopPrompt(cwd, promptText, i, count);
+          const turnDone = new Promise<void>((resolve, reject) => {
+            turnResolver = resolve;
+            turnRejecter = reject;
+          });
+          turnDone.catch(() => {});
+          const turnTimeout = setTimeout(() => {
+            turnRejecter?.(new Error("Timed out waiting for agent turn completion"));
+          }, TURN_TIMEOUT_MS);
+          try {
+            await client.prompt(session.sessionId, [{ type: "text", text }]);
+            await turnDone;
+          } finally {
+            clearTimeout(turnTimeout);
+            turnResolver = undefined;
+            turnRejecter = undefined;
+          }
         }
       } catch (err) {
-        console.error(chalk.red(`Loop failed: ${err instanceof Error ? err.message : String(err)}`));
+        const message = err instanceof Error ? err.message : String(err);
+        if (isRateLimited(message)) {
+          console.error(chalk.yellow(formatRateLimitMessage()));
+        } else {
+          console.error(chalk.red(`Loop failed: ${message}`));
+        }
       }
       continue;
     }
@@ -264,22 +400,76 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
             maxTurns: 10,
           });
         } catch (err) {
-          console.error(chalk.red(`Swarm failed: ${err instanceof Error ? err.message : String(err)}`));
+          console.error(formatUserError(err, "Swarm failed"));
         }
+      }
+      continue;
+    }
+
+    if (trimmed.startsWith("/schedule")) {
+      const rest = trimmed.slice("/schedule".length).trim();
+      const parts = rest.split(/\s+/);
+      const sub = parts[0]?.toLowerCase() ?? "";
+      const name = parts[1];
+      try {
+        switch (sub) {
+          case "":
+          case "list":
+            await scheduleListCommand();
+            break;
+          case "start":
+            await scheduleStartCommand();
+            break;
+          case "stop-daemon":
+            await scheduleStopDaemonCommand();
+            break;
+          case "stop":
+            if (!name) {
+              console.log(chalk.yellow("Usage: /schedule stop <name>"));
+              continue;
+            }
+            await scheduleStopCommand(name);
+            break;
+          case "run":
+            if (!name) {
+              console.log(chalk.yellow("Usage: /schedule run <name>"));
+              continue;
+            }
+            await scheduleRunCommand(name);
+            break;
+          case "delete":
+            if (!name) {
+              console.log(chalk.yellow("Usage: /schedule delete <name>"));
+              continue;
+            }
+            await scheduleDeleteCommand(name);
+            break;
+          default:
+            console.log(chalk.yellow("Usage: /schedule [list|start|stop-daemon|stop <name>|run <name>|delete <name>]"));
+        }
+      } catch (err) {
+        console.error(formatUserError(err, "Schedule command failed"));
       }
       continue;
     }
 
     if (trimmed.startsWith("/btw")) {
       const note = trimmed.slice("/btw".length).trim();
-      console.log(chalk.yellow(note ? `Side note: ${note}` : "Side note: What's on your mind?"));
+      const prompt = note
+        ? `[Side note / aside] ${note}\n\nThis is an off-topic aside. Do not run commands or edit files. Just reply briefly and helpfully.`
+        : "[Side note / aside] What's on your mind? This is an off-topic chat; do not run commands or edit files, just reply briefly.";
+      try {
+        await client.prompt(session.sessionId, [{ type: "text", text: prompt }]);
+      } catch (err) {
+        console.error(formatUserError(err, "Side note failed"));
+      }
       continue;
     }
 
     try {
       await client.prompt(session.sessionId, [{ type: "text", text: line }]);
     } catch (err) {
-      console.error(chalk.red(`Prompt failed: ${err instanceof Error ? err.message : String(err)}`));
+      console.error(formatUserError(err, "Prompt failed"));
     }
   }
 }

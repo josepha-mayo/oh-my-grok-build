@@ -3,7 +3,16 @@ import assert from "node:assert";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startJob, stopJob, deleteJob, listJobs, runJobNow } from "./scheduler.js";
+import {
+  startJob,
+  stopJob,
+  deleteJob,
+  listJobs,
+  runJobNow,
+  isDaemonRunning,
+  startSchedulerDaemon,
+  stopSchedulerDaemon,
+} from "./scheduler.js";
 
 let tempDir: string;
 
@@ -55,5 +64,28 @@ describe("scheduler", () => {
   it("returns false for unknown jobs", async () => {
     const ok = await runJobNow("does-not-exist");
     assert.strictEqual(ok, false);
+  });
+});
+
+describe("daemon lifecycle", () => {
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "omgb-daemon-"));
+    process.env.OMGB_HOME = tempDir;
+  });
+
+  afterEach(async () => {
+    await stopSchedulerDaemon().catch(() => {});
+    delete process.env.OMGB_HOME;
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("starts, detects, and stops a daemon", async () => {
+    assert.strictEqual(await isDaemonRunning(), false);
+    const started = await startSchedulerDaemon();
+    assert.strictEqual(started, true, "daemon should start");
+    assert.strictEqual(await isDaemonRunning(), true, "daemon should be running after start");
+    const stopped = await stopSchedulerDaemon();
+    assert.strictEqual(stopped, true, "daemon should stop");
+    assert.strictEqual(await isDaemonRunning(), false, "daemon should not be running after stop");
   });
 });
