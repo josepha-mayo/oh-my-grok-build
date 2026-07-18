@@ -35,7 +35,8 @@ import {
   subagentLogsCommand,
 } from "./commands/subagent.js";
 import { harnessAddCommand, harnessListCommand, harnessRemoveCommand, harnessRunCommand } from "./commands/harness.js";
-import { devinLoopCommand, devinAutonomousCommand } from "./commands/devin.js";
+import { devinAutonomousCommand } from "./commands/devin.js";
+import { cronCommand } from "./commands/cron.js";
 import { swarmCommand } from "./commands/swarm.js";
 import { loadOmgDotEnvIntoProcess } from "./config.js";
 
@@ -163,40 +164,34 @@ program
   });
 
 program
-  .command("loop <expression> <prompt>")
+  .command("loop <prompt>")
+  .description("Iteratively run a prompt until the working tree is clean")
+  .option("-m, --model <model>", "Model to use")
+  .option("--yolo", "Auto-approve tool calls")
+  .option("--max-iterations <n>", "Maximum iterations", parseInt, 5)
+  .option("--cwd <cwd>", "Working directory")
+  .action(async (prompt, options) => {
+    await loopCommand({ prompt, ...options });
+  });
+
+program
+  .command("cron <expression> <prompt>")
   .description("Run a prompt on a cron schedule")
   .option("-m, --model <model>", "Model to use")
   .option("--yolo", "Auto-approve tool calls")
   .action(async (expression, prompt, options) => {
-    await loopCommand({ expression, prompt, ...options });
+    await cronCommand({ expression, prompt, ...options });
   });
 
-const devin = program.command("devin").description("Devin-style loop and autonomous modes");
-
-devin.addCommand(
-  new Command("loop")
-    .description("Iteratively run a prompt until the working tree is clean")
-    .argument("<prompt>")
-    .option("-m, --model <model>", "Model to use")
-    .option("--yolo", "Auto-approve tool calls")
-    .option("--max-iterations <n>", "Maximum iterations", parseInt, 5)
-    .option("--cwd <cwd>", "Working directory")
-    .action(async (prompt, options) => {
-      await devinLoopCommand({ prompt, ...options });
-    })
-);
-
-devin.addCommand(
-  new Command("autonomous")
-    .description("Run a prompt in fully autonomous (yolo) mode")
-    .argument("<prompt>")
-    .option("-m, --model <model>", "Model to use")
-    .option("--sandbox-profile <profile>", "Sandbox profile to set for the grok process")
-    .option("--cwd <cwd>", "Working directory")
-    .action(async (prompt, options) => {
-      await devinAutonomousCommand({ prompt, ...options });
-    })
-);
+program
+  .command("autonomous <prompt>")
+  .description("Run a prompt in fully autonomous (yolo) mode")
+  .option("-m, --model <model>", "Model to use")
+  .option("--sandbox-profile <profile>", "Sandbox profile to set for the grok process")
+  .option("--cwd <cwd>", "Working directory")
+  .action(async (prompt, options) => {
+    await devinAutonomousCommand({ prompt, ...options });
+  });
 
 const schedule = program.command("schedule").description("Manage scheduled background jobs");
 
