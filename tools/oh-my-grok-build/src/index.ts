@@ -222,6 +222,7 @@ program
 program
   .command("cron <expression> <prompt>")
   .description("Run a prompt on a cron schedule")
+  .option("-n, --name <name>", "Job name", "cron")
   .option("-m, --model <model>", "Model to use")
   .option("--yolo", "Auto-approve tool calls")
   .action(async (expression, prompt, options) => {

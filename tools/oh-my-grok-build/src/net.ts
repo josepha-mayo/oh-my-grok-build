@@ -9,7 +9,8 @@ export function isPrivateIp(ip: string): boolean {
   if (ip.startsWith("10.") || ip.startsWith("192.168.")) return true;
   if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip)) return true;
   if (ip.startsWith("169.254.")) return true;
-  if (ip.startsWith("fc") || ip.startsWith("fd") || ip.startsWith("fe80:")) return true;
+  if (ip.startsWith("fc") || ip.startsWith("fd")) return true;
+  if (/^fe[89ab][0-9a-f]:/i.test(ip)) return true;
   return false;
 }
 
@@ -23,7 +24,7 @@ export function isAllowedHttpUrl(raw: string): { ok: true } | { ok: false; reaso
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return { ok: false, reason: `Blocked non-HTTP(S) protocol: ${url.protocol}` };
   }
-  const host = url.hostname.toLowerCase();
+  const host = url.hostname.toLowerCase().replace(/^\[(.+)\]$/, "$1");
   if (PRIVATE_HOSTS.has(host) || CLOUD_METADATA_HOSTS.has(host)) {
     return { ok: false, reason: "Blocked local/private/metadata host" };
   }
@@ -49,7 +50,7 @@ export function isAllowedWsUrl(raw: string): { ok: true } | { ok: false; reason:
   if (url.protocol !== "ws:" && url.protocol !== "wss:") {
     return { ok: false, reason: `Blocked non-WS(S) protocol: ${url.protocol}` };
   }
-  const host = url.hostname.toLowerCase();
+  const host = url.hostname.toLowerCase().replace(/^\[(.+)\]$/, "$1");
   if (CLOUD_METADATA_HOSTS.has(host)) {
     return { ok: false, reason: "Blocked cloud metadata host" };
   }

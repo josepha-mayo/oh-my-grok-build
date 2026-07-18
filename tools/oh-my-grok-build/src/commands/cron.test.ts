@@ -26,4 +26,14 @@ describe("cron command", () => {
 
     await stopJob("cron");
   });
+
+  it("creates a named scheduled cron job", async () => {
+    await cronCommand({ expression: "0 0 1 1 *", prompt: "hello", name: "morning-check" });
+
+    const jobs = await listJobs();
+    assert.strictEqual(jobs.length, 1);
+    assert.strictEqual(jobs[0].name, "morning-check");
+
+    await stopJob("morning-check");
+  });
 });

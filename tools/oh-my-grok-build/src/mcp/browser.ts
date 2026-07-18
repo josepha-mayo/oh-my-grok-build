@@ -1,44 +1,7 @@
-import { hostname } from "node:os";
 import { startMcpServer, type McpContent, type McpTool } from "./runtime.js";
+import { isAllowedHttpUrl } from "../net.js";
 
-const PRIVATE_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0"]);
-const CLOUD_METADATA_HOSTS = new Set(["metadata.google.internal", "169.254.169.254"]);
-
-function isPrivateIp(ip: string): boolean {
-  if (ip.startsWith("::ffff:")) return isPrivateIp(ip.slice(7));
-  if (ip === "127.0.0.1" || ip === "::1") return true;
-  if (ip.startsWith("10.") || ip.startsWith("192.168.")) return true;
-  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip)) return true;
-  if (ip.startsWith("169.254.")) return true;
-  if (ip.startsWith("fc") || ip.startsWith("fd") || ip.startsWith("fe80:")) return true;
-  return false;
-}
-
-function isAllowedUrl(raw: string): { ok: true } | { ok: false; reason: string } {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    return { ok: false, reason: "Invalid URL" };
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    return { ok: false, reason: `Blocked non-HTTP(S) protocol: ${url.protocol}` };
-  }
-  const host = url.hostname.toLowerCase();
-  if (PRIVATE_HOSTS.has(host) || CLOUD_METADATA_HOSTS.has(host)) {
-    return { ok: false, reason: "Blocked local/private/metadata host" };
-  }
-  if (host === hostname().toLowerCase()) {
-    return { ok: false, reason: "Blocked local machine hostname" };
-  }
-  if (isPrivateIp(host)) {
-    return { ok: false, reason: "Blocked private IP address" };
-  }
-  if (url.username || url.password) {
-    return { ok: false, reason: "URLs with embedded credentials are not allowed" };
-  }
-  return { ok: true };
-}
+const isAllowedUrl = isAllowedHttpUrl;
 
 function sanitizeAccessibilityRef(ref: string): string {
   const id = ref.replace(/^@/, "");
@@ -59,6 +22,15 @@ async function ensurePage(): Promise<any> {
     browser = await chromium.launch({ headless: true });
     context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
     page = await context.newPage();
+    await page.route("**/*", async (route: any) => {
+      const url = route.request().url();
+      const allowed = isAllowedUrl(url);
+      if (!allowed.ok) {
+        await route.abort("blockedbyclient");
+      } else {
+        await route.continue();
+      }
+    });
     page.consoleLogs = [];
     page.on("console", (msg: any) => {
       page.consoleLogs.push(`${msg.type()}: ${msg.text()}`);
@@ -222,9 +194,9 @@ const browserEvaluate: McpTool = {
     const script = String(args.script ?? "").trim();
     if (!script) throw new Error("script is required");
     const p = await ensurePage();
-    const result = await p.evaluate((s: string) => {
+    const result = await p.evaluate(async (s: string) => {
       const fn = new Function(s);
-      return fn();
+      return await fn();
     }, script);
     return textResult(`Result: ${JSON.stringify(result)}`);
   },
@@ -327,7 +299,6 @@ const browserClose: McpTool = {
   },
 };
 
-process.on("exit", () => void closeBrowser());
 process.on("SIGINT", () => {
   void closeBrowser().then(() => process.exit(0));
 });

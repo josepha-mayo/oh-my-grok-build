@@ -6,12 +6,13 @@ import { appendTimelineEvent } from "../timeline.js";
 export interface CronOptions {
   expression: string;
   prompt: string;
+  name?: string;
   model?: string;
   yolo?: boolean;
 }
 
 export async function cronCommand(options: CronOptions): Promise<void> {
-  const name = "cron";
+  const name = options.name ?? "cron";
 
   appendTimelineEvent({
     type: "cron_start",
@@ -33,11 +34,11 @@ export async function cronCommand(options: CronOptions): Promise<void> {
     { prompt: options.prompt, model: options.model, yolo: options.yolo }
   );
 
-  console.log(chalk.bold(`Cron started:`), chalk.cyan(options.expression));
+  console.log(chalk.bold(`Cron started:`), chalk.cyan(name), chalk.dim(options.expression));
   console.log(chalk.dim(`Press Ctrl+C to stop.`));
 
   process.on("SIGINT", async () => {
-    appendTimelineEvent({ type: "cron_stop", expression: options.expression });
+    appendTimelineEvent({ type: "cron_stop", expression: options.expression, name });
     await stopJob(name);
     process.exit(0);
   });
