@@ -102,7 +102,8 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
   const cfg = await loadOmgConfig();
   const model = options.model ?? cfg.defaultModel ?? "grok-build";
-  const maxIterations = Number.isNaN(options.maxIterations) ? 5 : (options.maxIterations ?? 5);
+  const rawMax = Number.isNaN(options.maxIterations) ? 5 : (options.maxIterations ?? 5);
+  const maxIterations = Math.max(1, Math.min(50, rawMax));
 
   appendTimelineEvent({ type: "loop_start", model, maxIterations, prompt: options.prompt, cwd });
 
@@ -123,7 +124,7 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
     const { code: exitCode, stderr } = await runGrokOnce(currentPrompt, { cwd, model, yolo: options.yolo });
     lastExit = exitCode;
 
-    if (lastExit !== 0 && lastExit !== null) {
+    if (lastExit !== 0) {
       appendTimelineEvent({ type: "loop_error", model, iterations: iteration, exitCode: lastExit });
       if (isRateLimited(stderr)) {
         throw new Error(formatRateLimitMessage());

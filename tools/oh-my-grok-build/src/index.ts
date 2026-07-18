@@ -20,6 +20,10 @@ import {
   scheduleStopCommand,
   scheduleRunCommand,
   scheduleDeleteCommand,
+  scheduleStartCommand,
+  scheduleStopDaemonCommand,
+  scheduleStatusCommand,
+  scheduleDaemonCommand,
 } from "./commands/schedule.js";
 import {
   toolsListCommand,
@@ -221,12 +225,22 @@ program
 
 program
   .command("cron <expression> <prompt>")
-  .description("Run a prompt on a cron schedule")
+  .description("Schedule a prompt to run on a cron expression")
   .option("-n, --name <name>", "Job name", "cron")
   .option("-m, --model <model>", "Model to use")
   .option("--yolo", "Auto-approve tool calls")
+  .option("--cwd <cwd>", "Working directory for the prompt")
+  .option("--foreground", "Run the scheduler in the foreground instead of the background daemon")
   .action(async (expression, prompt, options) => {
-    await cronCommand({ expression, prompt, ...options });
+    await cronCommand({
+      expression,
+      prompt,
+      name: options.name,
+      model: options.model,
+      yolo: options.yolo,
+      cwd: options.cwd,
+      daemon: !options.foreground,
+    });
   });
 
 program
@@ -276,6 +290,36 @@ schedule.addCommand(
     .action(async (name) => {
       await scheduleDeleteCommand(name);
     })
+);
+
+schedule.addCommand(
+  new Command("start").description("Start the persistent scheduler daemon").action(async () => {
+    await scheduleStartCommand();
+  })
+);
+
+schedule.addCommand(
+  new Command("stop-daemon")
+    .alias("stopd")
+    .description("Stop the persistent scheduler daemon")
+    .action(async () => {
+      await scheduleStopDaemonCommand();
+    })
+);
+
+schedule.addCommand(
+  new Command("status")
+    .alias("st")
+    .description("Show scheduler daemon and job status")
+    .action(async () => {
+      await scheduleStatusCommand();
+    })
+);
+
+schedule.addCommand(
+  new Command("daemon").description("Run the scheduler daemon (internal)").action(async () => {
+    await scheduleDaemonCommand();
+  })
 );
 
 const subagent = program.command("subagent").description("Spawn and manage Grok subagents");

@@ -1,14 +1,51 @@
+import { lookup } from "node:dns/promises";
+import { pathToFileURL } from "node:url";
 import { startMcpServer, type McpContent, type McpTool } from "./runtime.js";
-import { isAllowedHttpUrl } from "../net.js";
+import { isAllowedHttpUrl, isPrivateIp } from "../net.js";
 
-const isAllowedUrl = isAllowedHttpUrl;
-
-function sanitizeAccessibilityRef(ref: string): string {
+export function sanitizeAccessibilityRef(ref: string): string {
   const id = ref.replace(/^@/, "");
   if (!/^[A-Za-z0-9_-]+$/.test(id)) {
     throw new Error("Accessibility ref must be alphanumeric after '@'");
   }
   return `[data-accessibility-ref="${id}"]`;
+}
+
+type LookupFn = typeof lookup;
+
+/**
+ * Check a URL for SSRF safety. In addition to the static hostname checks in
+ * isAllowedHttpUrl, we resolve the hostname and block any URL whose resolved IP
+ * is private, link-local, or cloud metadata. This mitigates DNS-rebinding and
+ * xip.io-style SSRF bypasses.
+ */
+export async function isUrlAllowed(
+  raw: string,
+  lookupFn?: LookupFn
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const sync = isAllowedHttpUrl(raw);
+  if (!sync.ok) return sync;
+  try {
+    const url = new URL(raw);
+    const lookupImpl = lookupFn ?? lookup;
+    const addresses = await lookupImpl(url.hostname, { all: true });
+    if (!addresses.length) {
+      return { ok: false, reason: `No DNS records for ${url.hostname}` };
+    }
+    for (const { address } of addresses) {
+      if (isPrivateIp(address)) {
+        return { ok: false, reason: `Blocked private IP address resolved from ${url.hostname}` };
+      }
+    }
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    // Allow unresolvable hostnames to fail later in the browser. Anything else
+    // (network / permission errors) is treated as a block to be safe.
+    if (code !== "ENOTFOUND") {
+      return { ok: false, reason: `DNS lookup failed: ${code ?? String(err)}` };
+    }
+  }
+  return { ok: true };
 }
 
 let browser: any;
@@ -30,7 +67,11 @@ async function attachRoute(p: any): Promise<void> {
   attachConsole(p);
   await p.route("**/*", async (route: any) => {
     const url = route.request().url();
-    const allowed = isAllowedUrl(url);
+    if (url.startsWith("data:") || url.startsWith("blob:")) {
+      await route.continue();
+      return;
+    }
+    const allowed = await isUrlAllowed(url);
     if (!allowed.ok) {
       await route.abort("blockedbyclient");
     } else {
@@ -94,10 +135,12 @@ const browserNavigate: McpTool = {
   async handler(args) {
     const url = String(args.url ?? "").trim();
     if (!url) throw new Error("url is required");
-    const allowed = isAllowedUrl(url);
-    if (!allowed.ok) throw new Error(allowed.reason);
     const p = await ensurePage();
-    await p.goto(url, { waitUntil: "networkidle" });
+    try {
+      await p.goto(url, { waitUntil: "networkidle" });
+    } catch (err) {
+      return textResult(`Could not navigate to ${url}: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return textResult(`Navigated to ${url}.\n\n${await snapshot()}`);
   },
 };
@@ -192,28 +235,6 @@ const browserConsole: McpTool = {
     const logs = p.consoleLogs ?? [];
     p.consoleLogs = [];
     return textResult(logs.length ? logs.join("\n") : "No console logs captured.");
-  },
-};
-
-const browserEvaluate: McpTool = {
-  name: "browser_evaluate",
-  description: "Evaluate a JavaScript expression in the page context and return the result.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      script: { type: "string", description: "JavaScript expression or function body to evaluate." },
-    },
-    required: ["script"],
-  },
-  async handler(args) {
-    const script = String(args.script ?? "").trim();
-    if (!script) throw new Error("script is required");
-    const p = await ensurePage();
-    const result = await p.evaluate(async (s: string) => {
-      const fn = new Function(s);
-      return await fn();
-    }, script);
-    return textResult(`Result: ${JSON.stringify(result)}`);
   },
 };
 
@@ -314,34 +335,35 @@ const browserClose: McpTool = {
   },
 };
 
-process.on("SIGINT", () => {
-  void closeBrowser().then(
-    () => process.exit(0),
-    () => process.exit(1)
-  );
-});
-process.on("SIGTERM", () => {
-  void closeBrowser().then(
-    () => process.exit(0),
-    () => process.exit(1)
-  );
-});
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  process.on("SIGINT", () => {
+    void closeBrowser().then(
+      () => process.exit(0),
+      () => process.exit(1)
+    );
+  });
+  process.on("SIGTERM", () => {
+    void closeBrowser().then(
+      () => process.exit(0),
+      () => process.exit(1)
+    );
+  });
 
-startMcpServer({
-  name: "omgb-browser",
-  tools: [
-    browserNavigate,
-    browserSnapshot,
-    browserClick,
-    browserType,
-    browserPress,
-    browserScreenshot,
-    browserConsole,
-    browserEvaluate,
-    browserSetViewport,
-    browserScroll,
-    browserGetUrl,
-    browserSelect,
-    browserClose,
-  ],
-});
+  startMcpServer({
+    name: "omgb-browser",
+    tools: [
+      browserNavigate,
+      browserSnapshot,
+      browserClick,
+      browserType,
+      browserPress,
+      browserScreenshot,
+      browserConsole,
+      browserSetViewport,
+      browserScroll,
+      browserGetUrl,
+      browserSelect,
+      browserClose,
+    ],
+  });
+}

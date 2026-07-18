@@ -7,6 +7,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import spawner from "../spawner.js";
 import { isPrivateIp } from "../net.js";
 import { loadMcpConfig, toAcpMcpServers } from "../mcp/mcp-config.js";
+import { entryScriptPath } from "../background/scheduler.js";
 
 export interface ServeOptions {
   bind?: string;
@@ -22,6 +23,8 @@ const MAX_CONNECTIONS_PER_IP = 10;
 const CONNECTION_WINDOW_MS = 60_000;
 const MAX_MESSAGES_PER_CONNECTION = 100;
 const MESSAGE_WINDOW_MS = 10_000;
+const RUN_CMD_TIMEOUT_MS = 120_000;
+const ALLOWED_OMGB_COMMANDS = new Set(["schedule", "cron", "loop", "timeline"]);
 
 export function makeSecret(): string {
   return randomBytes(32).toString("hex").toUpperCase();
@@ -150,9 +153,10 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
       return;
     }
 
-    const args = ["agent", "stdio"];
+    const args = ["agent"];
     if (options.model) args.push("--model", options.model);
     if (options.yolo) args.push("--yolo");
+    args.push("--no-leader", "stdio");
 
     const proc = spawner.spawn("grok", args, {
       cwd,
@@ -205,9 +209,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
         ws.close(1009, "message too large");
         return;
       }
-      if (!proc.stdin?.writable) return;
-      const payload = await injectMcpServers(buf.toString());
-      proc.stdin.write(payload + "\n");
+      await handleClientMessage(ws, buf.toString(), cwd, proc);
     });
 
     ws.on("close", () => {
@@ -337,6 +339,89 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
 
 export function stopAgentServer(server: ServerInfo): Promise<void> {
   return server.close?.() ?? Promise.resolve();
+}
+
+interface RunCmdResult {
+  output: string;
+  exitCode: number;
+}
+
+async function runOmgbCommand(args: unknown, cwd: string): Promise<RunCmdResult> {
+  if (!Array.isArray(args) || args.some((a) => typeof a !== "string")) {
+    return { output: "Invalid command arguments", exitCode: -1 };
+  }
+  const argv = args as string[];
+  if (!argv.length || !ALLOWED_OMGB_COMMANDS.has(argv[0])) {
+    return { output: `Command not allowed: ${argv[0] ?? "(empty)"}`, exitCode: -1 };
+  }
+
+  const script = entryScriptPath();
+  return new Promise((resolve) => {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let finished = false;
+
+    const proc = spawner.spawn(process.execPath, [script, ...argv], {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
+    });
+
+    const timer = setTimeout(() => {
+      if (!finished) {
+        finished = true;
+        proc.kill("SIGTERM");
+        resolve({
+          output: Buffer.concat([...stdoutChunks, ...stderrChunks]).toString("utf8") + "\n[command timed out]",
+          exitCode: -1,
+        });
+      }
+    }, RUN_CMD_TIMEOUT_MS);
+
+    proc.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+    proc.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+
+    proc.on("error", (err) => {
+      if (!finished) {
+        finished = true;
+        clearTimeout(timer);
+        resolve({ output: err.message, exitCode: -1 });
+      }
+    });
+
+    proc.on("exit", (code) => {
+      if (!finished) {
+        finished = true;
+        clearTimeout(timer);
+        resolve({
+          output: Buffer.concat([...stdoutChunks, ...stderrChunks]).toString("utf8"),
+          exitCode: code ?? -1,
+        });
+      }
+    });
+  });
+}
+
+async function handleClientMessage(ws: any, raw: string, cwd: string, proc: ChildProcess): Promise<void> {
+  let msg: Record<string, unknown>;
+  try {
+    msg = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  if (msg.method === "x.ai/run_terminal_cmd") {
+    const id = msg.id;
+    const params = (msg.params ?? {}) as Record<string, unknown>;
+    const result = await runOmgbCommand(params.args, cwd);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    }
+    return;
+  }
+  const payload = await injectMcpServers(raw);
+  if (proc.stdin?.writable) {
+    proc.stdin.write(payload + "\n");
+  }
 }
 
 async function injectMcpServers(raw: string): Promise<string> {

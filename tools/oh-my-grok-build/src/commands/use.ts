@@ -1,6 +1,6 @@
 import path from "node:path";
 import chalk from "chalk";
-import { AcpClient } from "../acp/client.js";
+import { AcpClient, type AcpTransport } from "../acp/client.js";
 import { createStdioTransport } from "../acp/stdio.js";
 import { loadOmgConfig } from "../config.js";
 import { builtInMcpServer, toAcpMcpServers } from "../mcp/mcp-config.js";
@@ -17,6 +17,8 @@ export interface UseOptions {
   cwd?: string;
   maxTurns?: number;
   timeoutMs?: number;
+  /** Injected transport for testing. Defaults to a grok stdio transport. */
+  transport?: AcpTransport;
 }
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000;
@@ -50,12 +52,14 @@ export async function useCommand(options: UseOptions): Promise<string> {
     throw new Error(`No built-in MCP server available for ${options.mode} mode.`);
   }
 
-  const args = ["agent", "stdio"];
+  const args: string[] = [];
+  args.push("agent");
   args.push("--model", model);
-  if (options.yolo) args.push("--yolo");
   if (typeof options.maxTurns === "number" && !Number.isNaN(options.maxTurns) && options.maxTurns > 0) {
     args.push("--max-turns", String(options.maxTurns));
   }
+  if (options.yolo) args.push("--yolo");
+  args.push("--no-leader", "stdio");
 
   const childEnv: Record<string, string> = { GROK_DISABLE_AUTOUPDATER: "1" };
   if (options.mode === "computer") {
@@ -69,12 +73,14 @@ export async function useCommand(options: UseOptions): Promise<string> {
     cwd,
   });
 
-  const transport = createStdioTransport({
-    command: "grok",
-    args,
-    cwd,
-    env: childEnv,
-  });
+  const transport =
+    options.transport ??
+    createStdioTransport({
+      command: "grok",
+      args,
+      cwd,
+      env: childEnv,
+    });
 
   try {
     const chunks: string[] = [];
@@ -84,6 +90,7 @@ export async function useCommand(options: UseOptions): Promise<string> {
       turnResolver = resolve;
       turnRejecter = reject;
     });
+    turnDone.catch(() => {});
 
     const timeout = setTimeout(() => {
       turnRejecter?.(new Error(`${options.mode} use timed out after ${timeoutMs / 1000}s`));
@@ -123,7 +130,14 @@ export async function useCommand(options: UseOptions): Promise<string> {
         await client.authenticate(authMethod, 60_000);
       }
       const { sessionId } = await client.newSession(cwd, mcpServers, {}, 60_000);
-      await client.setMode(sessionId, options.yolo ? "code" : "ask", 60_000).catch(() => false);
+      const modeSet = await client.setMode(sessionId, options.yolo ? "code" : "ask", 60_000).catch(() => false);
+      if (!modeSet) {
+        process.stderr.write(
+          chalk.yellow(
+            `Warning: could not switch to ${options.yolo ? "code" : "ask"} mode; the agent may not invoke tools unless it supports them by default.\n`
+          )
+        );
+      }
       await client.prompt(sessionId, [{ type: "text", text: options.prompt }], timeoutMs);
       await turnDone;
       const result = chunks.join("");

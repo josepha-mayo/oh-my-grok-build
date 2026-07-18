@@ -67,7 +67,7 @@ describe("serve command", () => {
 
       assert.ok(captured);
       assert.strictEqual(captured!.cmd, "grok");
-      assert.deepStrictEqual(captured!.args.slice(0, 2), ["agent", "stdio"]);
+      assert.deepStrictEqual(captured!.args, ["agent", "--no-leader", "stdio"]);
     } finally {
       client.close();
       await stopAgentServer(server);
