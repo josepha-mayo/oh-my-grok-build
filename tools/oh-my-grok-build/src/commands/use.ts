@@ -38,7 +38,7 @@ function handlePermission(req: AcpPermissionRequest, yolo: boolean): AcpPermissi
 
 export async function useCommand(options: UseOptions): Promise<string> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-build";
+  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const timeoutMs = Number.isNaN(options.timeoutMs) ? DEFAULT_TIMEOUT : (options.timeoutMs ?? DEFAULT_TIMEOUT);
 

@@ -45,7 +45,7 @@ function appendLog(file: string, stream: "stdout" | "stderr", data: Buffer): voi
 
 export async function runPromptTask(prompt: string, options: RunPromptOptions = {}): Promise<void> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-build";
+  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
 
   const args = ["-p", prompt, "--model", model];
   if (options.yolo) args.push("--yolo");

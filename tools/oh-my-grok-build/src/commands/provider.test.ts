@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
-import { Readable } from "node:stream";
+
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
@@ -15,10 +15,24 @@ import { addProvider, getProvider, setDefaultProvider } from "../providers/manag
 import { setupOmgHome, cleanupOmgHome } from "../test-utils.js";
 
 let tempDir: string;
-let originalStdin: typeof process.stdin;
 
-function setProcessStdin(value: typeof process.stdin) {
-  Object.defineProperty(process, "stdin", { value, configurable: true });
+function startMockServer(
+  handler: (
+    req: { url?: string },
+    res: { writeHead: (code: number, headers?: Record<string, string>) => void; end: (data?: string) => void }
+  ) => void
+): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  return new Promise((resolve, reject) => {
+    const server = createServer((req, res) => handler(req, res));
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      resolve({
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        close: () => new Promise<void>((r) => server.close(() => r())),
+      });
+    });
+    server.on("error", reject);
+  });
 }
 
 describe("provider command", () => {
@@ -27,7 +41,6 @@ describe("provider command", () => {
   });
 
   afterEach(() => {
-    if (originalStdin) setProcessStdin(originalStdin);
     cleanupOmgHome(tempDir);
   });
 
@@ -46,15 +59,26 @@ describe("provider command", () => {
     assert.ok(lines.some((l) => l.includes("omgb-x")));
   });
 
-  it("adds a provider non-interactively", async () => {
-    originalStdin = process.stdin;
-    setProcessStdin(Readable.from(["sk-test\n"]) as any);
-
-    await providerAddCommand(false, "openai");
+  it("adds a provider non-interactively from a preset", async () => {
+    await providerAddCommand({ interactive: false, presetId: "openai" });
 
     const p = await getProvider("openai");
     assert.ok(p);
     assert.strictEqual(p!.model, "gpt-4o");
+  });
+
+  it("adds a custom provider non-interactively", async () => {
+    await providerAddCommand({
+      interactive: false,
+      id: "my-local",
+      baseUrl: "http://localhost:1234/v1",
+      model: "mymodel",
+    });
+
+    const p = await getProvider("my-local");
+    assert.ok(p);
+    assert.strictEqual(p!.model, "mymodel");
+    assert.strictEqual(p!.baseUrl, "http://localhost:1234/v1");
   });
 
   it("removes a provider", async () => {
@@ -83,7 +107,7 @@ describe("provider command", () => {
   });
 
   it("tests a provider against a mock server", async () => {
-    const server = createServer((req, res) => {
+    const server = await startMockServer((req, res) => {
       if (req.url === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ data: [{ id: "m" }] }));
@@ -93,11 +117,8 @@ describe("provider command", () => {
       }
     });
 
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-    const { port } = server.address() as AddressInfo;
-
     try {
-      await addProvider({ id: "mock", name: "Mock", model: "m", baseUrl: `http://127.0.0.1:${port}/v1` });
+      await addProvider({ id: "mock", name: "Mock", model: "m", baseUrl: server.baseUrl });
 
       const lines: string[] = [];
       const original = console.log;
@@ -110,7 +131,7 @@ describe("provider command", () => {
 
       assert.ok(lines.some((l) => l.includes("reachable")));
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await server.close();
     }
   });
 });

@@ -121,7 +121,7 @@ export async function spawnSubagent(
 
   const logFd = openSync(logPath, "a");
 
-  const args = ["-p", prompt, "--model", options.model ?? "grok-build"];
+  const args = ["-p", prompt, "--model", options.model ?? "grok-4.5"];
   if (options.yolo) args.push("--yolo");
   if (options.maxTurns) args.push("--max-turns", String(options.maxTurns));
 
@@ -213,7 +213,7 @@ export async function subagentTrace(name: string, rawTailLines = 50): Promise<st
 
   const parts: string[] = [];
   parts.push(`Subagent: ${record.name}`);
-  parts.push(`Model: ${record.model ?? "grok-build"}`);
+  parts.push(`Model: ${record.model ?? "grok-4.5"}`);
   parts.push(`Spawned: ${record.spawnedAt}`);
   parts.push(`Worktree: ${record.worktree}`);
   parts.push(`Prompt: ${record.prompt}`);

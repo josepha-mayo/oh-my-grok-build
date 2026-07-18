@@ -32,7 +32,7 @@ export async function devinAutonomousCommand(options: DevinAutonomousOptions): P
   }
 
   const ocfg = await loadOmgConfig();
-  const model = options.model ?? ocfg.defaultModel ?? "grok-build";
+  const model = options.model ?? ocfg.defaultModel ?? "grok-4.5";
   const args = ["-p", options.prompt, "--yolo", "--model", model];
 
   const env: NodeJS.ProcessEnv = { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" };

@@ -14,17 +14,34 @@ export async function probeLmStudio(baseUrl: string = LMSTUDIO_DEFAULT): Promise
 }
 
 async function listModelsAt(baseUrl: string): Promise<string[]> {
+  return (await fetchModelList(baseUrl)) ?? [];
+}
+
+export async function fetchModelList(
+  baseUrl: string,
+  apiKey?: string,
+  apiBackend: string = "chat_completions",
+  extraHeaders: Record<string, string> = {}
+): Promise<string[] | undefined> {
   const url = `${baseUrl.replace(/\/+$/, "")}/models`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  const headers: Record<string, string> = { ...extraHeaders };
+  if (apiKey) {
+    if (apiBackend === "messages") {
+      headers["x-api-key"] = apiKey;
+    } else {
+      headers["Authorization"] = `Bearer ${apiKey}`;
+    }
+  }
   try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return [];
+    const res = await fetch(url, { headers, signal: controller.signal });
+    if (!res.ok) return undefined;
     const json = (await res.json()) as { data?: { id: string }[] };
-    if (!Array.isArray(json?.data)) return [];
+    if (!Array.isArray(json?.data)) return undefined;
     return json.data.map((m) => m.id);
   } catch {
-    return [];
+    return undefined;
   } finally {
     clearTimeout(timeout);
   }

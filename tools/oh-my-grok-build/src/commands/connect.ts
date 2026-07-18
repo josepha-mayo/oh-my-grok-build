@@ -188,7 +188,7 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const cfg = await loadOmgConfig();
   const explicitModel = options.model ?? cfg.defaultModel;
-  let currentModel = explicitModel ?? "grok-build";
+  let currentModel = explicitModel ?? "grok-4.5";
   let hasExplicitModel = Boolean(explicitModel);
   let currentEffort: ReasoningEffort = "medium";
   let currentYolo = options.yolo ?? false;

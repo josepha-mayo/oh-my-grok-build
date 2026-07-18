@@ -21,7 +21,7 @@ export async function serveCommand(options: ServeOptions & { qr?: boolean }): Pr
 
   console.log(chalk.green("\nGrok agent server is running."));
   console.log(`  URL:    ${chalk.cyan(server.url)}`);
-  console.log(`  Model:  ${chalk.cyan(model ?? "grok-build (default)")}`);
+  console.log(`  Model:  ${chalk.cyan(model ?? "grok-4.5 (default)")}`);
   console.log(`  CWD:    ${chalk.cyan(server.cwd)}`);
 
   if (options.qr !== false) {

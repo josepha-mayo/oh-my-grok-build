@@ -136,7 +136,7 @@ function runGrok(prompt: string, options: { model: string; yolo?: boolean }): Pr
 
 export async function researchCommand(options: ResearchOptions): Promise<void> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-build";
+  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
   const count = Number.isNaN(options.count) ? 5 : Math.max(1, Math.min(20, options.count ?? 5));
   const topic = options.topic;
 

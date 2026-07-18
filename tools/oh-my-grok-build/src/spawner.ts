@@ -1,5 +1,11 @@
 import { spawn as cpSpawn, spawnSync as cpSpawnSync } from "node:child_process";
 
+// Default to disabled telemetry unless the user explicitly opted in.
+process.env.GROK_TELEMETRY_ENABLED ??= "false";
+process.env.GROK_TELEMETRY_TRACE_UPLOAD ??= "false";
+process.env.GROK_TELEMETRY_MIXPANEL_ENABLED ??= "false";
+process.env.GROK_EXTERNAL_OTEL ??= "false";
+
 type SpawnArgs = Parameters<typeof cpSpawn>;
 type SpawnSyncArgs = Parameters<typeof cpSpawnSync>;
 

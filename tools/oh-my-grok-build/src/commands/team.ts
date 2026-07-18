@@ -16,7 +16,7 @@ export interface TeamOptions {
 
 export async function teamCommand(options: TeamOptions): Promise<void> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-build";
+  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
 
   let count = Number.isNaN(options.count) ? 1 : options.count;
   count = Math.max(1, Math.min(20, count));
