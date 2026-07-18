@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
 import { getOmgDir, loadOmgConfig } from "../config.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import spawner from "../spawner.js";
 import { appendTimelineEvent } from "../timeline.js";
 
@@ -72,17 +73,28 @@ function gitDiff(cwd: string): Promise<string> {
   return gitOutput(cwd, ["diff"], DIFF_MAX_BYTES);
 }
 
-function runGrokOnce(prompt: string, options: { cwd: string; model: string; yolo?: boolean }): Promise<number | null> {
+interface GrokRunResult {
+  code: number | null;
+  stderr: string;
+}
+
+function runGrokOnce(prompt: string, options: { cwd: string; model: string; yolo?: boolean }): Promise<GrokRunResult> {
   const args = ["-p", prompt, "--model", options.model];
   if (options.yolo) args.push("--yolo");
   return new Promise((resolve, reject) => {
+    let stderr = "";
     const proc = spawner.spawn("grok", args, {
       cwd: options.cwd,
-      stdio: "inherit",
+      stdio: ["inherit", "inherit", "pipe"],
       env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     });
+    proc.stderr?.setEncoding("utf8");
+    proc.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+      process.stderr.write(chunk);
+    });
     proc.on("error", reject);
-    proc.on("exit", (code) => resolve(code));
+    proc.on("exit", (code) => resolve({ code, stderr }));
   });
 }
 
@@ -108,7 +120,16 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
     iteration++;
     console.log(chalk.dim(`\n--- Iteration ${iteration} ---`));
 
-    lastExit = await runGrokOnce(currentPrompt, { cwd, model, yolo: options.yolo });
+    const { code: exitCode, stderr } = await runGrokOnce(currentPrompt, { cwd, model, yolo: options.yolo });
+    lastExit = exitCode;
+
+    if (lastExit !== 0 && lastExit !== null) {
+      appendTimelineEvent({ type: "loop_error", model, iterations: iteration, exitCode: lastExit });
+      if (isRateLimited(stderr)) {
+        throw new Error(formatRateLimitMessage());
+      }
+      throw new Error(`grok exited with code ${lastExit}`);
+    }
 
     const diff = await gitDiff(cwd);
     const status = await gitStatusShort(cwd);
@@ -128,11 +149,6 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
     }
 
     currentPrompt = `Review the following diff and fix any issues:\n\n${diff || status}`;
-  }
-
-  if (lastExit !== 0) {
-    appendTimelineEvent({ type: "loop_error", model, iterations: iteration, exitCode: lastExit });
-    throw new Error(`grok exited with code ${lastExit}`);
   }
 
   const finalDirty = (await gitStatusShort(cwd)).trim().length > 0;

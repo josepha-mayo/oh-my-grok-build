@@ -2,6 +2,7 @@ import path from "node:path";
 import { AcpClient } from "../acp/client.js";
 import { createStdioTransport } from "../acp/stdio.js";
 import { sanitizeUserEnv } from "../env.js";
+import { makePermissionResponse, selectPermissionOption } from "../permissions.js";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
 
 const INTERACTIVE_AUTH_IDS = new Set(["omp-setup", "oauth", "browser", "grok.com"]);
@@ -54,10 +55,7 @@ export class OmpConnector implements Connector {
           turnResolver?.();
         }
       },
-      onPermission: async (req) => {
-        const option = req.options.find((o) => o.kind === "allow_once") ?? req.options[0];
-        return { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } };
-      },
+      onPermission: async (req) => makePermissionResponse(selectPermissionOption(req.options)),
       onError: (err) => {
         turnRejecter?.(err);
       },

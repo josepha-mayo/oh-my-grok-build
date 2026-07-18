@@ -37,9 +37,10 @@ export async function cronCommand(options: CronOptions): Promise<void> {
   console.log(chalk.bold(`Cron started:`), chalk.cyan(name), chalk.dim(options.expression));
   console.log(chalk.dim(`Press Ctrl+C to stop.`));
 
-  process.on("SIGINT", async () => {
+  process.on("SIGINT", () => {
     appendTimelineEvent({ type: "cron_stop", expression: options.expression, name });
-    await stopJob(name);
-    process.exit(0);
+    void stopJob(name)
+      .catch(() => undefined)
+      .finally(() => process.exit(0));
   });
 }

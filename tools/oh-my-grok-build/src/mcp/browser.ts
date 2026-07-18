@@ -300,10 +300,16 @@ const browserClose: McpTool = {
 };
 
 process.on("SIGINT", () => {
-  void closeBrowser().then(() => process.exit(0));
+  void closeBrowser().then(
+    () => process.exit(0),
+    () => process.exit(1)
+  );
 });
 process.on("SIGTERM", () => {
-  void closeBrowser().then(() => process.exit(0));
+  void closeBrowser().then(
+    () => process.exit(0),
+    () => process.exit(1)
+  );
 });
 
 startMcpServer({
