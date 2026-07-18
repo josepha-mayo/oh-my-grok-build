@@ -59,6 +59,11 @@ def handle(msg: dict, pyautogui):
             {"name": "computer_key", "description": "Press a key or hotkey combination.", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, "modifiers": {"type": "array", "items": {"type": "string"}}}, "required": ["key"]}},
             {"name": "computer_scroll", "description": "Scroll the mouse wheel.", "inputSchema": {"type": "object", "properties": {"clicks": {"type": "number"}, "x": {"type": "number"}, "y": {"type": "number"}}, "required": ["clicks"]}},
             {"name": "computer_move", "description": "Move the mouse to coordinates.", "inputSchema": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}},
+            {"name": "computer_double_click", "description": "Double-click at screen coordinates.", "inputSchema": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "button": {"type": "string"}}, "required": ["x", "y"]}},
+            {"name": "computer_drag", "description": "Drag the mouse from one point to another.", "inputSchema": {"type": "object", "properties": {"x1": {"type": "number"}, "y1": {"type": "number"}, "x2": {"type": "number"}, "y2": {"type": "number"}, "button": {"type": "string"}}, "required": ["x1", "y1", "x2", "y2"]}},
+            {"name": "computer_get_mouse_position", "description": "Return the current mouse cursor coordinates.", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "computer_screenshot_region", "description": "Take a screenshot of a region of the screen.", "inputSchema": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "width": {"type": "number"}, "height": {"type": "number"}}, "required": ["x", "y", "width", "height"]}},
+            {"name": "computer_wait", "description": "Pause for the given number of seconds.", "inputSchema": {"type": "object", "properties": {"seconds": {"type": "number"}}, "required": ["seconds"]}},
         ]
         send({"jsonrpc": "2.0", "id": id_, "result": {"tools": tools}})
         return
@@ -124,6 +129,38 @@ def call_tool(name: str, args: dict, pyautogui):
         y = int(args.get("y", 0))
         pyautogui.moveTo(x, y)
         return f"Moved to ({x}, {y})."
+    if name == "computer_double_click":
+        x = int(args.get("x", 0))
+        y = int(args.get("y", 0))
+        button = args.get("button", "left")
+        pyautogui.doubleClick(x, y, button=button)
+        return f"Double-clicked ({x}, {y}) with {button} button."
+    if name == "computer_drag":
+        x1 = int(args.get("x1", 0))
+        y1 = int(args.get("y1", 0))
+        x2 = int(args.get("x2", 0))
+        y2 = int(args.get("y2", 0))
+        button = args.get("button", "left")
+        pyautogui.moveTo(x1, y1)
+        pyautogui.dragTo(x2, y2, button=button)
+        return f"Dragged from ({x1}, {y1}) to ({x2}, {y2}) with {button} button."
+    if name == "computer_get_mouse_position":
+        x, y = pyautogui.position()
+        return f"Mouse position: ({x}, {y})."
+    if name == "computer_screenshot_region":
+        x = int(args.get("x", 0))
+        y = int(args.get("y", 0))
+        width = int(args.get("width", 0))
+        height = int(args.get("height", 0))
+        img = pyautogui.screenshot(region=(x, y, width, height))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        data = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return {"type": "image", "data": data, "mimeType": "image/png"}
+    if name == "computer_wait":
+        seconds = float(args.get("seconds", 0))
+        pyautogui.sleep(seconds)
+        return f"Waited {seconds}s."
     raise RuntimeError(f"Unknown tool: {name}")
 
 def main():
