@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import { runPromptTask } from "../background/runner.js";
 import { startJob, stopJob } from "../background/scheduler.js";
+import { appendTimelineEvent } from "../timeline.js";
 
 export interface CronOptions {
   expression: string;
@@ -11,6 +12,8 @@ export interface CronOptions {
 
 export async function cronCommand(options: CronOptions): Promise<void> {
   const name = "cron";
+
+  appendTimelineEvent({ type: "cron_start", expression: options.expression, prompt: options.prompt, model: options.model });
 
   await startJob(
     name,
@@ -29,6 +32,7 @@ export async function cronCommand(options: CronOptions): Promise<void> {
   console.log(chalk.dim(`Press Ctrl+C to stop.`));
 
   process.on("SIGINT", async () => {
+    appendTimelineEvent({ type: "cron_stop", expression: options.expression });
     await stopJob(name);
     process.exit(0);
   });

@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import { loadGrokConfig, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
+import { appendTimelineEvent } from "../timeline.js";
 
 export interface DevinAutonomousOptions {
   prompt: string;
@@ -11,6 +12,8 @@ export interface DevinAutonomousOptions {
 
 export async function devinAutonomousCommand(options: DevinAutonomousOptions): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
+  appendTimelineEvent({ type: "autonomous_start", model: options.model, prompt: options.prompt, cwd, sandboxProfile: options.sandboxProfile });
+
   const cfg = await loadGrokConfig();
   const configProfile = (cfg.sandbox as Record<string, unknown> | undefined)?.profile as string | undefined;
 
@@ -41,6 +44,7 @@ export async function devinAutonomousCommand(options: DevinAutonomousOptions): P
     });
     proc.on("error", reject);
     proc.on("exit", (code) => {
+      appendTimelineEvent({ type: code === 0 ? "autonomous_stop" : "autonomous_error", exitCode: code });
       if (code === 0) resolve();
       else reject(new Error(`grok exited with code ${code}`));
     });

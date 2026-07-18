@@ -3,6 +3,7 @@ import chalk from "chalk";
 import { loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
 import { listSubagents, spawnSubagent, subagentOutput, killSubagent } from "../subagents/engine.js";
+import { appendTimelineEvent } from "../timeline.js";
 
 export interface SwarmOptions {
   prompt: string;
@@ -138,6 +139,8 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
 
   // Use a unique run prefix so repeated swarms do not collide with old worktrees.
   const runId = Date.now();
+  appendTimelineEvent({ type: "swarm_start", model, workers, prompt: options.prompt, runId });
+
   const names: string[] = [];
   for (let i = 0; i < workers; i++) {
     names.push(`swarm-${runId}-${i}`);
@@ -165,10 +168,19 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
   await waitForSubagents(names, timeoutMs);
 
   console.log(chalk.bold("\nAggregated results:\n"));
+  const outputs: { name: string; output: string }[] = [];
   for (const name of names) {
     const output = await subagentOutput(name, 50);
     console.log(chalk.cyan(`--- ${name} ---`));
     console.log(output.trim() || chalk.dim("(no output)"));
     console.log("");
+    outputs.push({ name, output });
   }
+
+  appendTimelineEvent({
+    type: "swarm_stop",
+    runId,
+    workers: names.length,
+    outputs: outputs.map((o) => ({ name: o.name, preview: o.output.slice(0, 200) })),
+  });
 }

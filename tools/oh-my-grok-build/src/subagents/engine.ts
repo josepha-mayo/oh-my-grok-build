@@ -1,7 +1,8 @@
-import { openSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { openSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { ensureOmgDir, getOmgDir } from "../config.js";
 import spawner from "../spawner.js";
+import { appendTimelineEvent } from "../timeline.js";
 
 export interface SubagentRecord {
   name: string;
@@ -32,6 +33,10 @@ function registryPath(): string {
 
 function subagentsDir(): string {
   return join(getOmgDir(), "subagents");
+}
+
+function tracePath(worktree: string): string {
+  return join(worktree, "trace.jsonl");
 }
 
 export async function loadRegistry(): Promise<SubagentRecord[]> {
@@ -92,6 +97,7 @@ export async function spawnSubagent(
   const safeName = sanitizeSubagentName(name);
   const worktree = join(subagentsDir(), safeName);
   const logPath = join(worktree, "subagent.log");
+  const traceFile = tracePath(worktree);
   const repoRoot = options.cwd ?? process.cwd();
 
   setupWorktree(worktree, repoRoot);
@@ -99,6 +105,11 @@ export async function spawnSubagent(
   const records = await loadRegistry();
   const existing = records.findIndex((r) => r.name === safeName);
   if (existing >= 0) records.splice(existing, 1);
+
+  appendFileSync(
+    traceFile,
+    JSON.stringify({ ts: new Date().toISOString(), event: "spawn", name: safeName, prompt, model: options.model, yolo: options.yolo, maxTurns: options.maxTurns }) + "\n"
+  );
 
   const logFd = openSync(logPath, "a");
 
@@ -129,6 +140,8 @@ export async function spawnSubagent(
 
   records.push(record);
   await saveRegistry(records);
+
+  appendTimelineEvent({ type: "subagent_spawn", name: safeName, model: options.model, prompt, pid: proc.pid ?? 0 });
 
   return { ...record, running: true };
 }
@@ -162,6 +175,8 @@ export async function killSubagent(name: string): Promise<void> {
     throw new Error(`Failed to kill subagent "${safeName}": ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  appendTimelineEvent({ type: "subagent_kill", name: safeName, pid: record.pid });
+
   records.splice(idx, 1);
   await saveRegistry(records);
 }
@@ -178,4 +193,55 @@ export async function subagentOutput(name: string, tailLines = 50): Promise<stri
   } catch {
     return "";
   }
+}
+
+export async function subagentTrace(name: string, tailLines = 50): Promise<string> {
+  const safeName = sanitizeSubagentName(name);
+  const records = await loadRegistry();
+  const record = records.find((r) => r.name === safeName);
+  if (!record) throw new Error(`Subagent "${safeName}" not found`);
+
+  const parts: string[] = [];
+  parts.push(`Subagent: ${record.name}`);
+  parts.push(`Model: ${record.model ?? "grok-build"}`);
+  parts.push(`Spawned: ${record.spawnedAt}`);
+  parts.push(`Worktree: ${record.worktree}`);
+  parts.push(`Prompt: ${record.prompt}`);
+  parts.push("");
+
+  try {
+    const traceRaw = readFileSync(tracePath(record.worktree), "utf8").trim();
+    if (traceRaw) {
+      const traceLines = traceRaw.split("\n").filter(Boolean);
+      parts.push("--- trace ---");
+      for (const line of traceLines.slice(-tailLines)) {
+        try {
+          const entry = JSON.parse(line) as { ts?: string; event?: string; prompt?: string };
+          const ts = entry.ts ? new Date(entry.ts).toLocaleTimeString() : "";
+          if (entry.event === "spawn" && entry.prompt) {
+            parts.push(`${ts} [spawn] prompt: ${entry.prompt.slice(0, 200)}`);
+          } else if (entry.event && entry.event !== "spawn") {
+            parts.push(`${ts} [${entry.event}]`);
+          }
+        } catch {
+          parts.push(line);
+        }
+      }
+      parts.push("");
+    }
+  } catch {
+    // trace file may not exist yet
+  }
+
+  try {
+    const output = readFileSync(record.logPath, "utf8").trim();
+    if (output) {
+      parts.push("--- output ---");
+      parts.push(output.split("\n").slice(-tailLines).join("\n"));
+    }
+  } catch {
+    // no output yet
+  }
+
+  return parts.join("\n");
 }
