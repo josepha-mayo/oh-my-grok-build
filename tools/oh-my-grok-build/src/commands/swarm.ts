@@ -18,7 +18,7 @@ export interface SwarmOptions {
 const DEFAULT_TIMEOUT = 10 * 60 * 1000;
 
 function clampWorkers(n: number | undefined): number {
-  const value = n ?? 4;
+  const value = Number.isNaN(n) ? 4 : (n ?? 4);
   return Math.max(1, Math.min(20, value));
 }
 
@@ -132,7 +132,7 @@ async function waitForSubagents(names: string[], timeoutMs: number): Promise<voi
 
 export async function swarmCommand(options: SwarmOptions): Promise<void> {
   const workers = clampWorkers(options.workers);
-  const timeoutMs = options.timeout ?? DEFAULT_TIMEOUT;
+  const timeoutMs = Number.isNaN(options.timeout) ? DEFAULT_TIMEOUT : (options.timeout ?? DEFAULT_TIMEOUT);
   const cfg = await loadOmgConfig();
   const model = options.model ?? cfg.defaultModel ?? "grok-build";
   const spawnOptions = { model, yolo: options.yolo, maxTurns: options.maxTurns, cwd: options.cwd };

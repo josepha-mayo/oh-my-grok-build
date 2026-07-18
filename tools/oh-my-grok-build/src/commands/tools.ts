@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import { loadOmgConfig, saveOmgConfig } from "../config.js";
+import { sanitizeUserEnv } from "../env.js";
 import { loadMcpConfig, mergeMcpConfigs, toAcpMcpServers } from "../mcp/mcp-config.js";
 import type { McpServerConfig } from "../types.js";
 
@@ -56,11 +57,16 @@ export async function toolsAddCommand(
   args: string[],
   options: { env?: string[] }
 ): Promise<void> {
-  const env: Record<string, string> = {};
+  const rawEnv: Record<string, string> = {};
   for (const e of options.env ?? []) {
     const idx = e.indexOf("=");
     if (idx === -1) throw new Error(`Invalid env var: ${e} (expected NAME=VALUE)`);
-    env[e.slice(0, idx)] = e.slice(idx + 1);
+    rawEnv[e.slice(0, idx)] = e.slice(idx + 1);
+  }
+  const env = sanitizeUserEnv(rawEnv);
+  const dropped = Object.keys(rawEnv).filter((k) => !(k in env));
+  if (dropped.length) {
+    console.warn(chalk.yellow(`Ignored non-API-key env variables for safety: ${dropped.join(", ")}`));
   }
   const cfg = await loadOmgConfig();
   const servers = mergeMcpConfigs(cfg.mcpServers);

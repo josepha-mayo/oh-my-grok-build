@@ -40,6 +40,7 @@ import { devinAutonomousCommand } from "./commands/devin.js";
 import { cronCommand } from "./commands/cron.js";
 import { timelineCommand } from "./commands/timeline.js";
 import { researchCommand } from "./commands/research.js";
+import { browserCommand, computerCommand } from "./commands/use.js";
 import { swarmCommand } from "./commands/swarm.js";
 import { loadOmgDotEnvIntoProcess } from "./config.js";
 
@@ -174,6 +175,28 @@ program
   .option("--yolo", "Auto-approve tool calls")
   .action(async (topic, options) => {
     await researchCommand({ topic, ...options });
+  });
+
+program
+  .command("use <prompt>")
+  .description("Run a computer-use prompt (desktop + browser via MCP)")
+  .option("-m, --model <model>", "Model to use")
+  .option("--yolo", "Auto-approve tool calls")
+  .option("--max-turns <n>", "Maximum agent turns", parseInt)
+  .option("--cwd <cwd>", "Working directory")
+  .action(async (prompt, options) => {
+    await computerCommand({ prompt, ...options });
+  });
+
+program
+  .command("browser <prompt>")
+  .description("Run a browser-use prompt (browser automation via MCP)")
+  .option("-m, --model <model>", "Model to use")
+  .option("--yolo", "Auto-approve tool calls")
+  .option("--max-turns <n>", "Maximum agent turns", parseInt)
+  .option("--cwd <cwd>", "Working directory")
+  .action(async (prompt, options) => {
+    await browserCommand({ prompt, ...options });
   });
 
 program

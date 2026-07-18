@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import type { AcpTransport } from "./client.js";
+import { sanitizeUserEnv } from "../env.js";
 import spawner from "../spawner.js";
 
 export interface StdioTransportOptions {
@@ -17,7 +18,7 @@ export interface StdioTransportOptions {
 export function createStdioTransport(options: StdioTransportOptions): AcpTransport {
   const proc = spawner.spawn(options.command, options.args ?? [], {
     cwd: options.cwd ?? process.cwd(),
-    env: { ...process.env, ...options.env },
+    env: { ...process.env, ...sanitizeUserEnv(options.env) },
     stdio: ["pipe", "pipe", "pipe"],
   });
 

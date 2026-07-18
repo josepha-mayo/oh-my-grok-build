@@ -13,8 +13,8 @@ This repo is a fork of the open-source `xai-org/grok-build` SpaceXAI harness. We
 | Path | Purpose |
 |------|---------|
 | `crates/` | Upstream Grok Build Rust source (do not edit unless upstreaming) |
-| `tools/oh-my-grok-build/` | `omgb` TypeScript harness: ACP relay, providers, team, sessions, exec, background scheduler, subagents |
-| `plugin/` | Grok Build plugin: skills, hooks, agents, slash commands |
+| `tools/oh-my-grok-build/` | `omgb` TypeScript harness: ACP relay, providers, team, sessions, exec, background scheduler, subagents, timeline, research, computer/browser use |
+| `plugin/` | Grok Build plugin: skills, hooks, agents, slash commands (incl. /use, /browser, /schedule, /btw) |
 | `github.com/josepha-mayo/grok-build-app` | Capacitor React mobile app (now its own repo) |
 | `AGENTS.md` | This file |
 
@@ -28,6 +28,8 @@ This repo is a fork of the open-source `xai-org/grok-build` SpaceXAI harness. We
 - Run `npm run format:check` and `npm run format` (fix) before committing.
 - Use Grok's extension points: plugins, skills, hooks, agents, MCP, ACP.
 - Provider API keys are stored in `~/.omgb/.env`, never committed, and referenced by `env_key` in `~/.grok/config.toml`.
+- Connector and MCP `env` maps are filtered to `*_API_KEY` keys only; dangerous keys such as `PATH` or `LD_PRELOAD` cannot be injected.
+- WebSocket and browser URLs are validated against private/metadata hosts.
 
 ## Build & test
 

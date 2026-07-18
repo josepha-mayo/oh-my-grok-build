@@ -1,5 +1,6 @@
 import type { ProviderConfig } from "../types.js";
 import { loadOmgDotEnv } from "../config.js";
+import { formatProviderError } from "./errors.js";
 
 const OLLAMA_DEFAULT = "http://localhost:11434/v1";
 const LMSTUDIO_DEFAULT = "http://localhost:1234/v1";
@@ -121,7 +122,7 @@ async function testTinyChatCompletion(
     });
     if (res.ok) return { ok: true };
     const text = await res.text();
-    return { ok: false, error: `${res.status}: ${text.slice(0, 200)}` };
+    return { ok: false, error: formatProviderError(res.status, text) };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
@@ -149,7 +150,7 @@ async function testTinyResponses(
     });
     if (res.ok) return { ok: true };
     const text = await res.text();
-    return { ok: false, error: `${res.status}: ${text.slice(0, 200)}` };
+    return { ok: false, error: formatProviderError(res.status, text) };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
@@ -177,7 +178,7 @@ async function testTinyMessages(
     });
     if (res.ok) return { ok: true };
     const text = await res.text();
-    return { ok: false, error: `${res.status}: ${text.slice(0, 200)}` };
+    return { ok: false, error: formatProviderError(res.status, text) };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {

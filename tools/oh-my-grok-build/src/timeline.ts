@@ -54,7 +54,7 @@ export function readTimelineEvents(options?: { count?: number; type?: string }):
       .filter((e): e is TimelineEvent => e !== undefined);
 
     const filtered = options?.type ? lines.filter((e) => e.type === options.type) : lines;
-    const count = options?.count ?? 50;
+    const count = Number.isNaN(options?.count) ? 50 : (options?.count ?? 50);
     return filtered.slice(-count);
   } catch {
     return [];

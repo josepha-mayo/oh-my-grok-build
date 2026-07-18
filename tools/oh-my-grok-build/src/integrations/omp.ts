@@ -1,6 +1,7 @@
 import path from "node:path";
 import { AcpClient } from "../acp/client.js";
 import { createStdioTransport } from "../acp/stdio.js";
+import { sanitizeUserEnv } from "../env.js";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
 
 const INTERACTIVE_AUTH_IDS = new Set(["omp-setup", "oauth", "browser", "grok.com"]);
@@ -17,8 +18,11 @@ export class OmpConnector implements Connector {
     const command = this.config.command ?? "omp";
     const args = ["acp"];
     const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries({ ...process.env, ...this.config.env })) {
+    for (const [k, v] of Object.entries(process.env)) {
       if (v !== undefined) env[k] = v;
+    }
+    for (const [k, v] of Object.entries(sanitizeUserEnv(this.config.env))) {
+      env[k] = v;
     }
 
     const transport = createStdioTransport({

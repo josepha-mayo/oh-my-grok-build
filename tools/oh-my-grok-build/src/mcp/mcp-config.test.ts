@@ -33,9 +33,23 @@ describe("mcp-config", () => {
     assert.deepEqual(acp[0].args, ["memory.js"]);
   });
 
-  it("includes env vars when present", () => {
-    const servers = [{ name: "x", enabled: true, command: "node", args: ["x.js"], env: { FOO: "bar" } }];
+  it("includes API-key env vars when present", () => {
+    const servers = [{ name: "x", enabled: true, command: "node", args: ["x.js"], env: { FOO_API_KEY: "bar" } }];
     const acp = toAcpMcpServers(servers);
-    assert.deepEqual(acp[0].env, [{ name: "FOO", value: "bar" }]);
+    assert.deepEqual(acp[0].env, [{ name: "FOO_API_KEY", value: "bar" }]);
+  });
+
+  it("filters out dangerous env vars", () => {
+    const servers = [
+      {
+        name: "x",
+        enabled: true,
+        command: "node",
+        args: ["x.js"],
+        env: { LD_PRELOAD: "/tmp/evil.so", PATH: "/tmp", FOO_API_KEY: "ok" },
+      },
+    ];
+    const acp = toAcpMcpServers(servers);
+    assert.deepEqual(acp[0].env, [{ name: "FOO_API_KEY", value: "ok" }]);
   });
 });

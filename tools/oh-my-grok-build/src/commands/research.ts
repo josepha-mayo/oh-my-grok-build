@@ -23,7 +23,11 @@ interface ArxivEntry {
 }
 
 function sanitizeFilename(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 80);
+  const safe = name
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return safe || "research";
 }
 
 function xmlText(tag: string, block: string): string {
@@ -36,15 +40,21 @@ function xmlText(tag: string, block: string): string {
     : "";
 }
 
-function xmlAttr(tag: string, attr: string, block: string): string {
-  const re = new RegExp(`<${tag}[^>]*?\\s${attr}="([^"]+)"[^>]*>`);
+function linkHrefByRel(block: string, rel: string): string {
+  const re = new RegExp(
+    `<link[^>]*?\\srel="${rel}"[^>]*?\\shref="([^"]+)"[^>]*>|<link[^>]*?\\shref="([^"]+)"[^>]*?\\srel="${rel}"[^>]*>`
+  );
   const m = block.match(re);
-  return m ? m[1] : "";
+  return m ? (m[1] ?? m[2] ?? "") : "";
 }
 
-async function searchArxiv(topic: string, count: number): Promise<ArxivEntry[]> {
-  const url = `http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(topic)}&start=0&max_results=${count}&sortBy=relevance&sortOrder=descending`;
+async function searchArxiv(topic: string, rawCount: number): Promise<ArxivEntry[]> {
+  const count = Number.isNaN(rawCount) ? 5 : Math.max(1, Math.min(20, rawCount));
+  const url = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(topic)}&start=0&max_results=${count}&sortBy=relevance&sortOrder=descending`;
   const res = await fetch(url, { headers: { Accept: "application/atom+xml" } });
+  if (res.status === 429) {
+    throw new Error("arXiv rate limit reached. Please wait a moment and try again.");
+  }
   if (!res.ok) throw new Error(`arXiv API error: ${res.status} ${res.statusText}`);
   const text = await res.text();
 
@@ -52,12 +62,12 @@ async function searchArxiv(topic: string, count: number): Promise<ArxivEntry[]> 
   const blocks = text.split("<entry").slice(1);
   for (const block of blocks) {
     const raw = "<entry" + block.split("</entry>")[0] + "</entry>";
-    const id = xmlText("id", raw).replace(/^http:\/\/arxiv.org\/abs\//, "");
+    const id = xmlText("id", raw).replace(/^https?:\/\/arxiv.org\/abs\//, "");
     const title = xmlText("title", raw);
     const summary = xmlText("summary", raw);
     const authors = [...raw.matchAll(/<name>([\s\S]*?)<\/name>/g)].map((m) => m[1].trim());
-    const htmlUrl = xmlAttr("link", "href", raw) || `https://arxiv.org/abs/${id}`;
-    const pdfUrl = htmlUrl.replace("/abs/", "/pdf/");
+    const htmlUrl = linkHrefByRel(raw, "alternate") || `https://arxiv.org/abs/${id}`;
+    const pdfUrl = linkHrefByRel(raw, "related") || htmlUrl.replace("/abs/", "/pdf/");
     if (id && title) {
       entries.push({ id, title, summary, authors, pdfUrl, htmlUrl });
     }
@@ -116,7 +126,7 @@ function runGrok(prompt: string, options: { model: string; yolo?: boolean }): Pr
 export async function researchCommand(options: ResearchOptions): Promise<void> {
   const cfg = await loadOmgConfig();
   const model = options.model ?? cfg.defaultModel ?? "grok-build";
-  const count = Math.max(1, Math.min(20, options.count ?? 5));
+  const count = Number.isNaN(options.count) ? 5 : Math.max(1, Math.min(20, options.count ?? 5));
   const topic = options.topic;
 
   appendTimelineEvent({ type: "research_start", topic, model, count });
