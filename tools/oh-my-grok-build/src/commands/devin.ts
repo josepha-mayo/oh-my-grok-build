@@ -1,5 +1,5 @@
 import chalk from "chalk";
-import { loadGrokConfig, loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, loadGrokConfig, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
 import { appendTimelineEvent } from "../timeline.js";
 
@@ -32,7 +32,7 @@ export async function devinAutonomousCommand(options: DevinAutonomousOptions): P
   }
 
   const ocfg = await loadOmgConfig();
-  const model = options.model ?? ocfg.defaultModel ?? "grok-4.5";
+  const model = options.model ?? ocfg.defaultModel ?? DEFAULT_MODEL;
   const args = ["-p", options.prompt, "--yolo", "--model", model];
 
   const env: NodeJS.ProcessEnv = { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" };

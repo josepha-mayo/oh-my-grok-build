@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import chalk from "chalk";
-import { loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import { listSubagents, spawnSubagent, subagentOutput, killSubagent } from "../subagents/engine.js";
@@ -138,7 +138,7 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
   const workers = clampWorkers(options.workers);
   const timeoutMs = Number.isNaN(options.timeout) ? DEFAULT_TIMEOUT : (options.timeout ?? DEFAULT_TIMEOUT);
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
+  const model = options.model ?? cfg.defaultModel ?? DEFAULT_MODEL;
   const spawnOptions = { model, yolo: options.yolo, maxTurns: options.maxTurns, cwd: options.cwd };
 
   // Use a unique run prefix so repeated swarms do not collide with old worktrees.

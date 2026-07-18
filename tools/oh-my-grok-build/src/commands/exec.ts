@@ -1,4 +1,4 @@
-import { loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import { appendTimelineEvent } from "../timeline.js";
@@ -13,7 +13,7 @@ export interface ExecOptions {
 
 export async function execCommand(options: ExecOptions): Promise<void> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
+  const model = options.model ?? cfg.defaultModel ?? DEFAULT_MODEL;
 
   appendTimelineEvent({ type: "exec_start", model, prompt: options.prompt, cwd: options.cwd ?? process.cwd() });
 

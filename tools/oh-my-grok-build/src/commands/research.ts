@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
-import { getOmgDir, loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, getOmgDir, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import { appendTimelineEvent } from "../timeline.js";
@@ -136,7 +136,7 @@ function runGrok(prompt: string, options: { model: string; yolo?: boolean }): Pr
 
 export async function researchCommand(options: ResearchOptions): Promise<void> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
+  const model = options.model ?? cfg.defaultModel ?? DEFAULT_MODEL;
   const count = Number.isNaN(options.count) ? 5 : Math.max(1, Math.min(20, options.count ?? 5));
   const topic = options.topic;
 

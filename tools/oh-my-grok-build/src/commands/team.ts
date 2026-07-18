@@ -2,7 +2,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import chalk from "chalk";
-import { loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import { appendTimelineEvent } from "../timeline.js";
@@ -16,7 +16,7 @@ export interface TeamOptions {
 
 export async function teamCommand(options: TeamOptions): Promise<void> {
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
+  const model = options.model ?? cfg.defaultModel ?? DEFAULT_MODEL;
 
   let count = Number.isNaN(options.count) ? 1 : options.count;
   count = Math.max(1, Math.min(20, count));

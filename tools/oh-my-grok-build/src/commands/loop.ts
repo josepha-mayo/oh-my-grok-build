@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
-import { getOmgDir, loadOmgConfig } from "../config.js";
+import { DEFAULT_MODEL, getOmgDir, loadOmgConfig } from "../config.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import spawner from "../spawner.js";
 import { appendTimelineEvent } from "../timeline.js";
@@ -101,7 +101,7 @@ function runGrokOnce(prompt: string, options: { cwd: string; model: string; yolo
 export async function loopCommand(options: LoopOptions): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
   const cfg = await loadOmgConfig();
-  const model = options.model ?? cfg.defaultModel ?? "grok-4.5";
+  const model = options.model ?? cfg.defaultModel ?? DEFAULT_MODEL;
   const rawMax = Number.isNaN(options.maxIterations) ? 5 : (options.maxIterations ?? 5);
   const maxIterations = Math.max(1, Math.min(50, rawMax));
 

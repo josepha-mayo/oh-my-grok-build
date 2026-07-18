@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isAllowedHttpUrl, isAllowedWsUrl, isPrivateIp } from "./net.js";
+import { isAllowedHttpUrl, isAllowedProviderUrl, isAllowedWsUrl, isLoopbackHost, isPrivateIp } from "./net.js";
 
 describe("net", () => {
   describe("isPrivateIp", () => {
@@ -34,6 +34,13 @@ describe("net", () => {
     it("returns false for public addresses", () => {
       assert.strictEqual(isPrivateIp("8.8.8.8"), false);
       assert.strictEqual(isPrivateIp("2001:4860:4860::8888"), false);
+    });
+
+    it("does not treat IP-looking hostnames as addresses", () => {
+      assert.strictEqual(isPrivateIp("127.foo.com"), false);
+      assert.strictEqual(isPrivateIp("10.0.0.1.nip.io"), false);
+      assert.strictEqual(isPrivateIp("192.168.1.1.evil.com"), false);
+      assert.strictEqual(isPrivateIp("fe80.example.com"), false);
     });
   });
 
@@ -104,6 +111,60 @@ describe("net", () => {
       assert.strictEqual(isAllowedWsUrl("ws://10.0.0.1", true).ok, true);
       assert.strictEqual(isAllowedWsUrl("ws://192.168.1.1", true).ok, true);
       assert.strictEqual(isAllowedWsUrl("ws://172.16.0.1", true).ok, true);
+    });
+  });
+
+  describe("isLoopbackHost", () => {
+    it("detects loopback hosts", () => {
+      assert.strictEqual(isLoopbackHost("localhost"), true);
+      assert.strictEqual(isLoopbackHost("127.0.0.1"), true);
+      assert.strictEqual(isLoopbackHost("127.0.0.2"), true);
+      assert.strictEqual(isLoopbackHost("[::1]"), true);
+      assert.strictEqual(isLoopbackHost("::1"), true);
+      assert.strictEqual(isLoopbackHost("::ffff:127.0.0.1"), true);
+      assert.strictEqual(isLoopbackHost("::ffff:7f00:1"), true);
+      assert.strictEqual(isLoopbackHost("localhost."), true);
+    });
+
+    it("rejects non-loopback hosts", () => {
+      assert.strictEqual(isLoopbackHost("localhost.evil.com"), false);
+      assert.strictEqual(isLoopbackHost("127.foo.com"), false);
+      assert.strictEqual(isLoopbackHost("192.168.1.1"), false);
+      assert.strictEqual(isLoopbackHost("10.0.0.1"), false);
+      assert.strictEqual(isLoopbackHost("example.com"), false);
+      assert.strictEqual(isLoopbackHost("::ffff:192.168.1.1"), false);
+    });
+  });
+
+  describe("isAllowedProviderUrl", () => {
+    it("allows public HTTPS URLs", async () => {
+      const result = await isAllowedProviderUrl("https://api.openai.com/v1");
+      assert.strictEqual(result.ok, true);
+    });
+
+    it("allows loopback URLs", async () => {
+      assert.strictEqual((await isAllowedProviderUrl("http://localhost:11434/v1")).ok, true);
+      assert.strictEqual((await isAllowedProviderUrl("http://127.0.0.1:8000/v1")).ok, true);
+      assert.strictEqual((await isAllowedProviderUrl("http://[::1]:8080/v1")).ok, true);
+    });
+
+    it("blocks non-HTTP(S) protocols", async () => {
+      assert.strictEqual((await isAllowedProviderUrl("file:///etc/passwd")).ok, false);
+    });
+
+    it("blocks cloud metadata endpoints", async () => {
+      assert.strictEqual((await isAllowedProviderUrl("http://169.254.169.254/latest/meta-data/")).ok, false);
+      assert.strictEqual((await isAllowedProviderUrl("http://metadata.google.internal")).ok, false);
+    });
+
+    it("blocks non-loopback private IPs", async () => {
+      assert.strictEqual((await isAllowedProviderUrl("http://192.168.1.1:8000/v1")).ok, false);
+      assert.strictEqual((await isAllowedProviderUrl("http://10.0.0.1:8000/v1")).ok, false);
+      assert.strictEqual((await isAllowedProviderUrl("http://172.16.0.1:8000/v1")).ok, false);
+    });
+
+    it("blocks URLs with embedded credentials", async () => {
+      assert.strictEqual((await isAllowedProviderUrl("https://user:pass@example.com")).ok, false);
     });
   });
 });

@@ -1,13 +1,18 @@
 import { spawn as cpSpawn, spawnSync as cpSpawnSync } from "node:child_process";
 
-// Default to disabled telemetry unless the user explicitly opted in.
-process.env.GROK_TELEMETRY_ENABLED ??= "false";
-process.env.GROK_TELEMETRY_TRACE_UPLOAD ??= "false";
-process.env.GROK_TELEMETRY_MIXPANEL_ENABLED ??= "false";
-process.env.GROK_EXTERNAL_OTEL ??= "false";
-
 type SpawnArgs = Parameters<typeof cpSpawn>;
 type SpawnSyncArgs = Parameters<typeof cpSpawnSync>;
+
+// Default to disabled telemetry unless the user explicitly opted in.
+function withTelemetryDefaults(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    GROK_TELEMETRY_ENABLED: env.GROK_TELEMETRY_ENABLED ?? "false",
+    GROK_TELEMETRY_TRACE_UPLOAD: env.GROK_TELEMETRY_TRACE_UPLOAD ?? "false",
+    GROK_TELEMETRY_MIXPANEL_ENABLED: env.GROK_TELEMETRY_MIXPANEL_ENABLED ?? "false",
+    GROK_EXTERNAL_OTEL: env.GROK_EXTERNAL_OTEL ?? "false",
+  };
+}
 
 function resolveGrokCommand(
   command: string,
@@ -26,7 +31,11 @@ export function spawn(...args: SpawnArgs): ReturnType<typeof cpSpawn> {
   const procArgs = (args[1] as string[] | undefined) ?? [];
   const options = args[2] as object | undefined;
   const resolved = resolveGrokCommand(command, procArgs, options);
-  return cpSpawn(resolved.command, resolved.args, resolved.options);
+  const baseEnv = (resolved.options as { env?: NodeJS.ProcessEnv } | undefined)?.env ?? process.env;
+  return cpSpawn(resolved.command, resolved.args, {
+    ...resolved.options,
+    env: withTelemetryDefaults(baseEnv),
+  } as any);
 }
 
 export function spawnSync(...args: SpawnSyncArgs): ReturnType<typeof cpSpawnSync> {
@@ -34,7 +43,11 @@ export function spawnSync(...args: SpawnSyncArgs): ReturnType<typeof cpSpawnSync
   const procArgs = (args[1] as string[] | undefined) ?? [];
   const options = args[2] as object | undefined;
   const resolved = resolveGrokCommand(command, procArgs, options);
-  return cpSpawnSync(resolved.command, resolved.args, resolved.options);
+  const baseEnv = (resolved.options as { env?: NodeJS.ProcessEnv } | undefined)?.env ?? process.env;
+  return cpSpawnSync(resolved.command, resolved.args, {
+    ...resolved.options,
+    env: withTelemetryDefaults(baseEnv),
+  } as any);
 }
 
 export default { spawn, spawnSync };
