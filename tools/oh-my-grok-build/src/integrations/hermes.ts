@@ -3,6 +3,7 @@ import { AcpClient } from "../acp/client.js";
 import { createStdioTransport } from "../acp/stdio.js";
 import { sanitizeUserEnv } from "../env.js";
 import { makePermissionResponse, selectPermissionOption } from "../permissions.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import type { Connector, ConnectorConfig, ConnectorResult } from "./types.js";
 
 const INTERACTIVE_AUTH_IDS = new Set(["hermes-setup", "oauth", "browser", "grok.com"]);
@@ -73,7 +74,15 @@ export class HermesConnector implements Connector {
         await client.authenticate(authMethod, 60_000);
       }
       const { sessionId } = await client.newSession(path.resolve(this.config.cwd ?? process.cwd()), [], {}, 60_000);
-      await client.prompt(sessionId, [{ type: "text", text: prompt }], 120_000);
+      try {
+        await client.prompt(sessionId, [{ type: "text", text: prompt }], 120_000);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (isRateLimited(message)) {
+          throw new Error(formatRateLimitMessage());
+        }
+        throw err;
+      }
       await turnDone;
       return { text: chunks.join("") };
     } finally {

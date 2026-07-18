@@ -33,7 +33,7 @@ export function isPrivateIp(ip: string): boolean {
     // If we cannot parse the IPv4-mapped form, block it to be safe.
     return mapped ? isPrivateIp(mapped) : true;
   }
-  if (ip === "127.0.0.1" || ip === "::1") return true;
+  if (ip === "127.0.0.1" || ip.startsWith("127.") || ip === "::1" || ip === "::") return true;
   if (ip.startsWith("10.") || ip.startsWith("192.168.")) return true;
   if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip)) return true;
   if (ip.startsWith("169.254.")) return true;

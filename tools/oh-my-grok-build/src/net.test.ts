@@ -6,10 +6,14 @@ describe("net", () => {
   describe("isPrivateIp", () => {
     it("detects loopback addresses", () => {
       assert.strictEqual(isPrivateIp("127.0.0.1"), true);
+      assert.strictEqual(isPrivateIp("127.0.0.2"), true);
+      assert.strictEqual(isPrivateIp("127.255.255.255"), true);
       assert.strictEqual(isPrivateIp("::1"), true);
+      assert.strictEqual(isPrivateIp("::"), true);
       assert.strictEqual(isPrivateIp("::ffff:127.0.0.1"), true);
       // Node URL normalizes IPv4-mapped loopback to the compressed hex form.
       assert.strictEqual(isPrivateIp("::ffff:7f00:1"), true);
+      assert.strictEqual(isPrivateIp("::ffff:7f00:2"), true);
     });
 
     it("detects RFC1918 addresses", () => {
@@ -47,9 +51,15 @@ describe("net", () => {
     it("blocks localhost and loopback", () => {
       assert.strictEqual(isAllowedHttpUrl("http://localhost:8080").ok, false);
       assert.strictEqual(isAllowedHttpUrl("http://127.0.0.1:8080").ok, false);
+      assert.strictEqual(isAllowedHttpUrl("http://127.0.0.2:8080").ok, false);
       assert.strictEqual(isAllowedHttpUrl("http://[::1]:8080").ok, false);
+      assert.strictEqual(isAllowedHttpUrl("http://[::]:8080").ok, false);
       assert.strictEqual(isAllowedHttpUrl("http://[::ffff:127.0.0.1]:8080").ok, false);
+      assert.strictEqual(isAllowedHttpUrl("http://[::ffff:127.0.0.2]:8080").ok, false);
       assert.strictEqual(isAllowedHttpUrl("http://[::ffff:7f00:1]:8080").ok, false);
+      assert.strictEqual(isAllowedHttpUrl("http://[::ffff:7f00:2]:8080").ok, false);
+      // Node normalizes dotted octal/hex loopback forms to 127.0.0.1.
+      assert.strictEqual(isAllowedHttpUrl("http://0177.0.0.1:8080").ok, false);
     });
 
     it("blocks cloud metadata endpoints", () => {

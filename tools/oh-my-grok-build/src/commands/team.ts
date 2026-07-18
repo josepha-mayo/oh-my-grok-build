@@ -4,6 +4,7 @@ import { join } from "node:path";
 import chalk from "chalk";
 import { loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
+import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
 import { appendTimelineEvent } from "../timeline.js";
 
 export interface TeamOptions {
@@ -51,6 +52,10 @@ export async function teamCommand(options: TeamOptions): Promise<void> {
   });
   for (const r of results) {
     console.log(chalk.cyan(`\n--- Worker ${r.index + 1} (exit ${r.code ?? "?"}) ---`));
-    console.log(r.output.trim() || chalk.dim("(no output)"));
+    if (r.code !== 0 && r.code !== null && isRateLimited(r.output)) {
+      console.log(chalk.yellow(formatRateLimitMessage()));
+    } else {
+      console.log(r.output.trim() || chalk.dim("(no output)"));
+    }
   }
 }

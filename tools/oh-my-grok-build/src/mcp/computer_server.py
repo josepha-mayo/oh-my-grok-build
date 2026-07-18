@@ -87,8 +87,13 @@ def handle(msg: dict, pyautogui):
             send({"jsonrpc": "2.0", "id": id_, "result": {"content": [{"type": "text", "text": str(exc)}], "isError": True}})
             return
         params = msg.get("params", {})
+        if not isinstance(params, dict):
+            send({"jsonrpc": "2.0", "id": id_, "result": {"content": [{"type": "text", "text": "Invalid params: expected object"}], "isError": True}})
+            return
         name = params.get("name", "")
         args = params.get("arguments", {})
+        if not isinstance(args, dict):
+            args = {}
         try:
             result = call_tool(name, args, pyautogui)
             if isinstance(result, dict) and result.get("type") == "image":

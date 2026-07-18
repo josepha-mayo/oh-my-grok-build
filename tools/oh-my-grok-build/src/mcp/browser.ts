@@ -14,6 +14,30 @@ function sanitizeAccessibilityRef(ref: string): string {
 let browser: any;
 let context: any;
 let page: any;
+const routedPages = new WeakSet<any>();
+
+function attachConsole(p: any): void {
+  if (p.consoleLogs) return;
+  p.consoleLogs = [];
+  p.on("console", (msg: any) => {
+    p.consoleLogs.push(`${msg.type()}: ${msg.text()}`);
+  });
+}
+
+async function attachRoute(p: any): Promise<void> {
+  if (routedPages.has(p)) return;
+  routedPages.add(p);
+  attachConsole(p);
+  await p.route("**/*", async (route: any) => {
+    const url = route.request().url();
+    const allowed = isAllowedUrl(url);
+    if (!allowed.ok) {
+      await route.abort("blockedbyclient");
+    } else {
+      await route.continue();
+    }
+  });
+}
 
 async function ensurePage(): Promise<any> {
   if (page) return page;
@@ -21,20 +45,11 @@ async function ensurePage(): Promise<any> {
     const { chromium } = await import("playwright-core");
     browser = await chromium.launch({ headless: true });
     context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    context.on("page", (p: any) => {
+      void attachRoute(p);
+    });
     page = await context.newPage();
-    await page.route("**/*", async (route: any) => {
-      const url = route.request().url();
-      const allowed = isAllowedUrl(url);
-      if (!allowed.ok) {
-        await route.abort("blockedbyclient");
-      } else {
-        await route.continue();
-      }
-    });
-    page.consoleLogs = [];
-    page.on("console", (msg: any) => {
-      page.consoleLogs.push(`${msg.type()}: ${msg.text()}`);
-    });
+    await attachRoute(page);
     return page;
   } catch (err) {
     throw new Error(

@@ -5,6 +5,7 @@ import { networkInterfaces } from "node:os";
 import type { ServerInfo } from "../types.js";
 import { WebSocket, WebSocketServer } from "ws";
 import spawner from "../spawner.js";
+import { isPrivateIp } from "../net.js";
 import { loadMcpConfig, toAcpMcpServers } from "../mcp/mcp-config.js";
 
 export interface ServeOptions {
@@ -71,26 +72,6 @@ function isLocalOrigin(origin: string): boolean {
   } catch {
     return false;
   }
-}
-
-function isPrivateIp(ip: string): boolean {
-  // Handle IPv4-mapped IPv6 addresses first.
-  if (ip.startsWith("::ffff:")) {
-    return isPrivateIp(ip.slice(7));
-  }
-  if (
-    ip === "127.0.0.1" ||
-    ip === "::1" ||
-    ip.startsWith("10.") ||
-    ip.startsWith("192.168.") ||
-    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip) ||
-    ip.startsWith("fe80:") ||
-    ip.startsWith("fc") ||
-    ip.startsWith("fd")
-  ) {
-    return true;
-  }
-  return false;
 }
 
 function isOriginAllowed(origin: string, clientIp: string): boolean {
