@@ -33,10 +33,12 @@ import {
   subagentListCommand,
   subagentKillCommand,
   subagentLogsCommand,
+  subagentTraceCommand,
 } from "./commands/subagent.js";
 import { harnessAddCommand, harnessListCommand, harnessRemoveCommand, harnessRunCommand } from "./commands/harness.js";
 import { devinAutonomousCommand } from "./commands/devin.js";
 import { cronCommand } from "./commands/cron.js";
+import { timelineCommand } from "./commands/timeline.js";
 import { swarmCommand } from "./commands/swarm.js";
 import { loadOmgDotEnvIntoProcess } from "./config.js";
 
@@ -175,6 +177,15 @@ program
   });
 
 program
+  .command("timeline")
+  .description("Show recent timeline events")
+  .option("-n, --count <n>", "Number of events to show", parseInt, 50)
+  .option("-t, --type <type>", "Filter by event type")
+  .action(async (options) => {
+    timelineCommand(options);
+  });
+
+program
   .command("cron <expression> <prompt>")
   .description("Run a prompt on a cron schedule")
   .option("-m, --model <model>", "Model to use")
@@ -272,6 +283,16 @@ subagent.addCommand(
     .option("-n, --lines <n>", "Number of lines to show", parseInt, 50)
     .action(async (name, options) => {
       await subagentLogsCommand(name, options.lines);
+    })
+);
+
+subagent.addCommand(
+  new Command("trace")
+    .description("Show subagent chat trace")
+    .argument("<name>")
+    .option("-n, --lines <n>", "Number of lines to show", parseInt, 50)
+    .action(async (name, options) => {
+      await subagentTraceCommand(name, options.lines);
     })
 );
 

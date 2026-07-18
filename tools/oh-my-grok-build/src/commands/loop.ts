@@ -4,6 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
 import { getOmgDir, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
+import { appendTimelineEvent } from "../timeline.js";
 
 export interface LoopOptions {
   prompt: string;
@@ -91,6 +92,8 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
   const model = options.model ?? cfg.defaultModel ?? "grok-build";
   const maxIterations = options.maxIterations ?? 5;
 
+  appendTimelineEvent({ type: "loop_start", model, maxIterations, prompt: options.prompt, cwd });
+
   if ((await gitStatusShort(cwd)).trim()) {
     throw new Error("Working tree is not clean. Commit or stash changes before starting a loop.");
   }
@@ -128,10 +131,14 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
   }
 
   if (lastExit !== 0) {
+    appendTimelineEvent({ type: "loop_error", model, iterations: iteration, exitCode: lastExit });
     throw new Error(`grok exited with code ${lastExit}`);
   }
 
-  if ((await gitStatusShort(cwd)).trim()) {
+  const finalDirty = (await gitStatusShort(cwd)).trim().length > 0;
+  appendTimelineEvent({ type: "loop_stop", model, iterations: iteration, dirty: finalDirty });
+
+  if (finalDirty) {
     console.warn(chalk.yellow("Warning: working tree is still dirty after max iterations."));
   }
 }

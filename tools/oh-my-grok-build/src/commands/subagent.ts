@@ -1,5 +1,5 @@
 import chalk from "chalk";
-import { killSubagent, listSubagents, spawnSubagent, subagentOutput } from "../subagents/engine.js";
+import { killSubagent, listSubagents, spawnSubagent, subagentOutput, subagentTrace } from "../subagents/engine.js";
 
 export interface SubagentSpawnOptions {
   name: string;
@@ -42,4 +42,9 @@ export async function subagentKillCommand(name: string): Promise<void> {
 export async function subagentLogsCommand(name: string, lines: number): Promise<void> {
   const output = await subagentOutput(name, lines);
   console.log(output || chalk.dim("(no log output)"));
+}
+
+export async function subagentTraceCommand(name: string, lines: number): Promise<void> {
+  const output = await subagentTrace(name, lines);
+  console.log(output || chalk.dim("(no trace output)"));
 }
