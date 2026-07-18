@@ -12,7 +12,13 @@ export interface DevinAutonomousOptions {
 
 export async function devinAutonomousCommand(options: DevinAutonomousOptions): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
-  appendTimelineEvent({ type: "autonomous_start", model: options.model, prompt: options.prompt, cwd, sandboxProfile: options.sandboxProfile });
+  appendTimelineEvent({
+    type: "autonomous_start",
+    model: options.model,
+    prompt: options.prompt,
+    cwd,
+    sandboxProfile: options.sandboxProfile,
+  });
 
   const cfg = await loadGrokConfig();
   const configProfile = (cfg.sandbox as Record<string, unknown> | undefined)?.profile as string | undefined;

@@ -13,7 +13,12 @@ export interface CronOptions {
 export async function cronCommand(options: CronOptions): Promise<void> {
   const name = "cron";
 
-  appendTimelineEvent({ type: "cron_start", expression: options.expression, prompt: options.prompt, model: options.model });
+  appendTimelineEvent({
+    type: "cron_start",
+    expression: options.expression,
+    prompt: options.prompt,
+    model: options.model,
+  });
 
   await startJob(
     name,

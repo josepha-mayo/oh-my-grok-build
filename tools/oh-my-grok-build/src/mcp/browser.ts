@@ -268,7 +268,10 @@ const browserScroll: McpTool = {
     const ref = String(args.ref ?? "").trim();
     if (ref) {
       const selector = ref.startsWith("@") ? sanitizeAccessibilityRef(ref) : ref;
-      await p.evaluate((sel: string) => document.querySelector(sel)?.scrollIntoView({ behavior: "auto", block: "center" }), selector);
+      await p.evaluate(
+        (sel: string) => document.querySelector(sel)?.scrollIntoView({ behavior: "auto", block: "center" }),
+        selector
+      );
     } else if (args.deltaY !== undefined) {
       const deltaY = Number(args.deltaY);
       if (!Number.isFinite(deltaY)) throw new Error("deltaY must be a number");

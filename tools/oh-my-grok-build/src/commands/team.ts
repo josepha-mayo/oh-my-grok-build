@@ -44,7 +44,11 @@ export async function teamCommand(options: TeamOptions): Promise<void> {
   });
 
   const results = await Promise.all(workers);
-  appendTimelineEvent({ type: "team_stop", count, results: results.map((r) => ({ index: r.index, exitCode: r.code })) });
+  appendTimelineEvent({
+    type: "team_stop",
+    count,
+    results: results.map((r) => ({ index: r.index, exitCode: r.code })),
+  });
   for (const r of results) {
     console.log(chalk.cyan(`\n--- Worker ${r.index + 1} (exit ${r.code ?? "?"}) ---`));
     console.log(r.output.trim() || chalk.dim("(no output)"));
