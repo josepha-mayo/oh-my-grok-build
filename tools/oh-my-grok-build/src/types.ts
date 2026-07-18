@@ -119,6 +119,14 @@ export interface ProviderConfig {
   maxCompletionTokens?: number;
 }
 
+export interface McpServerConfig {
+  name: string;
+  enabled: boolean;
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
 export interface OmgConfig {
   defaultModel?: string;
   providers: Record<string, ProviderConfig>;
@@ -127,6 +135,7 @@ export interface OmgConfig {
     port?: number;
     secretEnv?: string;
   };
+  mcpServers?: McpServerConfig[];
 }
 
 export interface ServerInfo {

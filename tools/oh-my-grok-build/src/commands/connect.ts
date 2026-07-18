@@ -6,6 +6,7 @@ import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
 import { parseServerUrl } from "../acp/server.js";
 import { swarmCommand } from "./swarm.js";
+import { loadMcpConfig, toAcpMcpServers } from "../mcp/mcp-config.js";
 import type { AcpNewSessionResponse, AcpPermissionRequest, AcpPermissionResponse, AcpUpdate } from "../types.js";
 
 export interface ConnectOptions {
@@ -92,7 +93,8 @@ export async function connectCommand(options: ConnectOptions): Promise<void> {
   }
 
   async function startSession(): Promise<AcpNewSessionResponse> {
-    const session = await client.newSession(cwd, [], buildSessionMeta(), 60_000);
+    const mcpServers = toAcpMcpServers(await loadMcpConfig());
+    const session = await client.newSession(cwd, mcpServers, buildSessionMeta(), 60_000);
     console.log(chalk.dim(`Session: ${session.sessionId}\n`));
     return session;
   }

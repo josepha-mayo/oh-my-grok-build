@@ -22,6 +22,13 @@ import {
   scheduleDeleteCommand,
 } from "./commands/schedule.js";
 import {
+  toolsListCommand,
+  toolsEnableCommand,
+  toolsDisableCommand,
+  toolsAddCommand,
+  toolsRemoveCommand,
+} from "./commands/tools.js";
+import {
   subagentSpawnCommand,
   subagentListCommand,
   subagentKillCommand,
@@ -319,6 +326,62 @@ harness.addCommand(
       await harnessRunCommand(name, prompt);
     })
 );
+
+const tools = program.command("tools").description("Manage MCP tool servers (memory, browser, computer)");
+
+tools.addCommand(
+  new Command("list")
+    .alias("ls")
+    .description("List configured MCP tool servers")
+    .action(async () => {
+      await toolsListCommand();
+    })
+);
+
+tools.addCommand(
+  new Command("enable")
+    .description("Enable a built-in MCP tool server")
+    .argument("<name>")
+    .action(async (name) => {
+      await toolsEnableCommand(name);
+    })
+);
+
+tools.addCommand(
+  new Command("disable")
+    .description("Disable a built-in MCP tool server")
+    .argument("<name>")
+    .action(async (name) => {
+      await toolsDisableCommand(name);
+    })
+);
+
+tools.addCommand(
+  new Command("add")
+    .description("Add a custom MCP server")
+    .argument("<name>")
+    .argument("<command>")
+    .argument("[args...]")
+    .option("-e, --env <var>", "Set env var (NAME=VALUE)", collect, [])
+    .action(async (name, command, args, options) => {
+      const extra = Array.isArray(args) ? args : [];
+      await toolsAddCommand(name, command, extra, options);
+    })
+);
+
+tools.addCommand(
+  new Command("remove")
+    .alias("rm")
+    .description("Remove a custom MCP server")
+    .argument("<name>")
+    .action(async (name) => {
+      await toolsRemoveCommand(name);
+    })
+);
+
+function collect(value: string, previous: string[]): string[] {
+  return previous.concat([value]);
+}
 
 async function main() {
   try {

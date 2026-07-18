@@ -5,6 +5,7 @@ import { networkInterfaces } from "node:os";
 import type { ServerInfo } from "../types.js";
 import { WebSocket, WebSocketServer } from "ws";
 import spawner from "../spawner.js";
+import { loadMcpConfig, toAcpMcpServers } from "../mcp/mcp-config.js";
 
 export interface ServeOptions {
   bind?: string;
@@ -207,7 +208,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
       }
     });
 
-    ws.on("message", (data: unknown) => {
+    ws.on("message", async (data: unknown) => {
       if (!checkMessageRate(client)) {
         ws.close(1009, "message rate exceeded");
         return;
@@ -221,9 +222,9 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
         ws.close(1009, "message too large");
         return;
       }
-      if (proc.stdin?.writable) {
-        proc.stdin.write(buf.toString() + "\n");
-      }
+      if (!proc.stdin?.writable) return;
+      const payload = await injectMcpServers(buf.toString());
+      proc.stdin.write(payload + "\n");
     });
 
     ws.on("close", () => {
@@ -354,4 +355,31 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
 
 export function stopAgentServer(server: ServerInfo): Promise<void> {
   return server.close?.() ?? Promise.resolve();
+}
+
+async function injectMcpServers(raw: string): Promise<string> {
+  let msg: Record<string, unknown>;
+  try {
+    msg = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return raw;
+  }
+  const method = msg.method as string | undefined;
+  if (method !== "session/new" && method !== "session/load") {
+    return raw;
+  }
+  const params = (msg.params ?? {}) as Record<string, unknown>;
+  const active = toAcpMcpServers(await loadMcpConfig());
+  const existing = Array.isArray(params.mcpServers) ? (params.mcpServers as Record<string, unknown>[]) : [];
+  const seen = new Set(existing.map((s) => s.name).filter((n): n is string => typeof n === "string"));
+  const merged: Record<string, unknown>[] = [...existing];
+  for (const s of active) {
+    if (!seen.has(s.name)) {
+      merged.push(s as Record<string, unknown>);
+      seen.add(s.name);
+    }
+  }
+  params.mcpServers = merged;
+  msg.params = params;
+  return JSON.stringify(msg);
 }
