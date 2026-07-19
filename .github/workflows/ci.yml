@@ -7,29 +7,16 @@ on:
     branches: [main]
 
 jobs:
-  harness:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tools/oh-my-grok-build
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: tools/oh-my-grok-build/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run build
-      - run: npm test
-
-  plugin:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
-          if [ -f plugin/plugin.json ]; then
-            cat plugin/plugin.json | python -m json.tool > /dev/null
-          fi
-        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
