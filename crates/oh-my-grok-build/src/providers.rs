@@ -113,37 +113,55 @@ fn env_var_name(provider_id: &str) -> String {
     )
 }
 
-fn write_api_key(provider_id: &str, key: &str) -> Result<()> {
+fn api_key_target_var(provider_id: &str, env_keys: Option<&[String]>) -> String {
+    env_keys
+        .and_then(|keys| keys.iter().find(|k| k.ends_with("_API_KEY")).cloned())
+        .unwrap_or_else(|| env_var_name(provider_id))
+}
+
+pub fn write_api_key(provider_id: &str, env_keys: Option<&[String]>, key: &str) -> Result<String> {
+    let target = api_key_target_var(provider_id, env_keys);
+    let legacy = env_var_name(provider_id);
     let dir = omg_dir();
     std::fs::create_dir_all(&dir)?;
     let path = omg_env_path();
-    let var = env_var_name(provider_id);
+    let prefixes: Vec<String> = if target == legacy {
+        vec![format!("{target}=")]
+    } else {
+        vec![format!("{target}="), format!("{legacy}=")]
+    };
     let mut lines: Vec<String> = std::fs::read_to_string(&path)
         .unwrap_or_default()
         .lines()
-        .filter(|l| !l.trim().starts_with(&format!("{var}=")))
+        .filter(|l| !prefixes.iter().any(|p| l.trim().starts_with(p)))
         .map(|l| l.to_string())
         .collect();
-    lines.push(format!("{var}={key}"));
+    lines.push(format!("{target}={key}"));
     std::fs::write(&path, lines.join("\n") + "\n")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(())
+    Ok(target)
 }
 
-fn remove_api_key(provider_id: &str) -> Result<()> {
+pub fn remove_api_key(provider_id: &str, env_keys: Option<&[String]>) -> Result<()> {
     let path = omg_env_path();
     if !path.exists() {
         return Ok(());
     }
-    let var = env_var_name(provider_id);
+    let target = api_key_target_var(provider_id, env_keys);
+    let legacy = env_var_name(provider_id);
+    let prefixes: Vec<String> = if target == legacy {
+        vec![format!("{target}=")]
+    } else {
+        vec![format!("{target}="), format!("{legacy}=")]
+    };
     let raw = std::fs::read_to_string(&path)?;
     let lines: Vec<String> = raw
         .lines()
-        .filter(|l| !l.trim().starts_with(&format!("{var}=")))
+        .filter(|l| !prefixes.iter().any(|p| l.trim().starts_with(p)))
         .map(|l| l.to_string())
         .collect();
     let content = lines.join("\n").trim_end().to_string();
@@ -187,6 +205,16 @@ pub fn resolve_api_key(provider: &ProviderConfig) -> Option<String> {
     None
 }
 
+pub fn resolve_env_key(key: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(key) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let dotenv = load_env_file();
+    dotenv.get(key).filter(|v| !v.is_empty()).cloned()
+}
+
 pub fn list_providers() -> Result<Vec<ProviderConfig>> {
     let cfg = load_omg_config()?;
     Ok(cfg.providers.values().cloned().collect())
@@ -199,12 +227,12 @@ pub fn get_provider(id: &str) -> Result<Option<ProviderConfig>> {
 
 pub fn remove_provider(id: &str) -> Result<()> {
     let mut cfg = load_omg_config()?;
-    cfg.providers.remove(id);
+    let provider = cfg.providers.remove(id);
     if cfg.default_model.as_deref() == Some(&format!("omgb-{id}")) {
         cfg.default_model = None;
     }
     save_omg_config(&cfg)?;
-    remove_api_key(id)?;
+    remove_api_key(id, provider.as_ref().and_then(|p| p.env_key.as_deref()))?;
     remove_provider_from_grok_config(id)?;
     Ok(())
 }
@@ -275,7 +303,7 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: "codellama".into(),
             base_url: DEFAULT_OLLAMA_URL.into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OLLAMA_HOST".into(), "OPENAI_API_KEY".into()]),
+            env_key: None,
             extra_headers: None,
             context_window: Some(128_000),
             temperature: None,
@@ -301,7 +329,7 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: String::new(),
             base_url: "http://localhost:8000/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            env_key: Some(vec!["OMGB_VLLM_API_KEY".into()]),
             extra_headers: None,
             context_window: Some(128_000),
             temperature: None,
@@ -314,7 +342,7 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: String::new(),
             base_url: "http://localhost:8080/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            env_key: Some(vec!["OMGB_LLAMA_CPP_API_KEY".into()]),
             extra_headers: None,
             context_window: Some(128_000),
             temperature: None,
@@ -327,7 +355,7 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: String::new(),
             base_url: "http://localhost:5000/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            env_key: Some(vec!["OMGB_TABBY_API_KEY".into()]),
             extra_headers: None,
             context_window: Some(128_000),
             temperature: None,
@@ -386,7 +414,10 @@ pub fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
     provider.api_backend = Some(args.backend.as_str().into());
 
     if let Some(key) = &args.api_key {
-        write_api_key(&id, key)?;
+        let target = write_api_key(&id, provider.env_key.as_deref(), key)?;
+        if provider.env_key.is_none() {
+            provider.env_key = Some(vec![target]);
+        }
     }
 
     if args.default || cfg.default_model.is_none() {
@@ -554,7 +585,7 @@ pub fn add_discovered_providers(discovered: &[(String, Vec<String>)]) -> Result<
             model: models[0].clone(),
             base_url: base_url.into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            env_key: None,
             extra_headers: None,
             context_window: Some(128_000),
             temperature: None,

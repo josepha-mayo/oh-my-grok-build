@@ -11,15 +11,19 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 dirs = { workspace = true }
+futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+shlex = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
+qrcode = { version = "0.14", default-features = false }
 uuid = { workspace = true, features = ["v4"] }
 xai-crash-handler = { path = "../codegen/xai-crash-handler" }
 xai-grok-pager = { path = "../codegen/xai-grok-pager" }

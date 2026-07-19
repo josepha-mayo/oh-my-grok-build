@@ -109,7 +109,7 @@ pub struct AutonomousArgs {
     pub prompt: String,
     #[arg(short, long)]
     pub model: Option<String>,
-    #[arg(long, default_value = "off")]
+    #[arg(long, default_value = "workspace")]
     pub sandbox_profile: String,
 }
 
@@ -341,8 +341,6 @@ pub struct ServeArgs {
     pub bind: SocketAddr,
     #[arg(long, env = "OMGB_AGENT_SECRET")]
     pub secret: Option<String>,
-    #[arg(long)]
-    pub remote: Option<String>,
     #[arg(short, long)]
     pub model: Option<String>,
     #[arg(long)]

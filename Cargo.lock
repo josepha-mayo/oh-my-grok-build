@@ -6921,11 +6921,15 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 5.0.1",
+ "futures",
+ "qrcode",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.27.0",
  "tokio-util",
  "toml",
  "url",
@@ -8051,6 +8055,12 @@ name = "qcms"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edecfcd5d755a5e5d98e24cf43113e7cdaec5a070edd0f6b250c03a573da30fa"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

@@ -70,6 +70,9 @@ pub fn add_job(
     prompt: &str,
     model: Option<String>,
 ) -> Result<()> {
+    if parse_interval(expression).is_none() && parse_cron(expression).is_err() {
+        bail!("invalid schedule expression: {expression}");
+    }
     let name = name.unwrap_or_else(|| format!("job-{}", Utc::now().timestamp_millis()));
     let mut jobs = load_jobs()?;
     jobs.retain(|j| j.name != name);
@@ -130,14 +133,33 @@ pub async fn run_job(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn start_daemon() -> Result<()> {
-    let pid = std::process::id();
-    std::fs::write(pid_path(), pid.to_string())?;
-    println!("scheduler started (pid {pid}); press Ctrl-C to stop");
-    Ok(())
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.contains(&pid.to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 pub async fn run_daemon_loop() -> Result<()> {
+    std::fs::create_dir_all(crate::providers::omg_dir())?;
     let pid = std::process::id();
     std::fs::write(pid_path(), pid.to_string())?;
     loop {
@@ -149,6 +171,14 @@ pub async fn run_daemon_loop() -> Result<()> {
         for job in jobs {
             if is_due(&job) {
                 let _ = run_job(&job.name).await;
+                let mut jobs = match load_jobs() {
+                    Ok(j) => j,
+                    Err(_) => continue,
+                };
+                if let Some(j) = jobs.iter_mut().find(|j| j.name == job.name) {
+                    j.last_run = Some(Utc::now());
+                }
+                let _ = save_jobs(&jobs);
             }
         }
     }
@@ -160,6 +190,11 @@ pub fn stop_daemon() -> Result<()> {
         .trim()
         .parse::<u32>()
         .map_err(|_| anyhow::anyhow!("no scheduler pid"))?;
+    if !process_alive(pid) {
+        let _ = std::fs::remove_file(pid_path());
+        println!("scheduler is not running");
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         std::process::Command::new("kill")
@@ -172,6 +207,7 @@ pub fn stop_daemon() -> Result<()> {
             .args(["/PID", &pid.to_string(), "/F"])
             .spawn()?;
     }
+    let _ = std::fs::remove_file(pid_path());
     println!("sent stop to scheduler (pid {pid})");
     Ok(())
 }
@@ -180,7 +216,6 @@ fn is_due(job: &ScheduledJob) -> bool {
     let now = Local::now();
     let mut due = false;
 
-    // Interval expressions like "5m", "1h", "30s".
     if let Some(secs) = parse_interval(&job.expression) {
         due = job
             .last_run
@@ -238,21 +273,53 @@ fn cron_matches(fields: &[Vec<String>], now: Local) -> bool {
         && matches_field(&fields[1], hour as u32, 0, 23)
         && matches_field(&fields[2], day as u32, 1, 31)
         && matches_field(&fields[3], month as u32, 1, 12)
-        && matches_field(&fields[4], weekday as u32, 0, 6)
+        && matches_field(&fields[4], weekday as u32, 0, 7)
 }
 
 fn matches_field(parts: &[String], value: u32, min: u32, max: u32) -> bool {
-    for p in parts {
-        if p == "*" {
-            return true;
-        }
-        if let Ok(n) = p.parse::<u32>() {
-            if n == value {
-                return true;
+    parts.iter().any(|p| field_matches(value, p, min, max))
+}
+
+fn field_matches(value: u32, token: &str, min: u32, max: u32) -> bool {
+    let token = token.trim();
+    if token == "*" {
+        return true;
+    }
+
+    if let Some(suffix) = token.strip_prefix("*/") {
+        if let Ok(step) = suffix.parse::<u32>() {
+            if step > 0 && value >= min && value <= max {
+                return (value - min) % step == 0;
             }
         }
+        return false;
     }
-    false
+
+    if let Some((range, step_str)) = token.split_once('/') {
+        let step = step_str.trim().parse::<u32>().unwrap_or(1);
+        if step == 0 {
+            return false;
+        }
+        if let Some((start, end)) = range.split_once('-') {
+            if let (Ok(s), Ok(e)) = (start.trim().parse::<u32>(), end.trim().parse::<u32>()) {
+                let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+                let lo = lo.clamp(min, max);
+                let hi = hi.clamp(min, max);
+                return value >= lo && value <= hi && (value - lo) % step == 0;
+            }
+        }
+        return false;
+    }
+
+    if let Some((start, end)) = token.split_once('-') {
+        if let (Ok(s), Ok(e)) = (start.trim().parse::<u32>(), end.trim().parse::<u32>()) {
+            let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+            return value >= lo && value <= hi;
+        }
+        return false;
+    }
+
+    token.parse::<u32>().is_ok_and(|n| n == value)
 }
 
 #[cfg(test)]

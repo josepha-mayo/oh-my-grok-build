@@ -58,16 +58,6 @@ fn is_non_public_ipv6(ip: Ipv6Addr) -> bool {
         || ip.is_unicast_link_local()
 }
 
-fn is_loopback_addr(ip: IpAddr) -> bool {
-    if ip.is_loopback() {
-        return true;
-    }
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
-        IpAddr::V4(_) => false,
-    }
-}
-
 fn is_non_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_non_public_ipv4(v4),
@@ -88,10 +78,20 @@ fn is_explicit_local_host(host: &str) -> bool {
     host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
+fn lookup_port(url: &Url) -> u16 {
+    url.port_or_known_default().unwrap_or(80)
+}
+
+/// A URL whose destination has been validated and pinned to a set of addresses.
+pub struct ValidatedUrl {
+    pub url: Url,
+    pub addrs: Vec<SocketAddr>,
+}
+
 /// Validate a URL for safe outbound use. When `allow_local` is true, explicit
 /// loopback hosts (`localhost`, `127.0.0.0/8`, `::1`) are permitted; private
 /// ranges and cloud metadata hosts remain blocked.
-pub async fn validate_url(raw: &str, allow_local: bool) -> anyhow::Result<Url> {
+pub async fn validate_url(raw: &str, allow_local: bool) -> anyhow::Result<ValidatedUrl> {
     let url = Url::parse(raw).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
     if url.scheme() != "http" && url.scheme() != "https" {
         anyhow::bail!("non-HTTP(S) protocol blocked: {}", url.scheme());
@@ -106,36 +106,55 @@ pub async fn validate_url(raw: &str, allow_local: bool) -> anyhow::Result<Url> {
 
     let explicit_local = is_explicit_local_host(&host);
     if allow_local && explicit_local {
-        return Ok(url);
+        let port = lookup_port(&url);
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{host}:{port}"))
+            .await?
+            .map(|a| SocketAddr::new(a.ip(), 0))
+            .collect();
+        if addrs.is_empty() {
+            anyhow::bail!("loopback host resolved to no addresses");
+        }
+        return Ok(ValidatedUrl { url, addrs });
     }
 
     if explicit_local {
         anyhow::bail!("loopback host blocked; use --allow-local to enable");
     }
 
-    let lookup = format!("{host}:80");
+    let port = lookup_port(&url);
     let mut saw_addr = false;
-    let mut addrs = tokio::net::lookup_host(lookup).await?;
-    while let Some(addr) = addrs.next() {
+    let mut addrs = Vec::new();
+    for addr in tokio::net::lookup_host(format!("{host}:{port}")).await? {
         saw_addr = true;
         if is_non_public_ip(addr.ip()) {
             anyhow::bail!("host resolved to a private/non-public address");
         }
+        addrs.push(SocketAddr::new(addr.ip(), 0));
     }
     if !saw_addr {
         anyhow::bail!("host resolved to no addresses");
     }
 
-    Ok(url)
+    Ok(ValidatedUrl { url, addrs })
+}
+
+fn build_client(vurl: &ValidatedUrl, timeout: Duration) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(host) = vurl.url.host_str() {
+        let host = host.to_ascii_lowercase();
+        if !vurl.addrs.is_empty() {
+            builder = builder.resolve_to_addrs(&host, &vurl.addrs);
+        }
+    }
+    Ok(builder.build()?)
 }
 
 /// Perform a GET request to a validated URL with an optional timeout.
-pub async fn http_get_text(url: &Url, timeout: Duration) -> anyhow::Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(2))
-        .build()?;
-    let resp = client.get(url.as_str()).send().await?;
+pub async fn http_get_text(vurl: &ValidatedUrl, timeout: Duration) -> anyhow::Result<String> {
+    let client = build_client(vurl, timeout)?;
+    let resp = client.get(vurl.url.as_str()).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!(
             "HTTP {} {}",
@@ -148,16 +167,13 @@ pub async fn http_get_text(url: &Url, timeout: Duration) -> anyhow::Result<Strin
 
 /// Perform a JSON POST to a validated URL.
 pub async fn http_post_json(
-    url: &Url,
+    vurl: &ValidatedUrl,
     headers: HashMap<String, String>,
     body: serde_json::Value,
     timeout: Duration,
 ) -> anyhow::Result<(u16, String)> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(2))
-        .build()?;
-    let mut req = client.post(url.as_str()).json(&body);
+    let client = build_client(vurl, timeout)?;
+    let mut req = client.post(vurl.url.as_str()).json(&body);
     for (k, v) in headers {
         req = req.header(k, v);
     }
