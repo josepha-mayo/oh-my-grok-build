@@ -57,6 +57,7 @@ members = [
     "crates/codegen/xai-grok-workspace-types",
     "crates/codegen/xai-hooks-plugins-types",
     "crates/codegen/xai-hunk-tracker",
+    "crates/oh-my-grok-build",
     "crates/codegen/xai-mixpanel",
     "crates/codegen/xai-prompt-queue",
     "crates/codegen/xai-ratatui-inline",

@@ -6914,6 +6914,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "oh-my-grok-build"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs 5.0.1",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "url",
+ "urlencoding",
+ "uuid",
+ "xai-crash-handler",
+ "xai-grok-pager",
+ "xai-grok-pager-minimal",
+ "xai-grok-shell",
+ "xai-grok-telemetry",
+ "xai-grok-tools",
+ "xai-grok-update",
+ "xai-grok-version",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
