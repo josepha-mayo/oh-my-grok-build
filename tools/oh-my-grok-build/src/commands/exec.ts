@@ -28,7 +28,6 @@ export async function execCommand(options: ExecOptions): Promise<void> {
     const proc = spawner.spawn("grok", args, {
       cwd: options.cwd ?? process.cwd(),
       stdio: ["inherit", "inherit", "pipe"],
-      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     });
     proc.stderr?.on("data", (d: Buffer) => {
       stderrChunks.push(d);

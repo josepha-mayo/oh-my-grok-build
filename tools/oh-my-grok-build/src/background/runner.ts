@@ -57,7 +57,6 @@ export async function runPromptTask(prompt: string, options: RunPromptOptions = 
     const stderrChunks: Buffer[] = [];
     const proc = spawner.spawn("grok", args, {
       cwd: options.cwd ?? process.cwd(),
-      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     });
 
     proc.stdout?.on("data", (d) => appendLog(file, "stdout", d));

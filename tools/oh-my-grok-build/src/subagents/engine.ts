@@ -127,7 +127,6 @@ export async function spawnSubagent(
 
   const proc = spawner.spawn("grok", args, {
     cwd: worktree,
-    env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     detached: true,
     stdio: ["ignore", logFd, logFd],
   });

@@ -1,6 +1,5 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
 import { DEFAULT_MODEL, getOmgDir, loadOmgConfig } from "../config.js";
 import spawner from "../spawner.js";
@@ -116,8 +115,7 @@ function runGrok(prompt: string, options: { model: string; yolo?: boolean }): Pr
     const proc = spawner.spawn("grok", args, {
       cwd: process.cwd(),
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
-    }) as ChildProcess;
+    });
     proc.stdout?.on("data", (d: Buffer) => chunks.push(d));
     proc.stderr?.on("data", (d: Buffer) => chunks.push(d));
     proc.on("error", reject);

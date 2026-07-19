@@ -1,11 +1,8 @@
 import { spawn as cpSpawn, spawnSync as cpSpawnSync } from "node:child_process";
+import type { ChildProcess, SpawnOptions, SpawnSyncOptions } from "node:child_process";
 import { parseArgsStringToArgv } from "string-argv";
 
-type SpawnArgs = Parameters<typeof cpSpawn>;
-type SpawnSyncArgs = Parameters<typeof cpSpawnSync>;
-
-// Default to disabled telemetry unless the user explicitly opted in.
-function withTelemetryDefaults(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+function withTelemetryDefaults(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return {
     ...env,
     GROK_TELEMETRY_ENABLED: env.GROK_TELEMETRY_ENABLED ?? "false",
@@ -15,11 +12,11 @@ function withTelemetryDefaults(env: NodeJS.ProcessEnv = process.env): NodeJS.Pro
   };
 }
 
-function resolveGrokCommand(
+function resolveGrokCommand<TOptions extends SpawnOptions | SpawnSyncOptions | undefined>(
   command: string,
   args: string[] = [],
-  options?: object
-): { command: string; args: string[]; options?: object } {
+  options?: TOptions
+): { command: string; args: string[]; options?: TOptions } {
   if (command !== "grok") return { command, args, options };
   const override = process.env.OMGB_GROK_COMMAND?.trim();
   if (!override) return { command, args, options };
@@ -28,36 +25,28 @@ function resolveGrokCommand(
   return { command: parts[0], args: [...parts.slice(1), ...args], options };
 }
 
-export function spawn(...args: SpawnArgs): ReturnType<typeof cpSpawn> {
-  const command = args[0] as string;
-  const procArgs = (args[1] as string[] | undefined) ?? [];
-  const options = args[2] as object | undefined;
-  const resolved = resolveGrokCommand(command, procArgs, options);
-  const baseEnv = (resolved.options as { env?: NodeJS.ProcessEnv } | undefined)?.env ?? process.env;
+export function spawn(command: string, args: string[] = [], options?: SpawnOptions): ChildProcess {
+  const resolved = resolveGrokCommand(command, args, options);
+  const baseEnv = resolved.options?.env ?? process.env;
   let env = withTelemetryDefaults(baseEnv);
   if (command === "grok") {
     env = { ...env, GROK_DISABLE_AUTOUPDATER: env.GROK_DISABLE_AUTOUPDATER ?? "1" };
   }
-  return cpSpawn(resolved.command, resolved.args, {
-    ...resolved.options,
-    env,
-  } as any);
+  return cpSpawn(resolved.command, resolved.args, { ...resolved.options, env });
 }
 
-export function spawnSync(...args: SpawnSyncArgs): ReturnType<typeof cpSpawnSync> {
-  const command = args[0] as string;
-  const procArgs = (args[1] as string[] | undefined) ?? [];
-  const options = args[2] as object | undefined;
-  const resolved = resolveGrokCommand(command, procArgs, options);
-  const baseEnv = (resolved.options as { env?: NodeJS.ProcessEnv } | undefined)?.env ?? process.env;
+export function spawnSync(
+  command: string,
+  args: string[] = [],
+  options?: SpawnSyncOptions
+): ReturnType<typeof cpSpawnSync> {
+  const resolved = resolveGrokCommand(command, args, options);
+  const baseEnv = resolved.options?.env ?? process.env;
   let env = withTelemetryDefaults(baseEnv);
   if (command === "grok") {
     env = { ...env, GROK_DISABLE_AUTOUPDATER: env.GROK_DISABLE_AUTOUPDATER ?? "1" };
   }
-  return cpSpawnSync(resolved.command, resolved.args, {
-    ...resolved.options,
-    env,
-  } as any);
+  return cpSpawnSync(resolved.command, resolved.args, { ...resolved.options, env });
 }
 
 export default { spawn, spawnSync };

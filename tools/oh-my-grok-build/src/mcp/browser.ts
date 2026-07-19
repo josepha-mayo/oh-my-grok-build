@@ -1,7 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { pathToFileURL } from "node:url";
 import { startMcpServer, type McpContent, type McpTool } from "./runtime.js";
-import { isAllowedHttpUrl, isPrivateIp } from "../net.js";
+import { isAllowedHttpUrl, isPrivateIp, withTimeout } from "../net.js";
 
 export function sanitizeAccessibilityRef(ref: string): string {
   const id = ref.replace(/^@/, "");
@@ -12,13 +12,6 @@ export function sanitizeAccessibilityRef(ref: string): string {
 }
 
 type LookupFn = typeof lookup;
-
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("DNS lookup timed out")), ms)),
-  ]);
-}
 
 /**
  * Check a URL for SSRF safety. In addition to the static hostname checks in

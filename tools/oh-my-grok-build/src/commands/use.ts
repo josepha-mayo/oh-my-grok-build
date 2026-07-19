@@ -61,7 +61,7 @@ export async function useCommand(options: UseOptions): Promise<string> {
   if (options.yolo) args.push("--yolo");
   args.push("--no-leader", "stdio");
 
-  const childEnv: Record<string, string> = { GROK_DISABLE_AUTOUPDATER: "1" };
+  const childEnv: Record<string, string> = {};
   if (options.mode === "computer") {
     childEnv.OMGB_ALLOW_DESKTOP_CONTROL = "1";
   }
