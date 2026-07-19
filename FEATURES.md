@@ -39,12 +39,13 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 
 | Feature | Status |
 | --- | --- |
-| Remove `grok-build-app` (Capacitor web app) from harness repo | 🚧 |
-| Move `tools/oh-my-grok-build` (Node harness) out of `tools/` (archive or delete) | 🚧 |
-| Write `FEATURES.md` as the single source of truth | 🚧 |
-| Update `AGENTS.md` to describe Rust-first architecture | 🚧 |
-| Review Rust core crates and identify extension seams | ⏳ |
-| Choose binary crate layout (`crates/oh-my-grok-build` composition root) | ⏳ |
+| Remove `grok-build-app` (Capacitor web app) from harness repo | ✅ |
+| Move `tools/oh-my-grok-build` (Node harness) out of `tools/` (archived) | ✅ |
+| Write `FEATURES.md` as the single source of truth | ✅ |
+| Update `AGENTS.md` to describe Rust-first architecture | ✅ |
+| Update CI to run `cargo` checks | ✅ |
+| Review Rust core crates and identify extension seams | ✅ |
+| Choose binary crate layout (`crates/oh-my-grok-build` composition root) | ✅ |
 
 ### Phase 1 — Core harness in Rust
 
