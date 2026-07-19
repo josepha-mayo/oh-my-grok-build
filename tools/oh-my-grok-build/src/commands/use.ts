@@ -66,7 +66,7 @@ export async function useCommand(options: UseOptions): Promise<string> {
     childEnv.OMGB_ALLOW_DESKTOP_CONTROL = "1";
   }
 
-  appendTimelineEvent({
+  await appendTimelineEvent({
     type: options.mode === "computer" ? "computer_use_start" : "browser_use_start",
     model,
     prompt: options.prompt,
@@ -141,7 +141,7 @@ export async function useCommand(options: UseOptions): Promise<string> {
       await client.prompt(sessionId, [{ type: "text", text: options.prompt }], timeoutMs);
       await turnDone;
       const result = chunks.join("");
-      appendTimelineEvent({
+      await appendTimelineEvent({
         type: options.mode === "computer" ? "computer_use_stop" : "browser_use_stop",
         model,
         promptLength: options.prompt.length,

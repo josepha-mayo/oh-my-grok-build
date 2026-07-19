@@ -149,7 +149,13 @@ export async function spawnSubagent(
   records.push(record);
   await saveRegistry(records);
 
-  appendTimelineEvent({ type: "subagent_spawn", name: safeName, model: options.model, prompt, pid: proc.pid ?? 0 });
+  await appendTimelineEvent({
+    type: "subagent_spawn",
+    name: safeName,
+    model: options.model,
+    prompt,
+    pid: proc.pid ?? 0,
+  });
 
   return { ...record, running: true };
 }
@@ -183,7 +189,7 @@ export async function killSubagent(name: string): Promise<void> {
     throw new Error(`Failed to kill subagent "${safeName}": ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  appendTimelineEvent({ type: "subagent_kill", name: safeName, pid: record.pid });
+  await appendTimelineEvent({ type: "subagent_kill", name: safeName, pid: record.pid });
 
   records.splice(idx, 1);
   await saveRegistry(records);

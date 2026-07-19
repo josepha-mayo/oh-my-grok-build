@@ -5,7 +5,7 @@ import { networkInterfaces } from "node:os";
 import type { ServerInfo } from "../types.js";
 import { WebSocket, WebSocketServer } from "ws";
 import spawner from "../spawner.js";
-import { isPrivateIp } from "../net.js";
+import { isLoopbackHost } from "../net.js";
 import { loadMcpConfig, toAcpMcpServers } from "../mcp/mcp-config.js";
 import { entryScriptPath } from "../background/scheduler.js";
 
@@ -255,7 +255,7 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
 
     // Only trust X-Forwarded-For from loopback. If a real reverse proxy is
     // in use, the operator can set --bind 127.0.0.1 and proxy to that.
-    if (isPrivateIp(remoteAddress)) {
+    if (isLoopbackHost(remoteAddress)) {
       const forwarded = req.headers["x-forwarded-for"];
       if (typeof forwarded === "string") {
         return forwarded.split(",")[0].trim();
@@ -272,6 +272,13 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
     }
     entry.count++;
     connectionRates.set(ip, entry);
+
+    // Evict stale entries to prevent the map from growing unbounded.
+    for (const [key, value] of connectionRates.entries()) {
+      if (now - value.windowStart > CONNECTION_WINDOW_MS) {
+        connectionRates.delete(key);
+      }
+    }
     return entry.count <= MAX_CONNECTIONS_PER_IP;
   }
 

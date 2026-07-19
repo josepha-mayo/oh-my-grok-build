@@ -1,6 +1,9 @@
 /target
+node_modules/
 **/*.rs.bk
 .DS_Store
 __pycache__/
 *.pyc
 FEATURES.md
+tools/oh-my-grok-build/package-lock.json
+grok-build-app/package-lock.json

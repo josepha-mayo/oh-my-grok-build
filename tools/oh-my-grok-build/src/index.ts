@@ -232,7 +232,7 @@ program
   .option("-n, --count <n>", "Number of events to show", parseInt, 50)
   .option("-t, --type <type>", "Filter by event type")
   .action(async (options) => {
-    timelineCommand(options);
+    await timelineCommand(options);
   });
 
 program

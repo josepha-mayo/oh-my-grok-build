@@ -13,6 +13,13 @@ export function sanitizeAccessibilityRef(ref: string): string {
 
 type LookupFn = typeof lookup;
 
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("DNS lookup timed out")), ms)),
+  ]);
+}
+
 /**
  * Check a URL for SSRF safety. In addition to the static hostname checks in
  * isAllowedHttpUrl, we resolve the hostname and block any URL whose resolved IP
@@ -28,7 +35,7 @@ export async function isUrlAllowed(
   try {
     const url = new URL(raw);
     const lookupImpl = lookupFn ?? lookup;
-    const addresses = await lookupImpl(url.hostname, { all: true });
+    const addresses = await withTimeout(lookupImpl(url.hostname, { all: true }), 5000);
     if (!addresses.length) {
       return { ok: false, reason: `No DNS records for ${url.hostname}` };
     }

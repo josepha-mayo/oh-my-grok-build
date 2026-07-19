@@ -15,7 +15,7 @@ export async function execCommand(options: ExecOptions): Promise<void> {
   const cfg = await loadOmgConfig();
   const model = options.model ?? cfg.defaultModel ?? DEFAULT_MODEL;
 
-  appendTimelineEvent({ type: "exec_start", model, prompt: options.prompt, cwd: options.cwd ?? process.cwd() });
+  await appendTimelineEvent({ type: "exec_start", model, prompt: options.prompt, cwd: options.cwd ?? process.cwd() });
 
   const args = ["-p", options.prompt, "--model", model];
   if (options.yolo) args.push("--yolo");
@@ -35,8 +35,8 @@ export async function execCommand(options: ExecOptions): Promise<void> {
       process.stderr.write(d);
     });
     proc.on("error", reject);
-    proc.on("exit", (code) => {
-      appendTimelineEvent({ type: code === 0 ? "exec_stop" : "exec_error", model, exitCode: code });
+    proc.on("exit", async (code) => {
+      await appendTimelineEvent({ type: code === 0 ? "exec_stop" : "exec_error", model, exitCode: code });
       if (code === 0) {
         resolve();
         return;

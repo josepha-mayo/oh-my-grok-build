@@ -33,21 +33,25 @@ This repo is a fork of the open-source `xai-org/grok-build` SpaceXAI harness. We
 
 ## Build & test
 
+The repo is configured as an npm workspace. From the repository root:
+
 ```bash
-# TypeScript harness
-cd tools/oh-my-grok-build
 npm install
 npm run typecheck
 npm run build
 npm test
 npm run format:check
+```
 
-# Mobile app (from repo root)
-cd grok-build-app
-npm install
-npm run typecheck
-npm run build
-npm run format:check
+Individual workspace scripts can also be run with `npm run <script> -w <workspace>`,
+e.g. `npm run test -w tools/oh-my-grok-build`.
+
+For the mobile app only:
+
+```bash
+npm run typecheck -w grok-build-app
+npm run build -w grok-build-app
+npm run test -w grok-build-app
 ```
 
 ## Key principles

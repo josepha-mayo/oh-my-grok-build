@@ -6,9 +6,9 @@ export interface TimelineOptions {
   type?: string;
 }
 
-export function timelineCommand(options: TimelineOptions): void {
+export async function timelineCommand(options: TimelineOptions): Promise<void> {
   const count = Number.isNaN(options.count) ? 50 : (options.count ?? 50);
-  const events = readTimelineEvents({ count, type: options.type });
+  const events = await readTimelineEvents({ count, type: options.type });
 
   if (events.length === 0) {
     console.log("No timeline events yet.");

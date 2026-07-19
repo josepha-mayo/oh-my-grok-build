@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { ensureOmgDir, getOmgDir, atomicWriteFile } from "../config.js";
 import { runPromptTask } from "./runner.js";
 import { appendTimelineEvent } from "../timeline.js";
+import { withFileLock } from "../lock.js";
 
 export interface JobMeta {
   name: string;
@@ -31,6 +32,11 @@ const DAEMON_START_TIMEOUT_MS = 5000;
 
 function schedulerPath(): string {
   return join(getOmgDir(), "scheduler.json");
+}
+
+async function withJobsLock<T>(fn: () => Promise<T>): Promise<T> {
+  await ensureOmgDir();
+  return withFileLock(schedulerPath(), fn);
 }
 
 export function controlSocketPath(): string {
@@ -70,12 +76,14 @@ export async function saveJobs(jobs: JobMeta[]): Promise<void> {
 
 async function updateLastRun(name: string): Promise<void> {
   validateName(name);
-  const jobs = await loadJobs();
-  const job = jobs.find((j) => j.name === name);
-  if (job) {
-    job.lastRun = new Date().toISOString();
-    await saveJobs(jobs);
-  }
+  await withJobsLock(async () => {
+    const jobs = await loadJobs();
+    const job = jobs.find((j) => j.name === name);
+    if (job) {
+      job.lastRun = new Date().toISOString();
+      await saveJobs(jobs);
+    }
+  });
 }
 
 function makeTask(name: string, meta?: Record<string, unknown>): () => Promise<void> {
@@ -85,7 +93,7 @@ function makeTask(name: string, meta?: Record<string, unknown>): () => Promise<v
       console.error(`[scheduler] job "${name}" has no prompt`);
       return;
     }
-    appendTimelineEvent({ type: "cron_run", name, model: m.model });
+    await appendTimelineEvent({ type: "cron_run", name, model: m.model });
     try {
       await runPromptTask(m.prompt, { jobName: name, model: m.model, yolo: m.yolo, cwd: m.cwd });
     } catch (err) {
@@ -129,70 +137,78 @@ export async function startJob(
   validateName(name);
   _stopCronJob(name);
 
-  const jobs = await loadJobs();
-  const now = new Date().toISOString();
-  const entry: JobMeta = {
-    name,
-    expression: cronExpression,
-    status: "active",
-    meta,
-    createdAt: now,
-  };
+  await withJobsLock(async () => {
+    const jobs = await loadJobs();
+    const now = new Date().toISOString();
+    const entry: JobMeta = {
+      name,
+      expression: cronExpression,
+      status: "active",
+      meta,
+      createdAt: now,
+    };
 
-  const idx = jobs.findIndex((j) => j.name === name);
-  if (idx >= 0) {
-    entry.createdAt = jobs[idx].createdAt;
-    entry.lastRun = jobs[idx].lastRun;
-    jobs[idx] = entry;
-  } else {
-    jobs.push(entry);
-  }
-  await saveJobs(jobs);
+    const idx = jobs.findIndex((j) => j.name === name);
+    if (idx >= 0) {
+      entry.createdAt = jobs[idx].createdAt;
+      entry.lastRun = jobs[idx].lastRun;
+      jobs[idx] = entry;
+    } else {
+      jobs.push(entry);
+    }
+    await saveJobs(jobs);
+  });
 
   return _startCronJob(name, cronExpression, taskFn);
 }
 
 export async function saveCronJob(name: string, cronExpression: string, meta?: Record<string, unknown>): Promise<void> {
   validateName(name);
-  const jobs = await loadJobs();
-  const now = new Date().toISOString();
-  const entry: JobMeta = {
-    name,
-    expression: cronExpression,
-    status: "active",
-    meta,
-    createdAt: now,
-  };
+  await withJobsLock(async () => {
+    const jobs = await loadJobs();
+    const now = new Date().toISOString();
+    const entry: JobMeta = {
+      name,
+      expression: cronExpression,
+      status: "active",
+      meta,
+      createdAt: now,
+    };
 
-  const idx = jobs.findIndex((j) => j.name === name);
-  if (idx >= 0) {
-    entry.createdAt = jobs[idx].createdAt;
-    entry.lastRun = jobs[idx].lastRun;
-    jobs[idx] = entry;
-  } else {
-    jobs.push(entry);
-  }
-  await saveJobs(jobs);
+    const idx = jobs.findIndex((j) => j.name === name);
+    if (idx >= 0) {
+      entry.createdAt = jobs[idx].createdAt;
+      entry.lastRun = jobs[idx].lastRun;
+      jobs[idx] = entry;
+    } else {
+      jobs.push(entry);
+    }
+    await saveJobs(jobs);
+  });
 }
 
 export async function stopJob(name: string): Promise<void> {
   validateName(name);
   _stopCronJob(name);
 
-  const jobs = await loadJobs();
-  const entry = jobs.find((j) => j.name === name);
-  if (entry) {
-    entry.status = "stopped";
-    await saveJobs(jobs);
-  }
+  await withJobsLock(async () => {
+    const jobs = await loadJobs();
+    const entry = jobs.find((j) => j.name === name);
+    if (entry) {
+      entry.status = "stopped";
+      await saveJobs(jobs);
+    }
+  });
 }
 
 export async function deleteJob(name: string): Promise<void> {
   validateName(name);
   _stopCronJob(name);
 
-  const jobs = await loadJobs();
-  await saveJobs(jobs.filter((j) => j.name !== name));
+  await withJobsLock(async () => {
+    const jobs = await loadJobs();
+    await saveJobs(jobs.filter((j) => j.name !== name));
+  });
 }
 
 export async function listJobs(): Promise<JobMeta[]> {
@@ -289,7 +305,9 @@ export async function stopSchedulerDaemon(): Promise<boolean> {
 }
 
 async function reconcile(): Promise<void> {
-  const jobs = await loadJobs();
+  const jobs = await withJobsLock(async () => {
+    return loadJobs();
+  });
   const desired = new Map(jobs.filter((j) => j.status === "active").map((j) => [j.name, j.expression]));
 
   for (const [name, { expression }] of Array.from(activeJobs.entries())) {

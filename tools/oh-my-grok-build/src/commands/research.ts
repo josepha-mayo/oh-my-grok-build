@@ -140,7 +140,7 @@ export async function researchCommand(options: ResearchOptions): Promise<void> {
   const count = Number.isNaN(options.count) ? 5 : Math.max(1, Math.min(20, options.count ?? 5));
   const topic = options.topic;
 
-  appendTimelineEvent({ type: "research_start", topic, model, count });
+  await appendTimelineEvent({ type: "research_start", topic, model, count });
 
   console.log(chalk.bold(`Searching arXiv for "${topic}"...`));
   const entries = await searchArxiv(topic, count);
@@ -169,5 +169,12 @@ export async function researchCommand(options: ResearchOptions): Promise<void> {
     console.log(chalk.dim(`Patch saved to ${patchPath}`));
   }
 
-  appendTimelineEvent({ type: "research_stop", topic, model, papers: entries.length, reportPath, hasPatch: !!patch });
+  await appendTimelineEvent({
+    type: "research_stop",
+    topic,
+    model,
+    papers: entries.length,
+    reportPath,
+    hasPatch: !!patch,
+  });
 }

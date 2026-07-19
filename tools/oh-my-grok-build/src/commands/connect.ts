@@ -86,7 +86,11 @@ function gitOutput(cwd: string, args: string[], maxBytes = GIT_DIFF_MAX_BYTES): 
     proc.on("error", (err) => reject(new Error(`git ${args.join(" ")} failed to start: ${err.message}`)));
     proc.on("exit", (code) => {
       if (code !== 0) {
-        reject(new Error(`git ${args.join(" ")} exited with code ${code}: ${stderr.trim() || "(no stderr)"}`));
+        const err = new Error(
+          `git ${args.join(" ")} exited with code ${code}: ${stderr.trim() || "(no stderr)"}`
+        ) as Error & { code?: number | null };
+        err.code = code;
+        reject(err);
         return;
       }
       resolve(output);
@@ -102,11 +106,30 @@ function gitDiff(cwd: string): Promise<string> {
   return gitOutput(cwd, ["diff"]);
 }
 
+function isNotGitRepo(err: unknown): boolean {
+  if (err instanceof Error) {
+    if ((err as Error & { code?: number | null }).code === 128) return true;
+    if (err.message.includes("not a git repository")) return true;
+  }
+  return false;
+}
+
 async function buildLoopPrompt(cwd: string, original: string, iteration: number, total: number): Promise<string> {
   if (iteration === 0) return original;
   if (iteration === total - 1) return `Wrap up and finalize. Original task: ${original}`;
-  const status = await gitStatusShort(cwd);
-  const diff = await gitDiff(cwd);
+  let status: string;
+  let diff: string;
+  try {
+    status = await gitStatusShort(cwd);
+    diff = await gitDiff(cwd).catch(() => "(could not read git diff)");
+  } catch (err) {
+    if (isNotGitRepo(err)) {
+      status = "(not in a git repository)";
+      diff = "(not in a git repository)";
+    } else {
+      throw err;
+    }
+  }
   return [
     `Original task: ${original}`,
     "",

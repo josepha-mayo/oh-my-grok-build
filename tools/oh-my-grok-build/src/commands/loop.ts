@@ -55,7 +55,16 @@ function gitOutput(cwd: string, args: string[], maxBytes = DIFF_MAX_BYTES): Prom
       stderr += chunk;
     });
     proc.on("error", reject);
-    proc.on("exit", () => {
+    proc.on("exit", (code) => {
+      if (code !== 0 && code !== null) {
+        const message = output.trim() || stderr.trim() || "(no output)";
+        const err = new Error(`git ${args.join(" ")} exited with code ${code}: ${message}`) as Error & {
+          code?: number | null;
+        };
+        err.code = code;
+        reject(err);
+        return;
+      }
       if (stderr && !output.trim()) {
         reject(new Error(`git ${args.join(" ")} failed: ${stderr.trim()}`));
         return;
@@ -71,6 +80,14 @@ function gitStatusShort(cwd: string): Promise<string> {
 
 function gitDiff(cwd: string): Promise<string> {
   return gitOutput(cwd, ["diff"], DIFF_MAX_BYTES);
+}
+
+function isNotGitRepo(err: unknown): boolean {
+  if (err instanceof Error) {
+    if ((err as Error & { code?: number | null }).code === 128) return true;
+    if (err.message.includes("not a git repository")) return true;
+  }
+  return false;
 }
 
 interface GrokRunResult {
@@ -105,9 +122,20 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
   const rawMax = Number.isNaN(options.maxIterations) ? 5 : (options.maxIterations ?? 5);
   const maxIterations = Math.max(1, Math.min(50, rawMax));
 
-  appendTimelineEvent({ type: "loop_start", model, maxIterations, prompt: options.prompt, cwd });
+  await appendTimelineEvent({ type: "loop_start", model, maxIterations, prompt: options.prompt, cwd });
 
-  if ((await gitStatusShort(cwd)).trim()) {
+  let inRepo = true;
+  let initialStatus = "";
+  try {
+    initialStatus = await gitStatusShort(cwd);
+  } catch (err) {
+    if (isNotGitRepo(err)) {
+      inRepo = false;
+    } else {
+      throw err;
+    }
+  }
+  if (inRepo && initialStatus.trim()) {
     throw new Error("Working tree is not clean. Commit or stash changes before starting a loop.");
   }
 
@@ -125,15 +153,19 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
     lastExit = exitCode;
 
     if (lastExit !== 0) {
-      appendTimelineEvent({ type: "loop_error", model, iterations: iteration, exitCode: lastExit });
+      await appendTimelineEvent({ type: "loop_error", model, iterations: iteration, exitCode: lastExit });
       if (isRateLimited(stderr)) {
         throw new Error(formatRateLimitMessage());
       }
       throw new Error(`grok exited with code ${lastExit}`);
     }
 
-    const diff = await gitDiff(cwd);
-    const status = await gitStatusShort(cwd);
+    let diff = "";
+    let status = "";
+    if (inRepo) {
+      diff = await gitDiff(cwd);
+      status = await gitStatusShort(cwd);
+    }
 
     appendLoopLog({
       iteration,
@@ -144,16 +176,21 @@ export async function loopCommand(options: LoopOptions): Promise<void> {
       statusLength: status.length,
     });
 
-    if (!status.trim()) {
+    if (inRepo && !status.trim()) {
       console.log(chalk.green("Working tree is clean. Stopping."));
       break;
     }
 
-    currentPrompt = `Original task: ${options.prompt}\n\nReview the following diff and fix any issues:\n\n${diff || status}`;
+    if (inRepo) {
+      currentPrompt = `Original task: ${options.prompt}\n\nReview the following diff and fix any issues:\n\n${diff || status}`;
+    } else {
+      console.log(chalk.dim("Not a git repository; continuing with the original prompt."));
+      currentPrompt = options.prompt;
+    }
   }
 
-  const finalDirty = (await gitStatusShort(cwd)).trim().length > 0;
-  appendTimelineEvent({ type: "loop_stop", model, iterations: iteration, dirty: finalDirty });
+  const finalDirty = inRepo ? (await gitStatusShort(cwd)).trim().length > 0 : false;
+  await appendTimelineEvent({ type: "loop_stop", model, iterations: iteration, dirty: finalDirty });
 
   if (finalDirty) {
     console.warn(chalk.yellow("Warning: working tree is still dirty after max iterations."));
