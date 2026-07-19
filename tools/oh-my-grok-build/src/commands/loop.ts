@@ -1,6 +1,5 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
 import { DEFAULT_MODEL, getOmgDir, loadOmgConfig } from "../config.js";
 import { isRateLimited, formatRateLimitMessage } from "../rate-limit.js";
@@ -39,7 +38,7 @@ function gitOutput(cwd: string, args: string[], maxBytes = DIFF_MAX_BYTES): Prom
     let output = "";
     let stderr = "";
     let killed = false;
-    const proc = spawner.spawn("git", args, { cwd, env: process.env }) as ChildProcess;
+    const proc = spawner.spawn("git", args, { cwd });
     proc.stdout?.setEncoding("utf8");
     proc.stdout?.on("data", (chunk: string) => {
       if (killed) return;
@@ -103,7 +102,6 @@ function runGrokOnce(prompt: string, options: { cwd: string; model: string; yolo
     const proc = spawner.spawn("grok", args, {
       cwd: options.cwd,
       stdio: ["inherit", "inherit", "pipe"],
-      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     });
     proc.stderr?.setEncoding("utf8");
     proc.stderr?.on("data", (chunk: string) => {

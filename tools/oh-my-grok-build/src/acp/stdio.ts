@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import type { AcpTransport } from "./client.js";
 import spawner from "../spawner.js";
 

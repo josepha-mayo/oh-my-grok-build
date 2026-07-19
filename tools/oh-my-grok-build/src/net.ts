@@ -93,7 +93,7 @@ export function isAllowedHttpUrl(raw: string): { ok: true } | { ok: false; reaso
   return { ok: true };
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("DNS lookup timed out")), ms);
     promise.then(

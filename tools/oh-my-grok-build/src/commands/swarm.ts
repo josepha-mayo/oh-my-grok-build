@@ -37,7 +37,6 @@ function runGrokCapture(
     let byteCount = 0;
     const proc = spawner.spawn("grok", args, {
       cwd: options.cwd ?? process.cwd(),
-      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     proc.stdout?.on("data", (d: Buffer) => {

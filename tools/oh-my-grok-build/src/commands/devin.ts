@@ -36,7 +36,7 @@ export async function devinAutonomousCommand(options: DevinAutonomousOptions): P
   const model = options.model ?? ocfg.defaultModel ?? DEFAULT_MODEL;
   const args = ["-p", options.prompt, "--yolo", "--model", model];
 
-  const env: NodeJS.ProcessEnv = { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" };
+  const env: NodeJS.ProcessEnv = { ...process.env };
   if (sandboxProfile && sandboxProfile !== "off") {
     env.GROK_SANDBOX_PROFILE = sandboxProfile;
   }

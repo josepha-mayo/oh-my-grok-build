@@ -161,7 +161,6 @@ export async function startAgentServer(options: ServeOptions = {}): Promise<Serv
     const proc = spawner.spawn("grok", args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     });
 
     const client: Client = { ws, proc, stderrTail: [], messageCount: 0, messageWindowStart: Date.now() };
@@ -371,7 +370,6 @@ async function runOmgbCommand(args: unknown, cwd: string): Promise<RunCmdResult>
     const proc = spawner.spawn(process.execPath, [script, ...argv], {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
     });
 
     const timer = setTimeout(() => {

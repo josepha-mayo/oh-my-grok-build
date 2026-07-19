@@ -34,7 +34,6 @@ export async function teamCommand(options: TeamOptions): Promise<void> {
       const chunks: Buffer[] = [];
       const proc = spawner.spawn("grok", args, {
         cwd: workdir,
-        env: { ...process.env, GROK_DISABLE_AUTOUPDATER: "1" },
       });
       proc.stdout?.on("data", (d) => chunks.push(d));
       proc.stderr?.on("data", (d) => chunks.push(d));

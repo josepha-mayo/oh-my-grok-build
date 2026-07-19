@@ -1,7 +1,6 @@
 import path from "node:path";
 import readline from "node:readline/promises";
 import type { Readable as ReadableStream, Writable as WritableStream } from "node:stream";
-import type { ChildProcess } from "node:child_process";
 import chalk from "chalk";
 import { AcpClient } from "../acp/client.js";
 import { createNodeWebSocketTransport } from "../acp/transport.js";
@@ -68,7 +67,7 @@ function gitOutput(cwd: string, args: string[], maxBytes = GIT_DIFF_MAX_BYTES): 
     let output = "";
     let stderr = "";
     let killed = false;
-    const proc = spawner.spawn("git", args, { cwd, env: process.env }) as ChildProcess;
+    const proc = spawner.spawn("git", args, { cwd });
     proc.stdout?.setEncoding("utf8");
     proc.stdout?.on("data", (chunk: string) => {
       if (killed) return;
