@@ -70,6 +70,13 @@ const UNANALYZABLE_COMMANDS = new Set([
   "pwsh",
   "powershell.exe",
   "pwsh.exe",
+  "eval",
+  "source",
+  ".",
+  "exec",
+  "awk",
+  "gawk",
+  "nawk",
 ]);
 
 // Characters that separate commands or redirect I/O at the shell level.

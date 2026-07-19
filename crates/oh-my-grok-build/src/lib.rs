@@ -29,15 +29,20 @@ pub fn main() -> Result<()> {
     xai_grok_pager_minimal::install();
     xai_crash_handler::install_terminal_restore_only();
 
+    let cli = OmgbArgs::parse();
+    if let Some(OmgbCommand::Autonomous(ref args)) = cli.command {
+        // SAFETY: set before the multi-threaded Tokio runtime is created.
+        unsafe { std::env::set_var("GROK_SANDBOX", &args.sandbox_profile) };
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime")
-        .block_on(async_main())
+        .block_on(async_main(cli))
 }
 
-async fn async_main() -> Result<()> {
-    let cli = OmgbArgs::parse();
+async fn async_main(cli: OmgbArgs) -> Result<()> {
     let command = cli
         .command
         .unwrap_or_else(|| OmgbCommand::Tui(TuiArgs::default()));
@@ -55,7 +60,7 @@ async fn async_main() -> Result<()> {
         OmgbCommand::Swarm(args) => run_swarm(args).await,
         OmgbCommand::Subagent(args) => run_subagent(args).await,
         OmgbCommand::Research(args) => {
-            research::run_research(&args.topic, args.count, args.output).await
+            research::run_research(&args.topic, args.count, args.model, args.output).await
         }
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
         OmgbCommand::Harness(args) => run_harness(args).await,
@@ -77,14 +82,22 @@ fn build_agent_config(model: Option<String>) -> Result<AgentConfig> {
     Ok(cfg)
 }
 
+fn config_sandbox_profile() -> Option<String> {
+    let raw = xai_grok_shell::config::load_effective_config_disk_only().ok()?;
+    raw.get("sandbox")?
+        .get("profile")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
 async fn run_tui(args: TuiArgs) -> Result<()> {
     let mut argv = vec!["grok".to_string()];
-    if let Some(p) = args.prompt {
-        argv.push(p);
-    }
     if let Some(m) = args.model {
         argv.push("--model".to_string());
         argv.push(m);
+    }
+    if let Some(p) = args.prompt {
+        argv.push(p);
     }
     let pager_args = PagerArgs::parse_from(argv);
     pager_run(pager_args, None).await?;
@@ -92,6 +105,33 @@ async fn run_tui(args: TuiArgs) -> Result<()> {
 }
 
 async fn run_exec(args: ExecArgs) -> Result<()> {
+    if let Some(path) = &args.output_file {
+        if std::env::var("OMGB_EXEC_CAPTURE").is_err() {
+            let mut cmd = Command::new(std::env::current_exe()?);
+            cmd.arg("exec").arg(&args.prompt);
+            if let Some(m) = &args.model {
+                cmd.arg("--model").arg(m);
+            }
+            if args.yolo {
+                cmd.arg("--yolo");
+            }
+            if args.json {
+                cmd.arg("--json");
+            }
+            cmd.env("OMGB_EXEC_CAPTURE", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let out = cmd.output().await?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                bail!("exec failed: {stderr}");
+            }
+            std::fs::write(path, &out.stdout)?;
+            println!("wrote output to {}", path.display());
+            return Ok(());
+        }
+    }
+
     run_single_turn_with(
         &args.prompt,
         args.model,
@@ -103,12 +143,23 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
         },
         None,
         None,
-        args.output_file,
+        None,
     )
     .await
 }
 
 async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
+    if matches!(
+        config_sandbox_profile().as_deref(),
+        None | Some("") | Some("off")
+    ) {
+        eprintln!(
+            "warning: autonomous mode should run inside a sandbox; \
+             [sandbox].profile is unset or 'off' in ~/.grok/config.toml"
+        );
+    }
+    let cwd = std::env::current_dir()?;
+    xai_grok_shell::config::apply_sandbox(None, Some(&args.sandbox_profile), Some(&cwd));
     let prompt = format!(
         "{prompt}\n\nRun autonomously. Sandbox profile: {profile}.",
         prompt = args.prompt,
@@ -127,6 +178,9 @@ async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
 }
 
 async fn run_use(args: UseArgs) -> Result<()> {
+    if !args.yolo && std::env::var("OMGB_ALLOW_DESKTOP_CONTROL").is_err() {
+        bail!("desktop control requires --yolo or OMGB_ALLOW_DESKTOP_CONTROL=1");
+    }
     let prompt = format!(
         "{prompt}\n\nUse the computer as needed.",
         prompt = args.prompt
@@ -144,6 +198,9 @@ async fn run_use(args: UseArgs) -> Result<()> {
 }
 
 async fn run_browser(args: BrowserArgs) -> Result<()> {
+    if !args.yolo && std::env::var("OMGB_ALLOW_DESKTOP_CONTROL").is_err() {
+        bail!("desktop control requires --yolo or OMGB_ALLOW_DESKTOP_CONTROL=1");
+    }
     let mut prompt = args.prompt.clone();
     if let Some(url) = args.url {
         prompt.push_str(&format!("\n\nStart at URL: {url}"));
@@ -168,13 +225,13 @@ async fn run_single_turn_with(
     output_format: OutputFormat,
     max_turns: Option<u32>,
     cli_tools: Option<String>,
-    output_file: Option<PathBuf>,
+    cwd: Option<PathBuf>,
 ) -> Result<()> {
     let full_prompt = format!("{}{}", prompt, taste::taste_preamble());
     let options = HeadlessOptions {
         session_id: None,
         resume: None,
-        cwd: None,
+        cwd,
         yolo,
         trust: yolo,
         output_format,
@@ -212,17 +269,7 @@ async fn run_single_turn_with(
         None,
     );
 
-    if let Some(path) = output_file {
-        let old_stdout = std::io::stdout();
-        // Simpler: run to a temporary string by capturing output is non-trivial here.
-        // Write prompt to file as a placeholder and run to stdout.
-        std::fs::write(&path, "")?;
-        run_single_turn(HeadlessPrompt::Text(full_prompt), false, options).await?;
-        println!("\n(output also intended for {})", path.display());
-        Ok(())
-    } else {
-        run_single_turn(HeadlessPrompt::Text(full_prompt), false, options).await
-    }
+    run_single_turn(HeadlessPrompt::Text(full_prompt), false, options).await
 }
 
 async fn run_loop(args: LoopArgs) -> Result<()> {
@@ -312,8 +359,9 @@ async fn run_model(args: ModelArgs) -> Result<()> {
             xai_grok_pager::models::list_available_models(&cfg).await?;
         }
         Some(ModelCommand::Switch { model }) => {
-            providers::set_default_provider(&model)?;
-            println!("default model switched to {model}");
+            let id = model.strip_prefix("omgb-").unwrap_or(&model).to_string();
+            providers::set_default_provider(&id)?;
+            println!("default model switched to omgb-{id}");
         }
     }
     Ok(())
@@ -338,6 +386,16 @@ async fn run_schedule(args: ScheduleArgs) -> Result<()> {
 }
 
 async fn run_team(args: TeamArgs) -> Result<()> {
+    let git = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    if !git.success() {
+        bail!("team mode requires a git repository");
+    }
+
     let mut handles = Vec::new();
     for i in 0..args.agents {
         let prompt = format!(
@@ -348,14 +406,50 @@ async fn run_team(args: TeamArgs) -> Result<()> {
         );
         let model = args.model.clone();
         let yolo = args.yolo;
+        let worktree = std::env::temp_dir().join(format!("omgb-team-{i}-{}", uuid::Uuid::new_v4()));
+
         handles.push(tokio::spawn(async move {
-            run_single_turn_with(&prompt, model, yolo, OutputFormat::Plain, None, None, None).await
+            create_worktree(&worktree).await?;
+            let result = run_single_turn_with(
+                &prompt,
+                model,
+                yolo,
+                OutputFormat::Plain,
+                None,
+                None,
+                Some(worktree.clone()),
+            )
+            .await;
+            remove_worktree(&worktree).await;
+            result
         }));
     }
     for h in handles {
         h.await??;
     }
     Ok(())
+}
+
+async fn create_worktree(path: &PathBuf) -> Result<()> {
+    let out = Command::new("git")
+        .args(["worktree", "add", "-q"])
+        .arg(path)
+        .output()
+        .await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("git worktree add failed: {stderr}");
+    }
+    Ok(())
+}
+
+async fn remove_worktree(path: &PathBuf) {
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force", "-q"])
+        .arg(path)
+        .status()
+        .await;
+    let _ = tokio::fs::remove_dir_all(path).await;
 }
 
 async fn run_swarm(args: SwarmArgs) -> Result<()> {

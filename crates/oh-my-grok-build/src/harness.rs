@@ -32,9 +32,7 @@ pub struct ConnectorConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub secret: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub env: Option<HashMap<String, String>>,
+    pub secret_env_key: Option<String>,
 }
 
 fn load_registry() -> Result<ConnectorRegistry> {
@@ -85,13 +83,12 @@ pub fn add_connector(
     let type_str = r#type.as_str().to_string();
     let command = command.or_else(|| default_command(&type_str));
     let mut registry = load_registry()?;
-    let mut env = HashMap::new();
-    if let Some(secret) = &secret {
-        env.insert(
-            format!("{}_API_KEY", type_str.to_uppercase()),
-            secret.clone(),
-        );
-    }
+
+    let secret_env_key = secret
+        .as_ref()
+        .map(|s| crate::providers::write_api_key(&name, None, s))
+        .transpose()?;
+
     registry.connectors.insert(
         name.clone(),
         ConnectorConfig {
@@ -100,8 +97,7 @@ pub fn add_connector(
             command,
             url,
             cwd,
-            secret,
-            env: if env.is_empty() { None } else { Some(env) },
+            secret_env_key,
         },
     );
     save_registry(&registry)
@@ -113,8 +109,17 @@ pub fn list_connectors() -> Result<Vec<ConnectorConfig>> {
 
 pub fn remove_connector(name: &str) -> Result<()> {
     let mut registry = load_registry()?;
-    registry.connectors.remove(name);
-    save_registry(&registry)
+    let cfg = registry.connectors.remove(name);
+    save_registry(&registry)?;
+    if let Some(cfg) = cfg {
+        if let Some(ref key) = cfg.secret_env_key {
+            let keys = vec![key.clone()];
+            let _ = crate::providers::remove_api_key(name, Some(keys.as_slice()));
+        } else {
+            let _ = crate::providers::remove_api_key(name, None);
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
@@ -135,8 +140,9 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("connector has no command"))?;
 
     let prompt = format!("{}{}", prompt, taste_preamble());
-    let mut parts: Vec<String> = command
-        .split_whitespace()
+    let mut parts: Vec<String> = shlex::split(command)
+        .ok_or_else(|| anyhow::anyhow!("invalid connector command quoting"))?
+        .into_iter()
         .map(|s| s.replace("{prompt}", &prompt))
         .collect();
     if parts.is_empty() {
@@ -151,9 +157,9 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
     if let Some(cwd) = &cfg.cwd {
         cmd.current_dir(cwd);
     }
-    if let Some(map) = &cfg.env {
-        for (k, v) in map {
-            cmd.env(k, v);
+    if let Some(ref key) = cfg.secret_env_key {
+        if let Some(value) = crate::providers::resolve_env_key(key) {
+            cmd.env(key, value);
         }
     }
 
@@ -189,8 +195,10 @@ async fn run_http_connector(cfg: &ConnectorConfig, url: &str, prompt: &str) -> R
     use crate::net::{http_post_json, validate_url};
     let url = validate_url(url, false).await?;
     let mut headers = std::collections::HashMap::new();
-    if let Some(secret) = &cfg.secret {
-        headers.insert("Authorization".into(), format!("Bearer {secret}"));
+    if let Some(ref key) = cfg.secret_env_key {
+        if let Some(secret) = crate::providers::resolve_env_key(key) {
+            headers.insert("Authorization".into(), format!("Bearer {secret}"));
+        }
     }
     let body = serde_json::json!({ "prompt": format!("{}{}", prompt, taste_preamble()) });
     let (status, text) =
@@ -200,9 +208,4 @@ async fn run_http_connector(cfg: &ConnectorConfig, url: &str, prompt: &str) -> R
     }
     println!("{text}");
     Ok(())
-}
-
-/// Validate that connector env maps only contain API-key-like keys.
-pub fn filter_env(env: &mut HashMap<String, String>) {
-    env.retain(|k, _| k.ends_with("_API_KEY") || k == "OPENAI_API_KEY" || k == "ANTHROPIC_API_KEY");
 }

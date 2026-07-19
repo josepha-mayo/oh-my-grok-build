@@ -1,59 +1,56 @@
 # AGENTS.md — Oh My Grok Build
 
-This repo is a fork of the open-source `xai-org/grok-build` harness. We are building **oh-my-grok-build** (`omgb`): an opinionated productivity, orchestration, and mobile-relay layer on top of the existing Rust harness.
+This repo adds **oh-my-grok-build** (`omgb`) as an opinionated productivity, orchestration, and mobile-relay layer on top of the open-source `xai-org/grok-build` Rust core.
 
 ## Project goals
 
-- Extend the Grok Build **Rust harness** (`crates/`) instead of writing a parallel tool in TypeScript/Bun/Python.
-- Add the missing harness features found in `oh-my-codex`, `oh-my-pi`, `Command Code`, `Hermes`, etc.: BYOK providers, local model discovery, background/cron tasks, subagent orchestration, taste learning, team worktree isolation, git-native safety hooks, session branching helpers, research, timeline, cross-harness connectors, and a mobile relay.
-- Ship a single Rust binary named `oh-my-grok-build` (alias `omgb`) that reuses upstream crates and registers new subcommands/slash commands.
-- Keep edits to upstream `xai-grok-*` crates minimal and upstream-friendly. Prefer new `omgb-*` crates and upstream public APIs; when a seam is missing, expose it upstream rather than forking logic.
-- The mobile app is a separate, real native project and is **not** in this harness repo. It talks to `omgb serve` over ACP/WebSocket.
+- Reuse Grok Build's Rust crates as the execution engine and extend them with `omgb` commands.
+- Add the missing harness features found in `oh-my-codex`, `oh-my-pi`, `Command Code`, `Hermes`, etc.: BYOK providers, local model discovery, background/cron tasks, subagent orchestration, taste learning, team worktree isolation, git-native safety hooks, and a mobile relay.
+- Ship the `omgb` CLI as a Rust binary in the `oh-my-grok-build` crate, controlled by a Grok Build plugin (`plugin/`).
 
 ## Repository layout
 
 | Path | Purpose |
 |------|---------|
-| `crates/codegen/xai-grok-*` | Upstream Grok Build Rust source. Edit sparingly, mark changes clearly. |
-| `crates/oh-my-grok-build` | Composition-root binary crate for `oh-my-grok-build` / `omgb`. |
-| `crates/oh-my-grok-build/src/{providers,scheduler,subagents,taste,timeline,research,harness,server}` | Phase 1 feature modules inside the composition-root crate. These will be split into standalone `crates/omgb-*` crates once they stabilize. |
-| `plugin/` | Grok Build plugin skills and slash commands (`/use`, `/browser`, `/schedule`, `/loop`, `/btw`, `/taste`, `/autonomous`, `/research`, etc.). |
-| `AGENTS.md` | This file. |
-| `FEATURES.md` | Single source of truth for features, goals, and roadmap. |
+| `crates/codegen/` | Upstream Grok Build Rust source (treat as upstream; edit only when necessary) |
+| `crates/oh-my-grok-build/` | `omgb` Rust CLI: providers, scheduler, subagents, team mode, research, server/relay, connectors |
+| `plugin/` | Grok Build plugin: skills, hooks, agents, slash commands (incl. `/use`, `/browser`, `/schedule`, `/btw`) |
+| `grok-build-app/` | Native mobile app (planned; archived Capacitor prototype) |
+| `AGENTS.md` | This file |
 
 ## Conventions
 
-- Use **Rust** for all new harness code. Cargo workspace conventions apply.
-- Follow existing `rustfmt.toml`, `clippy.toml`, and crate naming patterns.
+- This is a **Rust-first** workspace; all production code lives in the Rust crate.
+- Run `cargo fmt -p oh-my-grok-build` and `cargo clippy -p oh-my-grok-build` before committing.
 - Keep code compact; avoid verbose error handling and unnecessary comments.
 - Never log secrets or API keys.
-- Provider API keys are stored in `~/.omgb/.env`, never committed, and referenced by `env_key` in `~/.grok/config.toml`.
-- Connector and MCP `env` maps are filtered to `*_API_KEY` keys only; dangerous keys such as `PATH` or `LD_PRELOAD` cannot be injected.
-- WebSocket and browser URLs are validated against private/metadata hosts.
-- Run `cargo fmt --check`, `cargo clippy --workspace`, and `cargo test --workspace` before committing.
-- Use Grok's extension points: plugins, skills, hooks, agents, MCP, ACP.
+- Provider API keys are stored in `~/.omgb/.env` (Unix permissions `0600`), never committed, and referenced by `env_key` in `~/.grok/config.toml`.
+- Connector secrets are stored the same way; `connectors.json` only keeps the env-key reference.
+- WebSocket and HTTP URLs are validated against private/metadata hosts.
+
+## Configuration
+
+- `~/.grok/config.toml` — Grok Build configuration (sandbox profile, model, endpoints).
+- `~/.omgb/config.json` — `omgb` provider and default model settings.
+- `~/.omgb/.env` — API keys and connector secrets (never committed).
+- `~/.omgb/schedule.jsonl` — background scheduled jobs.
+- `~/.omgb/connectors.json` — cross-harness connector registry (no secrets).
+- `~/.omgb/subagents.jsonl` — subagent registry.
 
 ## Build & test
 
 ```bash
-# Format/lint/test the Rust workspace
-cargo fmt --check
-cargo clippy --workspace --all-targets
-cargo test --workspace
-
-# Distribution build
-cargo build --bin oh-my-grok-build --profile release-dist
+cargo fmt -p oh-my-grok-build
+cargo clippy -p oh-my-grok-build
+cargo test -p oh-my-grok-build
+node --test plugin/bin/safe-shell-guard.test.js
 ```
+
+The binary is produced at `target/release/omgb` (`target\release\omgb.exe` on Windows).
 
 ## Key principles
 
-1. **Harness, not engine.** The upstream Rust core is the harness; we build on top of it.
-2. **Privacy-first / local-first.** No telemetry unless explicitly opted in. Relay traffic stays between the phone and the local machine.
-3. **Grok-native.** Use Grok's existing plugin, hook, skill, subagent, and MCP systems rather than reinventing them.
-4. **Incremental.** Small, composable crates. The CLI should be useful with one command (`omgb serve`) and grow from there.
-5. **Industry-standard.** Tests, CI, type safety, clear docs, and secure credential handling for every feature.
-
-## Important
-
-- Do **not** recreate the Node/TypeScript harness or the Capacitor web mobile app in this repo.
-- `FEATURES.md` is the source of truth for scope and status; update it as work progresses.
+1. **Privacy-first / local-first**: relay traffic stays between the phone and the local machine.
+2. **Grok-native**: use Grok's existing plugin, hook, skill, subagent, and MCP systems rather than reinventing them.
+3. **Incremental**: small, composable tools. The CLI should be useful with one command (`omgb serve`) and grow from there.
+4. **Industry-standard**: include tests, CI, type safety, clear docs, and secure credential handling.

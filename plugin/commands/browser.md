@@ -8,5 +8,6 @@ allowed-tools: run_terminal_cmd
 
 1. Identify the user's browser automation task.
 2. Run `omgb browser "<prompt>" [--model <model>] [--yolo]`.
-3. Stream the result back. If the agent asks for permission, choose `allow_once` when reasonable.
-4. Summarize what was done.
+3. Desktop/browser control is gated: pass `--yolo` or set `OMGB_ALLOW_DESKTOP_CONTROL=1`.
+4. Stream the result back. If the agent asks for permission, choose `allow_once` when reasonable.
+5. Summarize what was done.

@@ -7,7 +7,7 @@ use std::process::Stdio;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 fn subagents_path() -> PathBuf {
     crate::providers::omg_dir().join("subagents.jsonl")
@@ -51,6 +51,47 @@ fn append_record(record: &SubagentRecord) -> Result<()> {
     Ok(())
 }
 
+fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+fn log_path(id: &str, ext: &str) -> Result<PathBuf> {
+    if !is_safe_id(id) {
+        bail!("invalid subagent id '{id}'");
+    }
+    Ok(logs_dir().join(format!("{id}.{ext}")))
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.contains(&pid.to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
 pub async fn spawn(prompt: &str) -> Result<()> {
     let exe = std::env::current_exe()?.to_string_lossy().to_string();
     let id = format!(
@@ -58,8 +99,8 @@ pub async fn spawn(prompt: &str) -> Result<()> {
         Utc::now().timestamp_millis(),
         std::process::id()
     );
-    let out_path = logs_dir().join(format!("{id}.out"));
-    let err_path = logs_dir().join(format!("{id}.err"));
+    let out_path = log_path(&id, "out")?;
+    let err_path = log_path(&id, "err")?;
     std::fs::create_dir_all(&logs_dir())?;
 
     let mut cmd = tokio::process::Command::new(&exe);
@@ -80,28 +121,16 @@ pub async fn spawn(prompt: &str) -> Result<()> {
     let mut err_file = tokio::fs::File::create(&err_path).await?;
 
     tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-        loop {
-            match stdout.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let _ = out_file.write_all(&buf[..n]).await;
-                }
-                Err(_) => break,
-            }
-        }
+        let _ = tokio::io::copy(&mut stdout, &mut out_file).await;
+        let _ = out_file.flush().await;
     });
     tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-        loop {
-            match stderr.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let _ = err_file.write_all(&buf[..n]).await;
-                }
-                Err(_) => break,
-            }
-        }
+        let _ = tokio::io::copy(&mut stderr, &mut err_file).await;
+        let _ = err_file.flush().await;
+    });
+    tokio::spawn(async move {
+        let mut child = child;
+        let _ = child.wait().await;
     });
 
     let record = SubagentRecord {
@@ -109,7 +138,7 @@ pub async fn spawn(prompt: &str) -> Result<()> {
         pid,
         prompt: prompt.to_string(),
         started_at: Utc::now(),
-        command: format!("{exe} exec {prompt}"),
+        command: format!("{exe} exec <prompt>"),
     };
     append_record(&record)?;
     println!("spawned subagent {id} (pid {pid})");
@@ -122,10 +151,16 @@ pub fn list() -> Result<()> {
         println!("No subagents recorded.");
     } else {
         for r in records {
+            let alive = if process_alive(r.pid) {
+                "running"
+            } else {
+                "exited"
+            };
             println!(
-                "{} (pid {}) started {}: {}",
+                "{} (pid {}) {} started {}: {}",
                 r.id,
                 r.pid,
+                alive,
                 r.started_at.to_rfc3339(),
                 r.prompt
             );
@@ -135,12 +170,19 @@ pub fn list() -> Result<()> {
 }
 
 pub fn kill(id: &str) -> Result<()> {
+    if !is_safe_id(id) {
+        bail!("invalid subagent id '{id}'");
+    }
     let records = load_records()?;
     let record = records
         .iter()
         .find(|r| r.id == id)
-        .ok_or_else(|| anyhow::anyhow!("subagent '{id}' not found"))?
-        .clone();
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("subagent '{id}' not found"))?;
+    if !process_alive(record.pid) {
+        println!("subagent {} (pid {}) is not running", record.id, record.pid);
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         std::process::Command::new("kill")
@@ -158,7 +200,7 @@ pub fn kill(id: &str) -> Result<()> {
 }
 
 pub async fn logs(id: &str) -> Result<()> {
-    let path = logs_dir().join(format!("{id}.out"));
+    let path = log_path(id, "out")?;
     if !path.exists() {
         bail!("no logs for subagent '{id}'");
     }
@@ -168,8 +210,8 @@ pub async fn logs(id: &str) -> Result<()> {
 }
 
 pub async fn trace(id: &str) -> Result<()> {
-    let out = logs_dir().join(format!("{id}.out"));
-    let err = logs_dir().join(format!("{id}.err"));
+    let out = log_path(id, "out")?;
+    let err = log_path(id, "err")?;
     if out.exists() {
         println!("-- stdout --");
         print!("{}", tokio::fs::read_to_string(&out).await?);

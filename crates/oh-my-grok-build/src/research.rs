@@ -1,6 +1,7 @@
 //! Deep arXiv/web research for `omgb`.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -21,8 +22,8 @@ pub async fn research(topic: &str, count: usize) -> Result<String> {
     let url = format!(
         "http://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results={count}&sortBy=relevance&sortOrder=descending"
     );
-    let url = validate_url(&url, false).await?;
-    let text = http_get_text(&url, Duration::from_secs(30)).await?;
+    let vurl = validate_url(&url, false).await?;
+    let text = http_get_text(&vurl, Duration::from_secs(30)).await?;
     let entries = parse_atom(&text).unwrap_or_default();
 
     if entries.is_empty() {
@@ -43,13 +44,51 @@ pub async fn research(topic: &str, count: usize) -> Result<String> {
     Ok(report)
 }
 
-pub async fn run_research(topic: &str, count: usize, output: Option<PathBuf>) -> Result<()> {
+async fn exec_prompt(model: &str, prompt: &str) -> Result<String> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("exec")
+        .arg(prompt)
+        .arg("--model")
+        .arg(model)
+        .arg("--yolo")
+        .env("OMGB_EXEC_CAPTURE", "1")
+        .stdout(Stdio::piped());
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("failed to generate patch: {stderr}");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+pub async fn run_research(
+    topic: &str,
+    count: usize,
+    model: Option<String>,
+    output: Option<PathBuf>,
+) -> Result<()> {
     let report = research(topic, count).await?;
-    if let Some(path) = output {
-        std::fs::write(&path, &report)?;
-        println!("wrote research report to {}", path.display());
-    } else {
-        println!("{report}");
+    let dir = crate::providers::omg_dir().join("research");
+    std::fs::create_dir_all(&dir)?;
+    let report_path = output.unwrap_or_else(|| dir.join(format!("{topic}.md")));
+    std::fs::write(&report_path, &report)?;
+    println!("wrote research report to {}", report_path.display());
+
+    if let Some(model) = model {
+        let prompt = format!(
+            "Given the following research report, propose a concise patch or implementation plan. Output only the patch content.\n\n{report}"
+        );
+        match exec_prompt(&model, &prompt).await {
+            Ok(patch) => {
+                let patch_path = report_path.with_extension("patch");
+                std::fs::write(&patch_path, &patch)?;
+                println!("wrote patch to {}", patch_path.display());
+            }
+            Err(e) => {
+                eprintln!("warning: could not generate patch: {e}");
+            }
+        }
     }
     Ok(())
 }

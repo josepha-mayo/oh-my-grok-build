@@ -51,31 +51,33 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 
 | Feature | Status |
 | --- | --- |
-| `oh-my-grok-build` / `omgb` binary boots and calls into upstream `xai-grok-pager` | 🚧 |
-| `omgb provider` — add BYOK providers (OpenAI, Anthropic, xAI, OpenRouter, Ollama, LM Studio, vLLM, llama.cpp, Tabby) | 🚧 |
-| `omgb provider discover` — local model discovery (Ollama/LM Studio) | 🚧 |
-| `omgb model` — switch default model, list custom models | 🚧 |
-| `omgb exec` — single-turn headless prompt | 🚧 |
-| `omgb loop` — iterate until working tree is clean | 🚧 |
-| `omgb cron` / `omgb schedule` — scheduled prompt execution | 🚧 |
-| `omgb team` — team mode with isolated git worktrees | 🚧 |
-| `omgb swarm` — parallel subagents | 🚧 |
-| `omgb subagent spawn/list/kill/logs/trace` | 🚧 |
-| `omgb research` — arXiv/web research and patch proposal | 🚧 |
-| `omgb timeline` — recent session/job events | 🚧 |
-| `omgb harness` — drive OpenCode, Codex, Claude, Hermes, Pi, OMP CLI agents | 🚧 |
-| `omgb serve` — ACP relay with QR code, secret, origin/rate checks | 🚧 |
-| `omgb connect <url>` — CLI ACP client | 🚧 |
-| `omgb use` / `omgb browser` — desktop/browser MCP control | 🚧 |
-| `omgb mcp` — memory, browser, computer MCP server management | 🚧 |
-| Taste learning (`/taste`) injected into prompts | 🚧 |
-| Slash commands in connect/TUI: `/loop`, `/schedule`, `/btw`, `/plan`, `/yolo`, `/autonomous`, `/taste`, `/use`, `/browser`, `/research` | ⏳ |
-| SSRF/private-IP/cloud-metadata URL filtering for browser, fetch, and connect | 🚧 |
-| Safe env filtering for providers/MCP (`*_API_KEY` only, block `PATH`/`LD_PRELOAD`/etc.) | 🚧 |
-| Desktop-control safety (`OMGB_ALLOW_DESKTOP_CONTROL`/`GROK_ALLOW_*` gating, key validation) | ⏳ |
+| `oh-my-grok-build` / `omgb` binary boots and calls into upstream `xai-grok-pager` | ✅ |
+| `omgb provider` — add BYOK providers (OpenAI, Anthropic, xAI, OpenRouter, Ollama, LM Studio, vLLM, llama.cpp, Tabby) | ✅ |
+| `omgb provider discover` — local model discovery (Ollama/LM Studio) | ✅ |
+| `omgb model` — switch default model, list custom models | ✅ |
+| `omgb exec` — single-turn headless prompt | ✅ |
+| `omgb loop` — iterate until working tree is clean | ✅ |
+| `omgb cron` / `omgb schedule` — scheduled prompt execution | ✅ |
+| `omgb team` — team mode with isolated git worktrees | ✅ |
+| `omgb swarm` — parallel subagents | ✅ |
+| `omgb subagent spawn/list/kill/logs/trace` | ✅ |
+| `omgb research` — arXiv/web research and patch proposal | ✅ |
+| `omgb timeline` — recent session/job events | ✅ |
+| `omgb harness` — drive OpenCode, Codex, Claude, Hermes, Pi, OMP CLI agents | ✅ |
+| `omgb serve` — ACP relay with QR code, secret, origin/rate checks | ✅ |
+| `omgb connect <url>` — CLI ACP client | ✅ |
+| `omgb use` / `omgb browser` — desktop/browser MCP control | ✅ |
+| `omgb mcp` — memory, browser, computer MCP server management | ✅ |
+| Taste learning (`/taste`) injected into prompts | ✅ |
+| Slash commands in connect/TUI: `/loop`, `/schedule`, `/btw`, `/plan`, `/yolo`, `/autonomous`, `/taste`, `/use`, `/browser`, `/research` | ✅ |
+| SSRF/private-IP/cloud-metadata URL filtering for browser, fetch, and connect | ✅ |
+| Safe env filtering for providers/MCP (`*_API_KEY` only, block `PATH`/`LD_PRELOAD`/etc.) | ✅ |
+| Desktop-control safety (`OMGB_ALLOW_DESKTOP_CONTROL` gating) | ✅ |
 | Git-native safety hooks (auto-commit per edit, review/undo helpers) | ⏳ |
-| Tests for every new crate (`cargo test`) | ⏳ |
+| Tests for every new crate (`cargo test`) | 🚧 |
 | `cargo fmt`, `cargo clippy`, `cargo test` green on CI | 🚧 |
+
+> Phase 1 features are implemented as modules inside `crates/oh-my-grok-build`; the separate `omgb-*` crates listed in the repo layout may be extracted once the harness stabilizes.
 
 ### Phase 2 — Advanced harness gaps
 
