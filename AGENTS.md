@@ -16,7 +16,7 @@ This repo is a fork of the open-source `xai-org/grok-build` harness. We are buil
 |------|---------|
 | `crates/codegen/xai-grok-*` | Upstream Grok Build Rust source. Edit sparingly, mark changes clearly. |
 | `crates/oh-my-grok-build` | Composition-root binary crate for `oh-my-grok-build` / `omgb`. |
-| `crates/omgb-*` | New Rust crates for providers, scheduler, subagents, taste, timeline, research, harness connectors, mobile relay, etc. |
+| `crates/oh-my-grok-build/src/{providers,scheduler,subagents,taste,timeline,research,harness,server}` | Phase 1 feature modules inside the composition-root crate. These will be split into standalone `crates/omgb-*` crates once they stabilize. |
 | `plugin/` | Grok Build plugin skills and slash commands (`/use`, `/browser`, `/schedule`, `/loop`, `/btw`, `/taste`, `/autonomous`, `/research`, etc.). |
 | `AGENTS.md` | This file. |
 | `FEATURES.md` | Single source of truth for features, goals, and roadmap. |
