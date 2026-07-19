@@ -47,8 +47,14 @@ export function createStdioTransport(options: StdioTransportOptions): AcpTranspo
     close() {
       if (closed) return;
       closed = true;
+      proc.stdin?.end();
       if (!proc.killed && proc.exitCode === null) {
         proc.kill("SIGTERM");
+        setTimeout(() => {
+          if (!proc.killed && proc.exitCode === null) {
+            proc.kill("SIGKILL");
+          }
+        }, 5000).unref?.();
       }
     },
   };

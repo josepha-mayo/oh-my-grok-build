@@ -1,0 +1,17 @@
+{
+  "name": "oh-my-grok-build-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "tools/oh-my-grok-build",
+    "grok-build-app"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "test": "npm run test --workspaces",
+    "format:check": "npm run format:check --workspaces",
+    "format": "npm run format --workspaces",
+    "cli": "node ./tools/oh-my-grok-build/dist/index.js"
+  }
+}

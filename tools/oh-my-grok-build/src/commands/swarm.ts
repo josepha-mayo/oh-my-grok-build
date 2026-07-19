@@ -143,7 +143,7 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
 
   // Use a unique run prefix so repeated swarms do not collide with old worktrees.
   const runId = Date.now();
-  appendTimelineEvent({ type: "swarm_start", model, workers, prompt: options.prompt, runId });
+  await appendTimelineEvent({ type: "swarm_start", model, workers, prompt: options.prompt, runId });
 
   console.log(chalk.bold(`Decomposing task into up to ${workers} subtasks with model ${chalk.cyan(model)}...`));
   const subtasks = await decomposeTask(options.prompt, workers, { model, yolo: options.yolo, cwd: options.cwd });
@@ -185,7 +185,7 @@ export async function swarmCommand(options: SwarmOptions): Promise<void> {
     outputs.push({ name, output });
   }
 
-  appendTimelineEvent({
+  await appendTimelineEvent({
     type: "swarm_stop",
     runId,
     workers: names.length,

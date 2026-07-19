@@ -21,7 +21,7 @@ export async function teamCommand(options: TeamOptions): Promise<void> {
   let count = Number.isNaN(options.count) ? 1 : options.count;
   count = Math.max(1, Math.min(20, count));
 
-  appendTimelineEvent({ type: "team_start", model, count, prompt: options.prompt });
+  await appendTimelineEvent({ type: "team_start", model, count, prompt: options.prompt });
 
   console.log(chalk.bold(`Spawning ${count} Grok worker(s) with model ${chalk.cyan(model)}...\n`));
 
@@ -45,7 +45,7 @@ export async function teamCommand(options: TeamOptions): Promise<void> {
   });
 
   const results = await Promise.all(workers);
-  appendTimelineEvent({
+  await appendTimelineEvent({
     type: "team_stop",
     count,
     results: results.map((r) => ({ index: r.index, exitCode: r.code })),

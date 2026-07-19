@@ -87,7 +87,7 @@ export class CodexConnector implements Connector {
       proc.stdout?.on("data", (d) => chunks.push(d));
       proc.stderr?.on("data", (d) => chunks.push(d));
       proc.on("error", (err) => {
-        void rm(tmpDir, { recursive: true, force: true });
+        rm(tmpDir, { recursive: true, force: true }).catch(() => {});
         reject(err);
       });
       proc.on("exit", async (code) => {
@@ -121,7 +121,7 @@ export class CodexConnector implements Connector {
           }
           resolve({ text, usage: { lastMessageFile } });
         } finally {
-          void rm(tmpDir, { recursive: true, force: true });
+          rm(tmpDir, { recursive: true, force: true }).catch(() => {});
         }
       });
     });

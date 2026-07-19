@@ -33,7 +33,7 @@ export async function cronCommand(options: CronOptions): Promise<void> {
   const name = options.name ?? (await uniqueCronName());
   validateName(name);
 
-  appendTimelineEvent({
+  await appendTimelineEvent({
     type: "cron_start",
     expression: options.expression,
     prompt: options.prompt,
@@ -71,8 +71,8 @@ export async function cronCommand(options: CronOptions): Promise<void> {
   console.log(chalk.bold(`Cron started:`), chalk.cyan(name), chalk.dim(options.expression));
   console.log(chalk.dim(`Press Ctrl+C to stop.`));
 
-  const onShutdown = () => {
-    appendTimelineEvent({ type: "cron_stop", expression: options.expression, name });
+  const onShutdown = async () => {
+    await appendTimelineEvent({ type: "cron_stop", expression: options.expression, name });
     void stopJob(name)
       .catch(() => undefined)
       .finally(() => process.exit(0));
