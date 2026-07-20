@@ -51,12 +51,19 @@ const DANGEROUS_COMMANDS = new Set([
 
 const UNANALYZABLE_COMMANDS = new Set([
   "python",
+  "python2",
   "python3",
   "perl",
   "ruby",
   "node",
+  "nodejs",
+  "deno",
+  "bun",
   "php",
   "lua",
+  "micropython",
+  "pypy",
+  "pypy3",
   "ssh",
   "scp",
   "sftp",
@@ -77,6 +84,21 @@ const UNANALYZABLE_COMMANDS = new Set([
   "awk",
   "gawk",
   "nawk",
+  "mawk",
+  "tclsh",
+  "wish",
+  "osascript",
+  "npx",
+  "busybox",
+  "docker",
+  "podman",
+  "nerdctl",
+  "buildah",
+  "crictl",
+  "unshare",
+  "nsenter",
+  "pkexec",
+  "run0",
 ]);
 
 // Characters that separate commands or redirect I/O at the shell level.
@@ -204,15 +226,131 @@ function tokenize(command) {
   return { tokens };
 }
 
+// Stems that commonly appear with a trailing version number (e.g. python3.11,
+// ksh93, node22). getBaseName normalizes these back to the canonical stem so
+// versioned interpreter aliases are still caught by the block/prefix lists.
+const NORMALIZABLE_STEMS = new Set([
+  "python",
+  "python2",
+  "python3",
+  "perl",
+  "ruby",
+  "node",
+  "nodejs",
+  "deno",
+  "bun",
+  "php",
+  "lua",
+  "micropython",
+  "pypy",
+  "pypy3",
+  "bash",
+  "sh",
+  "dash",
+  "zsh",
+  "ksh",
+  "csh",
+  "tcsh",
+  "fish",
+  "awk",
+  "gawk",
+  "nawk",
+  "mawk",
+  "tclsh",
+  "wish",
+  "osascript",
+  "busybox",
+  "docker",
+  "podman",
+  "nerdctl",
+  "buildah",
+  "crictl",
+  "unshare",
+  "nsenter",
+  "pkexec",
+  "run0",
+]);
+
+function normalizeBaseName(base) {
+  let prev;
+  do {
+    prev = base;
+    const dotMatch = base.match(/^(.*)\.\d+$/);
+    if (dotMatch && NORMALIZABLE_STEMS.has(dotMatch[1])) {
+      base = dotMatch[1];
+      continue;
+    }
+    const numMatch = base.match(/^(.*\D)(\d+(?:\.\d+)*)$/);
+    if (numMatch && numMatch[1] && NORMALIZABLE_STEMS.has(numMatch[1])) {
+      base = numMatch[1];
+      continue;
+    }
+  } while (base !== prev);
+  return base;
+}
+
+// Windows executable/script extensions that should be stripped before matching
+// dangerous/unanalyzable command lists.  This prevents format.com, node.bat,
+// python.cmd, etc. from bypassing the guard.
+const WIN_EXEC_EXTENSIONS =
+  /\.(exe|com|bat|cmd|ps1|vbs|js|wsf|msc|cpl|scr|pif)$/i;
+
 function getBaseName(cmd) {
   let s = cmd.replace(/^\s+|\s+$/g, "");
-  s = s.replace(/\.exe$/i, "");
+  s = s.replace(WIN_EXEC_EXTENSIONS, "");
   const parts = s.split(/[\/\\]/);
-  return parts[parts.length - 1]?.toLowerCase() ?? "";
+  return normalizeBaseName(parts[parts.length - 1]?.toLowerCase() ?? "");
 }
 
 function isAssignment(token) {
   return !token.quoted && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token.value);
+}
+
+// env -S/--split-string takes a command-line string, splits it by whitespace,
+// and executes the result. Reconstruct the full token list and evaluate it.
+function getEnvSplitStringArg(tokens, j) {
+  const v = tokens[j].value;
+  let value;
+  let remainingStart;
+
+  if (v === "-S" || v === "--split-string") {
+    if (j + 1 >= tokens.length) {
+      return { allowed: false, reason: "env -S/--split-string requires a command string" };
+    }
+    value = tokens[j + 1].value;
+    remainingStart = j + 2;
+  } else if (v.startsWith("--split-string=")) {
+    const eq = "--split-string=".length;
+    value = v.slice(eq);
+    if (value === "") {
+      if (j + 1 >= tokens.length) {
+        return { allowed: false, reason: "env --split-string requires a command string" };
+      }
+      value = tokens[j + 1].value;
+      remainingStart = j + 2;
+    } else {
+      remainingStart = j + 1;
+    }
+  } else if (v.startsWith("-S") && v.length > 2) {
+    value = v.slice(2);
+    remainingStart = j + 1;
+  } else {
+    return null;
+  }
+
+  const inner = tokenize(value);
+  if (inner.error) {
+    return { allowed: false, reason: inner.error };
+  }
+  const combined = inner.tokens.slice();
+  for (let k = remainingStart; k < tokens.length; k++) {
+    combined.push({ value: tokens[k].value, quoted: tokens[k].quoted });
+  }
+  return evaluateTokens(combined, 0);
+}
+
+function hasBareTilde(token) {
+  return !token.quoted && token.value.includes("~");
 }
 
 function evaluate(command) {
@@ -252,6 +390,18 @@ function evaluateTokens(tokens, start) {
 
   const cmdToken = tokens[i];
   const base = getBaseName(cmdToken.value);
+
+  // Tilde expansion is a variable-like shortcut to the user's home directory.
+  // Allow it only for rm (which has its own path-aware check) and cd (which
+  // only changes the working directory); for all other commands it can read or
+  // write files such as ~/.ssh/id_rsa.
+  if (base !== "rm" && base !== "cd") {
+    for (let k = i; k < tokens.length; k++) {
+      if (hasBareTilde(tokens[k])) {
+        return { allowed: false, reason: "Blocked tilde expansion outside quotes" };
+      }
+    }
+  }
 
   // Fork bomb pattern (classic bash form). Tokenization already blocks ; | &,
   // but the command itself may be passed as a string to bash -c.
@@ -346,7 +496,7 @@ const PREFIX_HANDLERS = {
   },
 
   env: (tokens, i) => {
-    const noArg = new Set(["-i", "-S", "-v", "--ignore-environment", "--split-string", "--debug", "--help", "--version"]);
+    const noArg = new Set(["-i", "-v", "--ignore-environment", "--debug", "--help", "--version"]);
     let j = i + 1;
     while (j < tokens.length) {
       const t = tokens[j];
@@ -367,6 +517,10 @@ const PREFIX_HANDLERS = {
       if (v.startsWith("-u") && v.length > 2) {
         j++;
         continue;
+      }
+      const split = getEnvSplitStringArg(tokens, j);
+      if (split !== null) {
+        return split;
       }
       if (noArg.has(v)) {
         j++;
@@ -466,6 +620,19 @@ const PREFIX_HANDLERS = {
 
   wsl: (tokens, i) => parseWsl(tokens, i),
 
+  // busybox is a multi-call binary: the first non-option token is the applet
+  // and the rest are its arguments. Evaluate it as that command.
+  busybox: (tokens, i) => {
+    let j = i + 1;
+    while (j < tokens.length && tokens[j].value.startsWith("-")) {
+      j++;
+    }
+    if (j >= tokens.length) {
+      return { allowed: false, reason: "Busybox applet not specified" };
+    }
+    return evaluateTokens(tokens, j);
+  },
+
   xargs: (tokens, i) => parseXargs(tokens, i),
 };
 
@@ -557,7 +724,10 @@ function parseCmd(tokens, i) {
     const v = tokens[j].value;
     if (v.toLowerCase() === "/c" || v.toLowerCase() === "/k") {
       if (j + 1 >= tokens.length) return { allowed: false, reason: "cmd missing command string" };
-      return evaluate(tokens[j + 1].value);
+      if (j + 2 === tokens.length && tokens[j + 1].quoted !== null) {
+        return evaluate(tokens[j + 1].value);
+      }
+      return evaluateTokens(tokens, j + 1);
     }
     if (v.startsWith("/") && v.length > 1) {
       j++;
@@ -569,12 +739,22 @@ function parseCmd(tokens, i) {
 }
 
 function parseWsl(tokens, i) {
-  const valueOpts = new Set(["-d", "-u", "-e", "--distribution", "--user", "--exec", "--shell", "--cd"]);
+  const valueOpts = new Set(["-d", "-u", "--distribution", "--user", "--shell", "--cd"]);
   let j = i + 1;
   while (j < tokens.length) {
     const v = tokens[j].value;
     if (v === "--") {
+      if (j + 2 === tokens.length && tokens[j + 1].quoted !== null) {
+        return evaluate(tokens[j + 1].value);
+      }
       return { allowed: true, index: j + 1 };
+    }
+    if (v === "-e" || v === "--exec") {
+      if (j + 1 >= tokens.length) return { allowed: false, reason: "wsl -e/--exec requires command" };
+      if (j + 2 === tokens.length && tokens[j + 1].quoted !== null) {
+        return evaluate(tokens[j + 1].value);
+      }
+      return evaluateTokens(tokens, j + 1);
     }
     if (valueOpts.has(v)) {
       if (j + 1 >= tokens.length) return { allowed: false, reason: "wsl option requires value" };
@@ -594,12 +774,14 @@ function parseWsl(tokens, i) {
   if (j >= tokens.length) {
     return { allowed: false, reason: "Blocked wsl without command" };
   }
+  if (j + 1 === tokens.length && tokens[j].quoted !== null) {
+    return evaluate(tokens[j].value);
+  }
   return evaluateTokens(tokens, j);
 }
 
 function parseXargs(tokens, i) {
   const valueOpts = new Set([
-    "-I",
     "-L",
     "-P",
     "-n",
@@ -607,18 +789,12 @@ function parseXargs(tokens, i) {
     "-E",
     "-a",
     "-d",
-    "-S",
-    "-e",
     "--arg-file",
     "--delimiter",
-    "--eof",
     "--max-args",
     "--max-chars",
     "--max-lines",
     "--max-procs",
-    "--replace",
-    "--show-limits",
-    "--verbose",
   ]);
   const noArg = new Set([
     "-0",
@@ -633,34 +809,92 @@ function parseXargs(tokens, i) {
     "--exit",
     "--help",
     "--version",
+    "-S",
+    "--show-limits",
+    "-e",
+    "--eof",
   ]);
   let j = i + 1;
+  let sawReplace = false;
   while (j < tokens.length) {
     const v = tokens[j].value;
     if (v === "--") {
-      return { allowed: true, index: j + 1 };
+      j++;
+      continue;
+    }
+    if (v === "-I" || v === "-i" || v === "--replace") {
+      sawReplace = true;
+      if (j + 1 >= tokens.length) return { allowed: false, reason: "xargs replacement option requires value" };
+      if (hasBareTilde(tokens[j + 1])) {
+        return { allowed: false, reason: "Blocked tilde expansion in xargs option value" };
+      }
+      j += 2;
+      continue;
+    }
+    if (v.startsWith("--replace=")) {
+      sawReplace = true;
+      const eq = v.indexOf("=");
+      if (hasBareTilde({ value: v.slice(eq + 1), quoted: null })) {
+        return { allowed: false, reason: "Blocked tilde expansion in xargs option value" };
+      }
+      j++;
+      continue;
+    }
+    if ((v.startsWith("-I") || v.startsWith("-i")) && v.length > 2) {
+      sawReplace = true;
+      j++;
+      continue;
+    }
+    if (
+      v === "-e" ||
+      v === "--eof" ||
+      (v.startsWith("-e") && v.length > 2) ||
+      v.startsWith("--eof=")
+    ) {
+      j++;
+      continue;
+    }
+    if (noArg.has(v)) {
+      j++;
+      continue;
     }
     if (valueOpts.has(v)) {
       if (j + 1 >= tokens.length) return { allowed: false, reason: "xargs option requires value" };
+      if (hasBareTilde(tokens[j + 1])) {
+        return { allowed: false, reason: "Blocked tilde expansion in xargs option value" };
+      }
       j += 2;
       continue;
     }
     if (v.startsWith("--") && v.includes("=")) {
+      const eq = v.indexOf("=");
+      if (hasBareTilde({ value: v.slice(eq + 1), quoted: null })) {
+        return { allowed: false, reason: "Blocked tilde expansion in xargs option value" };
+      }
       j++;
       continue;
     }
     if (v.startsWith("-") && v.length > 1) {
-      if (noArg.has(v)) {
-        j++;
-        continue;
-      }
       return { allowed: false, reason: "Blocked unknown xargs option" };
     }
     break;
   }
+  if (sawReplace) {
+    return { allowed: false, reason: "Blocked xargs argument replacement (-I/-i/--replace); cannot verify substituted arguments" };
+  }
   if (j >= tokens.length) {
     // xargs with no command defaults to echo; that is safe.
     return { allowed: true };
+  }
+  const cmdBase = getBaseName(tokens[j].value);
+  if (DANGEROUS_COMMANDS.has(cmdBase) || UNANALYZABLE_COMMANDS.has(cmdBase)) {
+    return { allowed: false, reason: `Blocked xargs with dangerous/unanalyzable command: ${cmdBase}` };
+  }
+  // xargs appends arbitrary arguments from stdin or a file at runtime, so only
+  // allow commands that are safe with arbitrary trailing arguments. printf is
+  // not safe because the first stdin argument becomes an unsanitized format string.
+  if (cmdBase !== "echo") {
+    return { allowed: false, reason: `Blocked xargs with unanalyzed command: ${cmdBase}` };
   }
   return evaluateTokens(tokens, j);
 }
@@ -749,10 +983,24 @@ function isDangerousRmTarget(arg) {
     return true;
   }
 
-  // Top-level absolute directories (e.g. /tmp, /etc, /var).
-  const segments = normalized.split(path.sep).filter(Boolean);
-  if (path.isAbsolute(normalized) && segments.length <= 1) {
-    return true;
+  // Windows system directory and anything inside it (C:\Windows, C:\Windows\System32, etc.).
+  const systemRoot = (process.env.SystemRoot || process.env.windir || "").trim();
+  if (systemRoot) {
+    const lowerRoot = systemRoot.toLowerCase();
+    const lowerNorm = normalized.toLowerCase();
+    if (lowerNorm === lowerRoot || lowerNorm.startsWith(lowerRoot + "\\")) {
+      return true;
+    }
+  }
+
+  // Top-level absolute directories (e.g. /tmp, /etc, /var, C:\Temp, C:\Windows).
+  // On Windows the drive letter counts as a segment, so allow one level under it.
+  // Wildcard paths are handled separately below.
+  if (!target.includes("*") && path.isAbsolute(normalized)) {
+    const segments = normalized.split(path.sep).filter(Boolean);
+    if (segments.length <= 2) {
+      return true;
+    }
   }
 
   // Paths that still contain unresolved ".." segments went above the root/CWD.
@@ -760,12 +1008,28 @@ function isDangerousRmTarget(arg) {
     return true;
   }
 
-  // Wildcards directly under root or home.
+  // Wildcards directly under root, home, a Windows drive root, or a top-level directory.
   if (target.includes("*")) {
-    const dirPart = target.split("*")[0].replace(/[\/\\]+$/, "");
+    const dirPart = target.split("*")[0];
     const normDir = path.normalize(dirPart || ".");
-    if (normDir === path.sep || normDir === "/" || normDir === "\\" || (home && normDir.toLowerCase() === home.toLowerCase())) {
+    if (
+      normDir === path.sep ||
+      normDir === "/" ||
+      normDir === "\\" ||
+      /^[A-Za-z]:[\\]?$/.test(normDir)
+    ) {
       return true;
+    }
+    const cleanDir = normDir.replace(/[\/\\]+$/, "");
+    if (home && cleanDir.toLowerCase() === home.toLowerCase()) {
+      return true;
+    }
+    const endsWithSep = /[\/\\]$/.test(dirPart);
+    if (!endsWithSep && path.isAbsolute(normDir)) {
+      const dirSegments = normDir.split(path.sep).filter(Boolean);
+      if (dirSegments.length <= 2) {
+        return true;
+      }
     }
   }
 
