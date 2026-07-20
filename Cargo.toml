@@ -118,9 +118,11 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = { version = "4" }
 colored_json = "5"
+constant_time_eq = "0.3"
 core-foundation = "0.10"
 crc32fast = "1.4"
 criterion = "0.6"
+croner = "3.0.1"
 crossbeam = "0.8"
 crossterm = "0.28"
 cryptify = "3.2"
@@ -197,6 +199,7 @@ prometheus = { version = "0.14", features = ["process"] }
 prost = "0.14"
 prost-build = "0.14"
 pulldown-cmark = "0.13"
+qrcode = { version = "0.14", default-features = false }
 quick-xml = "0.38"
 rand = "0.9"
 ratatui = { version = "0.29" }

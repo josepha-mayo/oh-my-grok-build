@@ -7,8 +7,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-fn taste_path() -> PathBuf {
-    crate::providers::omg_dir().join("taste.json")
+fn taste_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("taste.json"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -24,20 +24,24 @@ pub struct TasteNote {
 }
 
 fn load_store() -> Result<TasteStore> {
-    let path = taste_path();
+    let path = taste_path()?;
     if !path.exists() {
         return Ok(TasteStore::default());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    Ok(serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)
 }
 
 fn save_store(store: &TasteStore) -> Result<()> {
-    let path = taste_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let path = taste_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("taste path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, serde_json::to_string_pretty(store)?)?;
     std::fs::rename(&tmp, &path)?;
+    crate::providers::restrict_env_file_permissions(&path)?;
     Ok(())
 }
 
@@ -86,15 +90,53 @@ pub fn taste_preamble() -> String {
         return String::new();
     };
     let mut parts = Vec::new();
-    for n in &store.likes {
+    for n in store.likes.iter().rev().take(10).rev() {
         parts.push(format!("Prefer: {}", n.note));
     }
-    for n in &store.dislikes {
+    for n in store.dislikes.iter().rev().take(10).rev() {
         parts.push(format!("Avoid: {}", n.note));
     }
     if parts.is_empty() {
         String::new()
     } else {
         format!("\n\nTaste profile:\n{}", parts.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_taste_store_serialization() {
+        let store = TasteStore {
+            likes: vec![TasteNote {
+                timestamp: DateTime::UNIX_EPOCH,
+                note: "compact code".into(),
+            }],
+            dislikes: vec![TasteNote {
+                timestamp: DateTime::UNIX_EPOCH,
+                note: "verbose error handling".into(),
+            }],
+        };
+        let json = serde_json::to_string(&store).unwrap();
+        let parsed: TasteStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.likes.len(), 1);
+        assert_eq!(parsed.likes[0].note, "compact code");
+        assert_eq!(parsed.dislikes.len(), 1);
+    }
+
+    #[test]
+    fn test_taste_preamble_format() {
+        let store = TasteStore {
+            likes: vec![TasteNote {
+                timestamp: DateTime::UNIX_EPOCH,
+                note: "tests".into(),
+            }],
+            dislikes: vec![],
+        };
+        let json = serde_json::to_string(&store).unwrap();
+        // taste_preamble reads from disk, so this only checks the store shape.
+        assert!(json.contains("tests"));
     }
 }

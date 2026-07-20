@@ -1,20 +1,54 @@
 //! Background scheduler for `omgb`.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::str::FromStr;
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+use chrono::{DateTime, Local, Utc};
+use croner::Cron;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-fn schedule_path() -> PathBuf {
-    crate::providers::omg_dir().join("schedule.jsonl")
+fn schedule_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("schedule.jsonl"))
 }
 
-fn pid_path() -> PathBuf {
-    crate::providers::omg_dir().join("scheduler.pid")
+fn schedule_lock_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("schedule.lock"))
+}
+
+fn pid_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("scheduler.pid"))
+}
+
+/// Holds the scheduler PID file open with an exclusive `fs2` lock so only one
+/// daemon runs at a time. The lock is released when this value is dropped.
+struct PidFile {
+    _file: std::fs::File,
+}
+
+impl PidFile {
+    fn acquire() -> Result<Self> {
+        let path = pid_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        if !file.try_lock_exclusive()? {
+            bail!("scheduler daemon is already running");
+        }
+        file.set_len(0)?;
+        let mut file = file;
+        writeln!(file, "{}", std::process::id())?;
+        Ok(PidFile { _file: file })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,25 +57,51 @@ pub struct ScheduledJob {
     pub expression: String,
     pub prompt: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub yolo: bool,
     pub last_run: Option<DateTime<Utc>>,
 }
 
+/// Acquire an exclusive file lock on `schedule.lock`.
+/// The lock is released when the returned `File` is dropped.
+async fn lock_schedule() -> Result<std::fs::File> {
+    let path = schedule_lock_path()?;
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("failed to open schedule lock: {e}"))?;
+        file.lock_exclusive()
+            .map_err(|e| anyhow::anyhow!("failed to lock schedule: {e}"))?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("schedule lock task panicked: {e}"))?
+}
+
 fn load_jobs() -> Result<Vec<ScheduledJob>> {
-    let path = schedule_path();
+    let path = schedule_path()?;
     if !path.exists() {
         return Ok(Vec::new());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(raw
-        .lines()
+    raw.lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect())
+        .map(|l| serde_json::from_str(l).map_err(|e| anyhow::anyhow!("{path}: {e}: {l}")))
+        .collect()
 }
 
 fn save_jobs(jobs: &[ScheduledJob]) -> Result<()> {
-    let path = schedule_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let path = schedule_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("schedule path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension(format!("jsonl.tmp.{}", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
     for job in jobs {
@@ -52,85 +112,148 @@ fn save_jobs(jobs: &[ScheduledJob]) -> Result<()> {
     Ok(())
 }
 
-pub fn list_jobs() -> Result<()> {
-    let jobs = load_jobs()?;
-    if jobs.is_empty() {
-        println!("No scheduled jobs.");
-        return Ok(());
-    }
-    for job in jobs {
-        println!("{}: '{}' ({})", job.name, job.prompt, job.expression);
-    }
-    Ok(())
+async fn with_jobs<F, R>(mut f: F) -> Result<R>
+where
+    F: FnMut(&mut Vec<ScheduledJob>) -> Result<R>,
+{
+    let _lock = lock_schedule().await?;
+    let mut jobs = load_jobs()?;
+    let result = f(&mut jobs)?;
+    save_jobs(&jobs)?;
+    Ok(result)
 }
 
-pub fn add_job(
+async fn with_jobs_read<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&[ScheduledJob]) -> Result<R>,
+{
+    let _lock = lock_schedule().await?;
+    let jobs = load_jobs()?;
+    f(&jobs)
+}
+
+pub async fn list_jobs() -> Result<()> {
+    with_jobs_read(|jobs| {
+        if jobs.is_empty() {
+            println!("No scheduled jobs.");
+            return Ok(());
+        }
+        for job in jobs {
+            println!("{}: '{}' ({})", job.name, job.prompt, job.expression);
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub async fn add_job(
     name: Option<String>,
     expression: &str,
     prompt: &str,
     model: Option<String>,
+    yolo: bool,
 ) -> Result<()> {
-    if parse_interval(expression).is_none() && parse_cron(expression).is_err() {
+    if parse_interval(expression).is_none() && Cron::from_str(expression).is_err() {
         bail!("invalid schedule expression: {expression}");
     }
     let name = name.unwrap_or_else(|| format!("job-{}", Utc::now().timestamp_millis()));
-    let mut jobs = load_jobs()?;
-    jobs.retain(|j| j.name != name);
-    jobs.push(ScheduledJob {
-        name: name.clone(),
-        expression: expression.into(),
-        prompt: prompt.into(),
-        model,
-        last_run: None,
-    });
-    save_jobs(&jobs)?;
-    println!("scheduled job '{name}'");
-    Ok(())
+    with_jobs(|jobs| {
+        jobs.retain(|j| j.name != name);
+        jobs.push(ScheduledJob {
+            name: name.clone(),
+            expression: expression.into(),
+            prompt: prompt.into(),
+            model,
+            yolo,
+            last_run: None,
+        });
+        println!("scheduled job '{name}'");
+        Ok(())
+    })
+    .await
 }
 
-pub fn delete_job(name: &str) -> Result<()> {
-    let mut jobs = load_jobs()?;
-    let before = jobs.len();
-    jobs.retain(|j| j.name != name);
-    if jobs.len() == before {
-        bail!("job '{name}' not found");
-    }
-    save_jobs(&jobs)?;
-    println!("deleted job '{name}'");
-    Ok(())
+pub async fn delete_job(name: &str) -> Result<()> {
+    with_jobs(|jobs| {
+        let before = jobs.len();
+        jobs.retain(|j| j.name != name);
+        if jobs.len() == before {
+            bail!("job '{name}' not found");
+        }
+        println!("deleted job '{name}'");
+        Ok(())
+    })
+    .await
 }
 
-pub async fn run_job(name: &str) -> Result<()> {
-    let jobs = load_jobs()?;
-    let job = jobs
-        .iter()
-        .find(|j| j.name == name)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("job '{name}' not found"))?;
-
+pub async fn run_job(name: &str, capture: bool) -> Result<()> {
+    let job = {
+        let _lock = lock_schedule().await?;
+        let mut jobs = load_jobs()?;
+        let idx = jobs
+            .iter()
+            .position(|j| j.name == name)
+            .ok_or_else(|| anyhow::anyhow!("job '{name}' not found"))?;
+        jobs[idx].last_run = Some(Utc::now());
+        save_jobs(&jobs)?;
+        jobs[idx].clone()
+    };
     let exe = std::env::current_exe()?.to_string_lossy().to_string();
+    let prompt_file = crate::write_prompt_temp(&job.prompt).await?;
+
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("exec")
-        .arg(&job.prompt)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .stdin(Stdio::null());
+    if job.yolo {
+        cmd.arg("--yolo");
+    }
     if let Some(model) = &job.model {
         cmd.arg("--model").arg(model);
     }
-    let status = cmd.status().await?;
-    if !status.success() {
-        bail!(
-            "job '{name}' exited with status {}",
-            status.code().unwrap_or(-1)
-        );
-    }
 
-    let mut jobs = load_jobs()?;
-    if let Some(j) = jobs.iter_mut().find(|j| j.name == name) {
-        j.last_run = Some(Utc::now());
-    }
-    save_jobs(&jobs)?;
-    Ok(())
+    let result = if capture {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn()?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let log_path = crate::providers::omg_dir()?.join("scheduler.log");
+        let mut log = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await?;
+        let mut log2 = log.try_clone().await?;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stdout, &mut log).await;
+        });
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stderr, &mut log2).await;
+        });
+        let status = child.wait().await?;
+        if !status.success() {
+            Err(anyhow::anyhow!(
+                "job '{name}' exited with status {}",
+                status.code().unwrap_or(-1)
+            ))
+        } else {
+            Ok(())
+        }
+    } else {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        let status = cmd.status().await?;
+        if !status.success() {
+            Err(anyhow::anyhow!(
+                "job '{name}' exited with status {}",
+                status.code().unwrap_or(-1)
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let _ = tokio::fs::remove_file(&prompt_file).await;
+    result
 }
 
 #[cfg(unix)]
@@ -144,13 +267,20 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
     let Ok(output) = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .output()
     else {
         return false;
     };
+    let pid_s = pid.to_string();
     let text = String::from_utf8_lossy(&output.stdout);
-    text.contains(&pid.to_string())
+    text.lines().any(|line| {
+        let mut parts = line.split("\",\"");
+        let Some(pid_field) = parts.nth(1) else {
+            return false;
+        };
+        pid_field.trim_matches('"') == pid_s
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -158,40 +288,65 @@ fn process_alive(_pid: u32) -> bool {
     true
 }
 
+pub async fn spawn_daemon() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("schedule")
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
+    }
+    cmd.spawn()?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let path = pid_path()?;
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(pid) = raw.trim().parse::<u32>() {
+            if process_alive(pid) {
+                println!("scheduler daemon started (pid {pid})");
+                return Ok(());
+            }
+        }
+    }
+    bail!("scheduler daemon failed to start")
+}
+
 pub async fn run_daemon_loop() -> Result<()> {
-    std::fs::create_dir_all(crate::providers::omg_dir())?;
-    let pid = std::process::id();
-    std::fs::write(pid_path(), pid.to_string())?;
+    let _pid_file = PidFile::acquire()?;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        let jobs = match load_jobs() {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-        for job in jobs {
-            if is_due(&job) {
-                let _ = run_job(&job.name).await;
-                let mut jobs = match load_jobs() {
-                    Ok(j) => j,
-                    Err(_) => continue,
-                };
-                if let Some(j) = jobs.iter_mut().find(|j| j.name == job.name) {
-                    j.last_run = Some(Utc::now());
+        let due_jobs: Result<Vec<ScheduledJob>> =
+            with_jobs_read(|jobs| Ok(jobs.iter().filter(|j| is_due(j)).cloned().collect())).await;
+        match due_jobs {
+            Ok(jobs) => {
+                let mut set = tokio::task::JoinSet::new();
+                for job in jobs {
+                    set.spawn(async move { run_job(&job.name, true).await });
                 }
-                let _ = save_jobs(&jobs);
+                while let Some(res) = set.join_next().await {
+                    if let Ok(Err(_)) = res {
+                        // Job output is captured in ~/.omgb/scheduler.log.
+                    }
+                }
             }
+            Err(_) => {}
         }
     }
 }
 
 pub fn stop_daemon() -> Result<()> {
-    let raw = std::fs::read_to_string(pid_path()).unwrap_or_default();
+    let path = pid_path()?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("failed to read scheduler pid file: {e}"))?;
     let pid = raw
         .trim()
         .parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("no scheduler pid"))?;
+        .map_err(|_| anyhow::anyhow!("scheduler pid file does not contain a valid pid"))?;
     if !process_alive(pid) {
-        let _ = std::fs::remove_file(pid_path());
+        let _ = std::fs::remove_file(&path);
         println!("scheduler is not running");
         return Ok(());
     }
@@ -213,18 +368,26 @@ pub fn stop_daemon() -> Result<()> {
 }
 
 fn is_due(job: &ScheduledJob) -> bool {
-    let now = Local::now();
-    let mut due = false;
-
     if let Some(secs) = parse_interval(&job.expression) {
-        due = job
+        return job
             .last_run
             .map(|t| (Utc::now() - t).num_seconds() >= secs as i64)
             .unwrap_or(true);
-    } else if let Ok(fields) = parse_cron(&job.expression) {
-        due = cron_matches(&fields, now);
     }
-    due
+
+    let Ok(cron) = Cron::from_str(&job.expression) else {
+        return false;
+    };
+
+    let now = Local::now();
+    if let Some(last) = job.last_run {
+        match cron.find_next_occurrence(&last.with_timezone(&Local), false) {
+            Ok(next) => now >= next,
+            Err(_) => false,
+        }
+    } else {
+        true
+    }
 }
 
 fn parse_interval(expr: &str) -> Option<u64> {
@@ -232,99 +395,42 @@ fn parse_interval(expr: &str) -> Option<u64> {
     if expr.is_empty() {
         return None;
     }
-    let num: String = expr
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let unit: String = expr
-        .chars()
-        .skip_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let n: f64 = num.parse().ok()?;
-    let multiplier = match unit.as_str() {
-        "s" | "sec" | "secs" | "second" | "seconds" => 1,
-        "m" | "min" | "mins" | "minute" | "minutes" => 60,
-        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
-        "d" | "day" | "days" => 24 * 60 * 60,
-        _ => return None,
-    };
-    Some((n * multiplier as f64) as u64)
-}
-
-fn parse_cron(expr: &str) -> Result<Vec<Vec<String>>> {
-    let parts: Vec<&str> = expr.split_whitespace().collect();
-    if parts.len() != 5 {
-        bail!("cron expression must have 5 fields");
-    }
-    Ok(parts
-        .into_iter()
-        .map(|p| p.split(',').map(|s| s.to_string()).collect())
-        .collect())
-}
-
-fn cron_matches(fields: &[Vec<String>], now: Local) -> bool {
-    let minute = now.minute();
-    let hour = now.hour();
-    let day = now.day();
-    let month = now.month();
-    let weekday = now.weekday().num_days_from_sunday();
-
-    matches_field(&fields[0], minute as u32, 0, 59)
-        && matches_field(&fields[1], hour as u32, 0, 23)
-        && matches_field(&fields[2], day as u32, 1, 31)
-        && matches_field(&fields[3], month as u32, 1, 12)
-        && matches_field(&fields[4], weekday as u32, 0, 7)
-}
-
-fn matches_field(parts: &[String], value: u32, min: u32, max: u32) -> bool {
-    parts.iter().any(|p| field_matches(value, p, min, max))
-}
-
-fn field_matches(value: u32, token: &str, min: u32, max: u32) -> bool {
-    let token = token.trim();
-    if token == "*" {
-        return true;
-    }
-
-    if let Some(suffix) = token.strip_prefix("*/") {
-        if let Ok(step) = suffix.parse::<u32>() {
-            if step > 0 && value >= min && value <= max {
-                return (value - min) % step == 0;
-            }
+    let mut total: f64 = 0.0;
+    let mut s = expr;
+    while !s.is_empty() {
+        let num_end = s
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(s.len());
+        let num = s[..num_end].parse::<f64>().ok()?;
+        s = s[num_end..].trim_start();
+        let unit_end = s
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(s.len());
+        if unit_end == 0 {
+            return None;
         }
-        return false;
+        let unit = s[..unit_end].to_ascii_lowercase();
+        let multiplier = match unit.as_str() {
+            "s" | "sec" | "secs" | "second" | "seconds" => 1,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+            "d" | "day" | "days" => 24 * 60 * 60,
+            _ => return None,
+        };
+        total += num * multiplier as f64;
+        s = s[unit_end..].trim_start();
     }
-
-    if let Some((range, step_str)) = token.split_once('/') {
-        let step = step_str.trim().parse::<u32>().unwrap_or(1);
-        if step == 0 {
-            return false;
-        }
-        if let Some((start, end)) = range.split_once('-') {
-            if let (Ok(s), Ok(e)) = (start.trim().parse::<u32>(), end.trim().parse::<u32>()) {
-                let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-                let lo = lo.clamp(min, max);
-                let hi = hi.clamp(min, max);
-                return value >= lo && value <= hi && (value - lo) % step == 0;
-            }
-        }
-        return false;
+    let secs = total as u64;
+    if secs == 0 {
+        return None;
     }
-
-    if let Some((start, end)) = token.split_once('-') {
-        if let (Ok(s), Ok(e)) = (start.trim().parse::<u32>(), end.trim().parse::<u32>()) {
-            let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-            return value >= lo && value <= hi;
-        }
-        return false;
-    }
-
-    token.parse::<u32>().is_ok_and(|n| n == value)
+    Some(secs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeDelta;
 
     #[test]
     fn test_parse_interval() {
@@ -332,21 +438,54 @@ mod tests {
         assert_eq!(parse_interval("5m"), Some(300));
         assert_eq!(parse_interval("2h"), Some(7200));
         assert_eq!(parse_interval("1d"), Some(86400));
+        assert_eq!(parse_interval("1h30m"), Some(5400));
+        assert_eq!(parse_interval(" 90 M "), Some(5400));
         assert_eq!(parse_interval("foo"), None);
     }
 
     #[test]
-    fn test_parse_cron() {
-        let fields = parse_cron("0 9 * * *").unwrap();
-        assert_eq!(fields.len(), 5);
-        assert_eq!(fields[0], vec!["0"]);
-        assert_eq!(fields[1], vec!["9"]);
+    fn test_cron_parsing() {
+        assert!(Cron::from_str("0 9 * * *").is_ok());
+        assert!(Cron::from_str("* * * * *").is_ok());
+        assert!(Cron::from_str("invalid").is_err());
     }
 
     #[test]
-    fn test_matches_field() {
-        assert!(matches_field(&["*".to_string()], 42, 0, 59));
-        assert!(matches_field(&["5".to_string()], 5, 0, 59));
-        assert!(!matches_field(&["5".to_string()], 6, 0, 59));
+    fn test_cron_next_occurrence() {
+        let cron = Cron::from_str("0 0 1 * *").unwrap();
+        let start = Local.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap();
+        let next = cron.find_next_occurrence(&start, false).unwrap();
+        assert!(next > start);
+        assert_eq!(next.day(), 1);
+    }
+
+    #[test]
+    fn test_is_due_interval() {
+        let mut job = ScheduledJob {
+            name: "t".into(),
+            expression: "60s".into(),
+            prompt: "".into(),
+            model: None,
+            yolo: false,
+            last_run: Some(Utc::now() - TimeDelta::seconds(90)),
+        };
+        assert!(is_due(&job));
+        job.last_run = Some(Utc::now() - TimeDelta::seconds(30));
+        assert!(!is_due(&job));
+        job.last_run = None;
+        assert!(is_due(&job));
+    }
+
+    #[test]
+    fn test_is_due_cron_never_run() {
+        let job = ScheduledJob {
+            name: "t".into(),
+            expression: "* * * * *".into(),
+            prompt: "".into(),
+            model: None,
+            yolo: false,
+            last_run: None,
+        };
+        assert!(is_due(&job));
     }
 }

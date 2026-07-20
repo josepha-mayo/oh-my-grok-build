@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -70,6 +70,12 @@ pub enum OmgbCommand {
     Mcp(xai_grok_pager::mcp_cmd::McpArgs),
     /// Remember a coding-style preference
     Taste(TasteArgs),
+    /// Commit the current working tree
+    Commit(CommitArgs),
+    /// Review current changes (git status + diff)
+    Review,
+    /// Undo the last omgb commit
+    Undo(UndoArgs),
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -82,15 +88,23 @@ pub struct TuiArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct ExecArgs {
-    pub prompt: String,
+    pub prompt: Option<String>,
     #[arg(short, long)]
     pub model: Option<String>,
+    #[arg(long, value_name = "FILE")]
+    pub prompt_file: Option<PathBuf>,
     #[arg(long)]
     pub yolo: bool,
     #[arg(long)]
     pub json: bool,
     #[arg(long)]
     pub output_file: Option<PathBuf>,
+    /// Commit changes after the prompt finishes
+    #[arg(long)]
+    pub commit: bool,
+    /// Stage and commit untracked files as well
+    #[arg(long)]
+    pub commit_untracked: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -102,6 +116,12 @@ pub struct LoopArgs {
     pub max_iterations: u32,
     #[arg(long)]
     pub yolo: bool,
+    /// Commit changes after the loop finishes (required for auto-commit)
+    #[arg(long)]
+    pub commit: bool,
+    /// Stage and commit untracked files as well as tracked changes
+    #[arg(long)]
+    pub commit_untracked: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -149,15 +169,21 @@ pub struct AddProviderArgs {
     /// Base URL
     #[arg(long)]
     pub base_url: Option<String>,
-    /// API backend
-    #[arg(long, value_enum, default_value = "chat-completions")]
-    pub backend: ApiBackend,
-    /// API key (will be written to ~/.omgb/.env)
+    /// API backend (defaults to chat-completions for custom providers)
+    #[arg(long, value_enum)]
+    pub backend: Option<ApiBackend>,
+    /// API key value to store (also reads OMGB_API_KEY env var if omitted)
     #[arg(long, env = "OMGB_API_KEY")]
     pub api_key: Option<String>,
-    /// Environment variable name holding the key
+    /// Environment variable name(s) to read the key from at runtime (defaults to OMGB_<id>_API_KEY, plus the canonical env var for built-in templates)
     #[arg(long)]
     pub env_key: Option<String>,
+    /// Context window in tokens for this model
+    #[arg(long)]
+    pub context_window: Option<u64>,
+    /// Auto-compact threshold percent (0-100); defaults to 80 for BYOK/local models
+    #[arg(long)]
+    pub auto_compact_threshold_percent: Option<u8>,
     /// Default for this provider
     #[arg(long)]
     pub default: bool,
@@ -197,6 +223,9 @@ pub struct CronArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub name: Option<String>,
+    /// Run the job in yolo (non-interactive) mode
+    #[arg(long)]
+    pub yolo: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -219,6 +248,9 @@ pub enum ScheduleCommand {
     Start,
     /// Stop the persistent scheduler daemon
     Stop,
+    /// Internal hidden command that runs the scheduler loop in the spawned daemon.
+    #[command(hide = true)]
+    Daemon,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -252,7 +284,12 @@ pub struct SubagentArgs {
 #[derive(Debug, Subcommand, Clone)]
 pub enum SubagentCommand {
     /// Spawn a subagent with a prompt
-    Spawn { prompt: String },
+    Spawn {
+        prompt: String,
+        /// Run the subagent in yolo (non-interactive) mode
+        #[arg(long)]
+        yolo: bool,
+    },
     /// List running subagents
     List,
     /// Kill a subagent by pid/name
@@ -301,8 +338,19 @@ pub enum HarnessCommand {
         url: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
+        /// API key / secret value to store (also reads OMGB_API_KEY env var if omitted)
+        #[arg(long, env = "OMGB_API_KEY")]
+        api_key: Option<String>,
+        /// Environment variable name to expose the connector secret as in the child process
+        /// (defaults to a per-type value such as OPENAI_API_KEY for codex).
         #[arg(long)]
-        secret: Option<String>,
+        secret_env_key: Option<String>,
+        /// Allow the connector URL to point to loopback/localhost
+        #[arg(long)]
+        allow_local: bool,
+        /// Allow the connector URL to point to private/LAN addresses
+        #[arg(long)]
+        allow_private: bool,
     },
     /// List connectors
     List,
@@ -339,12 +387,26 @@ impl HarnessType {
 pub struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:2419")]
     pub bind: SocketAddr,
+    /// Host/IP to advertise in the QR pairing URL (defaults to a non-loopback local IP when binding 0.0.0.0/::)
+    #[arg(long)]
+    pub advertise_host: Option<IpAddr>,
     #[arg(long, env = "OMGB_AGENT_SECRET")]
     pub secret: Option<String>,
     #[arg(short, long)]
     pub model: Option<String>,
     #[arg(long)]
     pub yolo: bool,
+    /// Comma-separated allowed Origin header values for WebSocket clients.
+    /// Use `*` to allow any origin. If unset, no origin check is performed.
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_origins: Vec<String>,
+    /// Maximum WebSocket upgrade requests per minute per IP. 0 disables rate limiting.
+    #[arg(long)]
+    pub rate_limit: Option<u32>,
+    /// Allow binding to a non-loopback address. Traffic will be unencrypted;
+    /// use --allowed-origins to restrict client origins.
+    #[arg(long)]
+    pub insecure_allow_lan: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -352,8 +414,9 @@ pub struct ConnectArgs {
     pub url: String,
     #[arg(long, env = "OMGB_AGENT_SECRET")]
     pub secret: Option<String>,
-    #[arg(short, long)]
-    pub model: Option<String>,
+    /// Allow connecting to private/LAN WebSocket targets
+    #[arg(long)]
+    pub allow_private: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -374,6 +437,12 @@ pub struct BrowserArgs {
     pub yolo: bool,
     #[arg(long)]
     pub url: Option<String>,
+    /// Allow the starting URL to point to loopback/localhost
+    #[arg(long)]
+    pub allow_local: bool,
+    /// Allow the starting URL to point to private/LAN addresses
+    #[arg(long)]
+    pub allow_private: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -390,4 +459,21 @@ pub enum TasteCommand {
     Dislike { note: String },
     /// List stored taste notes
     List,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct CommitArgs {
+    /// Commit message (defaults to "omgb commit")
+    #[arg(short, long)]
+    pub message: Option<String>,
+    /// Stage and commit untracked files as well as tracked changes
+    #[arg(long)]
+    pub untracked: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct UndoArgs {
+    /// Hard reset, discarding working tree changes
+    #[arg(long)]
+    pub hard: bool,
 }

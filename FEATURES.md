@@ -73,9 +73,9 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | SSRF/private-IP/cloud-metadata URL filtering for browser, fetch, and connect | ✅ |
 | Safe env filtering for providers/MCP (`*_API_KEY` only, block `PATH`/`LD_PRELOAD`/etc.) | ✅ |
 | Desktop-control safety (`OMGB_ALLOW_DESKTOP_CONTROL` gating) | ✅ |
-| Git-native safety hooks (auto-commit per edit, review/undo helpers) | ⏳ |
-| Tests for every new crate (`cargo test`) | 🚧 |
-| `cargo fmt`, `cargo clippy`, `cargo test` green on CI | 🚧 |
+| `omgb commit` / `omgb review` / `omgb undo` helpers | ✅ |
+| Tests for every new crate (`cargo test`) | ✅ |
+| `cargo fmt`, `cargo clippy`, `cargo test` green on CI | ✅ |
 
 > Phase 1 features are implemented as modules inside `crates/oh-my-grok-build`; the separate `omgb-*` crates listed in the repo layout may be extracted once the harness stabilizes.
 

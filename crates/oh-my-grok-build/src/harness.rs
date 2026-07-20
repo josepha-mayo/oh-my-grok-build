@@ -11,8 +11,8 @@ use tokio::io::AsyncReadExt;
 use crate::args::HarnessType;
 use crate::taste::taste_preamble;
 
-fn registry_path() -> PathBuf {
-    crate::providers::omg_dir().join("connectors.json")
+fn registry_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("connectors.json"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -33,34 +33,79 @@ pub struct ConnectorConfig {
     pub cwd: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_env_key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_local: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_private: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn validate_cwd(cwd: &std::path::Path) -> Result<()> {
+    if !cwd.is_absolute() {
+        bail!("connector cwd must be an absolute path");
+    }
+    for comp in cwd.components() {
+        if !matches!(
+            comp,
+            std::path::Component::Normal(_)
+                | std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+        ) {
+            bail!("connector cwd contains disallowed component: {comp:?}");
+        }
+    }
+    if !cwd.exists() || !cwd.is_dir() {
+        bail!(
+            "connector cwd does not exist or is not a directory: {}",
+            cwd.display()
+        );
+    }
+    Ok(())
 }
 
 fn load_registry() -> Result<ConnectorRegistry> {
-    let path = registry_path();
+    let path = registry_path()?;
     if !path.exists() {
         return Ok(ConnectorRegistry::default());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    Ok(serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)
 }
 
 fn save_registry(registry: &ConnectorRegistry) -> Result<()> {
-    let path = registry_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let path = registry_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("registry path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     std::fs::write(&tmp, serde_json::to_string_pretty(registry)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
+fn default_secret_env_key(r#type: &str) -> Option<&'static str> {
+    match r#type {
+        "codex" | "opencode" => Some("OPENAI_API_KEY"),
+        "claude" => Some("ANTHROPIC_API_KEY"),
+        "hermes" => Some("HERMES_API_KEY"),
+        "pi" => Some("PI_API_KEY"),
+        "omp" => Some("OMP_API_KEY"),
+        _ => None,
+    }
+}
+
 fn default_command(r#type: &str) -> Option<String> {
     match r#type {
         "codex" => Some("codex exec --json {prompt}".into()),
-        "claude" => Some("claude -p {prompt}".into()),
         "opencode" => Some("opencode run {prompt}".into()),
-        "hermes" => Some("hermes run {prompt}".into()),
-        "pi" => Some("pi run {prompt}".into()),
-        "omp" => Some("omp run {prompt}".into()),
+        "claude" => Some("claude {prompt}".into()),
+        "hermes" => Some("hermes {prompt}".into()),
+        "pi" => Some("pi {prompt}".into()),
+        "omp" => Some("omp {prompt}".into()),
         _ => None,
     }
 }
@@ -68,26 +113,50 @@ fn default_command(r#type: &str) -> Option<String> {
 pub fn add_connector(
     name: String,
     r#type: HarnessType,
-    command: Option<String>,
+    mut command: Option<String>,
     url: Option<String>,
     cwd: Option<PathBuf>,
-    secret: Option<String>,
+    api_key: Option<String>,
+    secret_env_key: Option<String>,
+    allow_local: bool,
+    allow_private: bool,
 ) -> Result<()> {
     if name.is_empty()
         || !name
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        bail!("invalid connector name");
+        bail!("invalid connector name: must be ASCII alphanumeric, '_' or '-'");
     }
     let type_str = r#type.as_str().to_string();
-    let command = command.or_else(|| default_command(&type_str));
+    if command.is_some() && url.is_some() {
+        bail!("connector cannot have both --command and --url");
+    }
+    if command.is_none() && url.is_none() {
+        command = default_command(&type_str);
+    }
+    if command.is_none() && url.is_none() {
+        bail!("connector requires --command or --url");
+    }
     let mut registry = load_registry()?;
 
-    let secret_env_key = secret
-        .as_ref()
-        .map(|s| crate::providers::write_api_key(&name, None, s))
-        .transpose()?;
+    let child_key = secret_env_key
+        .clone()
+        .or_else(|| default_secret_env_key(&type_str).map(|s| s.to_string()));
+    if let Some(ref key) = child_key {
+        if !crate::providers::is_valid_env_key(key) {
+            bail!(
+                "secret-env-key must end with _API_KEY and contain only uppercase A-Z, 0-9, and underscores"
+            );
+        }
+    }
+
+    if let Some(key) = api_key {
+        if !key.is_empty() {
+            let storage = crate::providers::env_var_name(&name);
+            crate::providers::write_api_key(&name, Some(std::slice::from_ref(&storage)), &key)?;
+        }
+    }
 
     registry.connectors.insert(
         name.clone(),
@@ -97,7 +166,9 @@ pub fn add_connector(
             command,
             url,
             cwd,
-            secret_env_key,
+            secret_env_key: child_key,
+            allow_local,
+            allow_private,
         },
     );
     save_registry(&registry)
@@ -111,13 +182,9 @@ pub fn remove_connector(name: &str) -> Result<()> {
     let mut registry = load_registry()?;
     let cfg = registry.connectors.remove(name);
     save_registry(&registry)?;
-    if let Some(cfg) = cfg {
-        if let Some(ref key) = cfg.secret_env_key {
-            let keys = vec![key.clone()];
-            let _ = crate::providers::remove_api_key(name, Some(keys.as_slice()));
-        } else {
-            let _ = crate::providers::remove_api_key(name, None);
-        }
+    if cfg.is_some() {
+        let storage = crate::providers::env_var_name(name);
+        crate::providers::remove_api_key(name, true, Some(std::slice::from_ref(&storage)))?;
     }
     Ok(())
 }
@@ -140,13 +207,27 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("connector has no command"))?;
 
     let prompt = format!("{}{}", prompt, taste_preamble());
-    let mut parts: Vec<String> = shlex::split(command)
+    let placeholder = "{prompt}";
+    let mut found = false;
+    let parts: Vec<String> = shlex::split(command)
         .ok_or_else(|| anyhow::anyhow!("invalid connector command quoting"))?
         .into_iter()
-        .map(|s| s.replace("{prompt}", &prompt))
-        .collect();
+        .map(|s| {
+            if s == placeholder {
+                found = true;
+                Ok(prompt.clone())
+            } else if s.contains(placeholder) {
+                bail!("{placeholder} must be a standalone argument in the connector command")
+            } else {
+                Ok(s)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     if parts.is_empty() {
         bail!("empty connector command");
+    }
+    if !found {
+        bail!("connector command must contain {placeholder}");
     }
 
     let mut cmd = tokio::process::Command::new(&parts[0]);
@@ -155,17 +236,28 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(cwd) = &cfg.cwd {
+        validate_cwd(cwd)?;
         cmd.current_dir(cwd);
     }
-    if let Some(ref key) = cfg.secret_env_key {
-        if let Some(value) = crate::providers::resolve_env_key(key) {
-            cmd.env(key, value);
+    let storage = crate::providers::env_var_name(name);
+    if let Some(ref child_key) = cfg.secret_env_key {
+        if !crate::providers::is_valid_env_key(child_key) {
+            bail!("connector secret_env_key is invalid");
+        }
+        if let Some(value) = crate::providers::resolve_env_key(&storage)? {
+            cmd.env(child_key, value);
         }
     }
 
     let mut child = cmd.spawn()?;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("connector stdout was not piped"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("connector stderr was not piped"))?;
     let mut out = String::new();
     let mut err = String::new();
     let (read_out, read_err) =
@@ -193,19 +285,39 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
 
 async fn run_http_connector(cfg: &ConnectorConfig, url: &str, prompt: &str) -> Result<()> {
     use crate::net::{http_post_json, validate_url};
-    let url = validate_url(url, false).await?;
+    let url = validate_url(url, cfg.allow_local, cfg.allow_private).await?;
     let mut headers = std::collections::HashMap::new();
-    if let Some(ref key) = cfg.secret_env_key {
-        if let Some(secret) = crate::providers::resolve_env_key(key) {
-            headers.insert("Authorization".into(), format!("Bearer {secret}"));
-        }
+    let storage = crate::providers::env_var_name(&cfg.name);
+    if let Some(secret) = crate::providers::resolve_env_key(&storage)? {
+        headers.insert("Authorization".into(), format!("Bearer {secret}"));
     }
     let body = serde_json::json!({ "prompt": format!("{}{}", prompt, taste_preamble()) });
     let (status, text) =
-        http_post_json(&url, headers, body, std::time::Duration::from_secs(120)).await?;
+        http_post_json(&url, &headers, body, std::time::Duration::from_secs(120)).await?;
     if status != 200 {
         bail!("connector HTTP {status}: {text}");
     }
     println!("{text}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_connector_rejects_non_ascii_name() {
+        let r = add_connector(
+            "héllo".into(),
+            HarnessType::Codex,
+            Some("codex exec --json {prompt}".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(r.is_err(), "non-ASCII connector name should be rejected");
+    }
 }
