@@ -8,22 +8,30 @@ default-run = "oh-my-grok-build"
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+constant_time_eq = { workspace = true }
 dirs = { workspace = true }
+fs2 = { workspace = true }
+gethostname = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 shlex = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tokio-util = { workspace = true }
 toml = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
-qrcode = { version = "0.14", default-features = false }
+quick-xml = { workspace = true }
+qrcode = { workspace = true }
+scraper = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 xai-crash-handler = { path = "../codegen/xai-crash-handler" }
 xai-grok-pager = { path = "../codegen/xai-grok-pager" }
@@ -33,6 +41,7 @@ xai-grok-telemetry = { path = "../codegen/xai-grok-telemetry" }
 xai-grok-tools = { path = "../codegen/xai-grok-tools" }
 xai-grok-update = { path = "../codegen/xai-grok-update" }
 xai-grok-version = { path = "../codegen/xai-grok-version" }
+croner = { workspace = true }
 
 [lints]
 workspace = true

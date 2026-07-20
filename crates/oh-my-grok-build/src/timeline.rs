@@ -7,8 +7,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-fn timeline_path() -> PathBuf {
-    crate::providers::omg_dir().join("timeline.jsonl")
+fn timeline_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("timeline.jsonl"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,8 +24,11 @@ pub fn add_event(
     message: impl Into<String>,
     data: Option<serde_json::Value>,
 ) -> Result<()> {
-    let path = timeline_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let path = timeline_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("timeline path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
     let event = TimelineEvent {
         timestamp: Utc::now(),
         category: category.into(),
@@ -38,11 +41,13 @@ pub fn add_event(
         .append(true)
         .open(&path)?;
     writeln!(file, "{line}")?;
+    drop(file);
+    crate::providers::restrict_env_file_permissions(&path)?;
     Ok(())
 }
 
 pub fn list_events(limit: usize, json: bool) -> Result<()> {
-    let path = timeline_path();
+    let path = timeline_path()?;
     if !path.exists() {
         return Ok(());
     }
@@ -69,4 +74,24 @@ pub fn list_events(limit: usize, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timeline_event_serialization() {
+        let event = TimelineEvent {
+            timestamp: DateTime::UNIX_EPOCH,
+            category: "test".into(),
+            message: "message".into(),
+            data: Some(serde_json::json!({"k": "v"})),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: TimelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.category, "test");
+        assert_eq!(parsed.message, "message");
+        assert!(parsed.data.is_some());
+    }
 }

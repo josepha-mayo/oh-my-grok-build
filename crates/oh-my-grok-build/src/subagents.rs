@@ -7,14 +7,13 @@ use std::process::Stdio;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 
-fn subagents_path() -> PathBuf {
-    crate::providers::omg_dir().join("subagents.jsonl")
+fn subagents_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("subagents.jsonl"))
 }
 
-fn logs_dir() -> PathBuf {
-    crate::providers::omg_dir().join("subagent-logs")
+fn logs_dir() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("subagent-logs"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,21 +26,23 @@ pub struct SubagentRecord {
 }
 
 fn load_records() -> Result<Vec<SubagentRecord>> {
-    let path = subagents_path();
+    let path = subagents_path()?;
     if !path.exists() {
         return Ok(Vec::new());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(raw
-        .lines()
+    raw.lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect())
+        .map(|l| serde_json::from_str(l).map_err(|e| anyhow::anyhow!("{path}: {e}: {l}")))
+        .collect()
 }
 
 fn append_record(record: &SubagentRecord) -> Result<()> {
-    let path = subagents_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let path = subagents_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("subagents path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
     let line = serde_json::to_string(record)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -64,7 +65,7 @@ fn log_path(id: &str, ext: &str) -> Result<PathBuf> {
     if !is_safe_id(id) {
         bail!("invalid subagent id '{id}'");
     }
-    Ok(logs_dir().join(format!("{id}.{ext}")))
+    Ok(logs_dir()?.join(format!("{id}.{ext}")))
 }
 
 #[cfg(unix)]
@@ -78,13 +79,20 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
     let Ok(output) = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .output()
     else {
         return false;
     };
+    let pid_s = pid.to_string();
     let text = String::from_utf8_lossy(&output.stdout);
-    text.contains(&pid.to_string())
+    text.lines().any(|line| {
+        let mut parts = line.split("\",\"");
+        let Some(pid_field) = parts.nth(1) else {
+            return false;
+        };
+        pid_field.trim_matches('"') == pid_s
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -92,7 +100,7 @@ fn process_alive(_pid: u32) -> bool {
     true
 }
 
-pub async fn spawn(prompt: &str) -> Result<()> {
+pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
     let exe = std::env::current_exe()?.to_string_lossy().to_string();
     let id = format!(
         "sub-{}-{}",
@@ -101,36 +109,31 @@ pub async fn spawn(prompt: &str) -> Result<()> {
     );
     let out_path = log_path(&id, "out")?;
     let err_path = log_path(&id, "err")?;
-    std::fs::create_dir_all(&logs_dir())?;
+    std::fs::create_dir_all(&logs_dir()?)?;
 
+    let prompt_file = crate::write_prompt_temp(prompt).await?;
+    let out_file = std::fs::File::create(&out_path)?;
+    let err_file = std::fs::File::create(&err_path)?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("exec")
-        .arg(prompt)
+        .arg("--prompt-file")
+        .arg(&prompt_file)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file));
+    if yolo {
+        cmd.arg("--yolo");
+    }
 
     let mut child = cmd.spawn()?;
     let pid = child
         .id()
         .ok_or_else(|| anyhow::anyhow!("could not get subagent pid"))?;
 
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let mut out_file = tokio::fs::File::create(&out_path).await?;
-    let mut err_file = tokio::fs::File::create(&err_path).await?;
-
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut stdout, &mut out_file).await;
-        let _ = out_file.flush().await;
-    });
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut stderr, &mut err_file).await;
-        let _ = err_file.flush().await;
-    });
     tokio::spawn(async move {
         let mut child = child;
         let _ = child.wait().await;
+        let _ = tokio::fs::remove_file(&prompt_file).await;
     });
 
     let record = SubagentRecord {
@@ -138,7 +141,10 @@ pub async fn spawn(prompt: &str) -> Result<()> {
         pid,
         prompt: prompt.to_string(),
         started_at: Utc::now(),
-        command: format!("{exe} exec <prompt>"),
+        command: format!(
+            "{exe} exec --prompt-file <prompt>{}",
+            if yolo { " --yolo" } else { "" }
+        ),
     };
     append_record(&record)?;
     println!("spawned subagent {id} (pid {pid})");
@@ -221,4 +227,20 @@ pub async fn trace(id: &str) -> Result<()> {
         print!("{}", tokio::fs::read_to_string(&err).await?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_id() {
+        assert!(is_safe_id("sub-123-456"));
+        assert!(is_safe_id("a.b_c"));
+        assert!(!is_safe_id(""));
+        assert!(!is_safe_id("."));
+        assert!(!is_safe_id(".."));
+        assert!(!is_safe_id("foo/bar"));
+        assert!(!is_safe_id("foo\\bar"));
+    }
 }

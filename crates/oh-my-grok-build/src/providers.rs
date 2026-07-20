@@ -1,6 +1,6 @@
 //! BYOK and local-model provider management for `omgb`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -8,23 +8,34 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::args::{AddProviderArgs, ApiBackend, DiscoverArgs};
-use crate::net::{http_get_text, http_post_json, validate_url};
+use crate::net::{http_get_text, http_post_json, is_url_host_private, validate_url};
+use url::Url;
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LMSTUDIO_URL: &str = "http://localhost:1234/v1";
+const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
-pub fn omg_dir() -> PathBuf {
-    std::env::var("OMGB_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".omgb"))
+#[derive(Debug, Clone)]
+pub struct ModelListEntry {
+    pub id: String,
+    pub context_window: Option<u64>,
 }
 
-fn omg_config_path() -> PathBuf {
-    omg_dir().join("config.json")
+pub fn omg_dir() -> Result<PathBuf> {
+    if let Ok(v) = std::env::var("OMGB_HOME") {
+        return Ok(PathBuf::from(v));
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".omgb"))
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory; set OMGB_HOME"))
 }
 
-fn omg_env_path() -> PathBuf {
-    omg_dir().join(".env")
+fn omg_config_path() -> Result<PathBuf> {
+    Ok(omg_dir()?.join("config.json"))
+}
+
+fn omg_env_path() -> Result<PathBuf> {
+    Ok(omg_dir()?.join(".env"))
 }
 
 fn grok_home() -> PathBuf {
@@ -64,6 +75,8 @@ pub struct ProviderConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_compact_threshold_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
@@ -72,129 +85,350 @@ pub struct ProviderConfig {
 }
 
 pub fn load_omg_config() -> Result<OmgConfig> {
-    let path = omg_config_path();
+    let path = omg_config_path()?;
     if !path.exists() {
         return Ok(OmgConfig::default());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    Ok(serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)
 }
 
 pub fn save_omg_config(config: &OmgConfig) -> Result<()> {
-    let dir = omg_dir();
+    let dir = omg_dir()?;
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("config.json.tmp.{}", std::process::id()));
     std::fs::write(&tmp, serde_json::to_string_pretty(config)?)?;
-    std::fs::rename(&tmp, omg_config_path())?;
+    std::fs::rename(&tmp, omg_config_path()?)?;
     Ok(())
 }
 
-fn load_env_file() -> HashMap<String, String> {
-    let path = omg_env_path();
-    let mut map = HashMap::new();
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once('=') {
-                map.insert(k.trim().to_string(), v.trim().to_string());
+pub(crate) fn load_env_file() -> Result<HashMap<String, String>> {
+    let path = omg_env_path()?;
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    Ok(parse_env_entries(&raw).into_iter().collect())
+}
+
+/// Returns the set of `*_API_KEY` environment variable names that are
+/// referenced by configured providers or connectors. Only these keys are
+/// loaded into the process environment at startup.
+pub(crate) fn env_keys_to_load() -> HashSet<String> {
+    let mut keys = HashSet::new();
+    if let Ok(cfg) = load_omg_config() {
+        for p in cfg.providers.values() {
+            for k in valid_env_keys(p) {
+                keys.insert(k);
             }
         }
     }
-    map
+    if let Ok(dir) = omg_dir() {
+        let connectors_path = dir.join("connectors.json");
+        if let Ok(raw) = std::fs::read_to_string(&connectors_path) {
+            if let Ok(registry) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&raw) {
+                for (name, value) in registry {
+                    keys.insert(env_var_name(&name));
+                    if let Some(secret) = value
+                        .get("secret_env_key")
+                        .and_then(|v| v.as_str())
+                        .filter(|k| is_valid_env_key(k))
+                    {
+                        keys.insert(secret.to_string());
+                    }
+                }
+            }
+        }
+    }
+    keys
 }
 
-fn env_var_name(provider_id: &str) -> String {
+fn parse_env_entries(raw: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let line = trimmed
+            .strip_prefix("export ")
+            .unwrap_or(trimmed)
+            .trim_start();
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim().to_string();
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            out.push((key, parse_env_value(v.trim())));
+        }
+    }
+    out
+}
+
+fn parse_env_value(raw: &str) -> String {
+    if let Some(s) = raw.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '"' {
+                break;
+            }
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(match next {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '\\' => '\\',
+                        '"' => '"',
+                        '\'' => '\'',
+                        other => other,
+                    });
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else if let Some(s) = raw.strip_prefix('\'') {
+        s.split('\'').next().unwrap_or(s).to_string()
+    } else {
+        raw.trim().to_string()
+    }
+}
+
+fn format_env_value(value: &str) -> String {
+    let needs_quote = value.is_empty()
+        || value.chars().any(|c| {
+            c.is_whitespace() || c == '=' || c == '"' || c == '\\' || c == '#' || c == '\''
+        });
+    if !needs_quote {
+        return value.to_string();
+    }
+    let mut out = String::from('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn write_env_entries(entries: &[(String, String)]) -> Result<()> {
+    let path = omg_env_path()?;
+    let dir = omg_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let mut content = String::new();
+    for (k, v) in entries {
+        content.push_str(&format!("{}={}\n", k, format_env_value(v)));
+    }
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, &path)?;
+    restrict_env_file_permissions(&path)
+}
+
+pub(crate) fn restrict_env_file_permissions(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(user) = std::env::var("USERNAME") {
+            let _ = std::process::Command::new("icacls")
+                .arg(path)
+                .arg("/inheritance:r")
+                .status();
+            let _ = std::process::Command::new("icacls")
+                .arg(path)
+                .arg("/grant:r")
+                .arg(format!("{}:F", user))
+                .status();
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn env_var_name(provider_id: &str) -> String {
     format!(
         "OMGB_{}_API_KEY",
         provider_id.replace('-', "_").to_uppercase()
     )
 }
 
+fn provider_env_keys(provider_id: &str, canonical: Option<&str>) -> Option<Vec<String>> {
+    let storage = env_var_name(provider_id);
+    let mut keys = vec![storage];
+    if let Some(c) = canonical {
+        let c = c.to_string();
+        if !keys.contains(&c) {
+            keys.push(c);
+        }
+    }
+    Some(keys)
+}
+
+pub(crate) fn is_valid_env_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.ends_with("_API_KEY")
+        && key
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn is_url_host_loopback(raw: &str) -> bool {
+    crate::net::is_url_host_loopback(raw)
+}
+
+fn is_ollama_url(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    url.port() == Some(11434) && crate::net::is_url_host_loopback(raw)
+}
+
 fn api_key_target_var(provider_id: &str, env_keys: Option<&[String]>) -> String {
     env_keys
-        .and_then(|keys| keys.iter().find(|k| k.ends_with("_API_KEY")).cloned())
+        .and_then(|keys| keys.iter().find(|k| is_valid_env_key(k)).cloned())
         .unwrap_or_else(|| env_var_name(provider_id))
 }
 
 pub fn write_api_key(provider_id: &str, env_keys: Option<&[String]>, key: &str) -> Result<String> {
     let target = api_key_target_var(provider_id, env_keys);
-    let legacy = env_var_name(provider_id);
-    let dir = omg_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = omg_env_path();
-    let prefixes: Vec<String> = if target == legacy {
-        vec![format!("{target}=")]
-    } else {
-        vec![format!("{target}="), format!("{legacy}=")]
-    };
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !prefixes.iter().any(|p| l.trim().starts_with(p)))
-        .map(|l| l.to_string())
-        .collect();
-    lines.push(format!("{target}={key}"));
-    std::fs::write(&path, lines.join("\n") + "\n")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    if !is_valid_env_key(&target) {
+        bail!("refusing to write API key for invalid env var {target}");
     }
+    let legacy = env_var_name(provider_id);
+    let path = omg_env_path()?;
+    let mut entries = if path.exists() {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+        parse_env_entries(&raw)
+    } else {
+        Vec::new()
+    };
+    entries.retain(|(k, _)| *k != target && (target == legacy || *k != legacy));
+    entries.push((target.clone(), key.to_string()));
+    write_env_entries(&entries)?;
     Ok(target)
 }
 
-pub fn remove_api_key(provider_id: &str, env_keys: Option<&[String]>) -> Result<()> {
-    let path = omg_env_path();
-    if !path.exists() {
-        return Ok(());
-    }
-    let target = api_key_target_var(provider_id, env_keys);
-    let legacy = env_var_name(provider_id);
-    let prefixes: Vec<String> = if target == legacy {
-        vec![format!("{target}=")]
-    } else {
-        vec![format!("{target}="), format!("{legacy}=")]
-    };
-    let raw = std::fs::read_to_string(&path)?;
-    let lines: Vec<String> = raw
-        .lines()
-        .filter(|l| !prefixes.iter().any(|p| l.trim().starts_with(p)))
-        .map(|l| l.to_string())
-        .collect();
-    let content = lines.join("\n").trim_end().to_string();
-    std::fs::write(
-        &path,
-        if content.is_empty() {
-            content
-        } else {
-            content + "\n"
-        },
-    )?;
-    Ok(())
-}
-
-pub fn resolve_api_key(provider: &ProviderConfig) -> Option<String> {
-    let keys: Vec<String> = provider.env_key.clone().unwrap_or_else(|| {
-        if provider.id.starts_with("ollama")
-            || provider.id.starts_with("lmstudio")
-            || provider.id.starts_with("local-")
-        {
-            vec!["OPENAI_API_KEY".to_string()]
-        } else {
-            vec![env_var_name(&provider.id)]
-        }
-    });
-    for k in &keys {
-        if let Ok(v) = std::env::var(k) {
-            if !v.is_empty() {
-                return Some(v);
+fn is_env_key_referenced(
+    target: &str,
+    exclude_provider: Option<&str>,
+    exclude_connector: Option<&str>,
+) -> Result<bool> {
+    if let Ok(cfg) = load_omg_config() {
+        for (id, p) in &cfg.providers {
+            if exclude_provider == Some(id.as_str()) {
+                continue;
+            }
+            if p.env_key
+                .as_ref()
+                .map_or(false, |keys| keys.contains(target))
+            {
+                return Ok(true);
             }
         }
     }
-    let dotenv = load_env_file();
+    let connectors_path = omg_dir()?.join("connectors.json");
+    if let Ok(raw) = std::fs::read_to_string(&connectors_path) {
+        if let Ok(registry) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&raw) {
+            for (name, value) in registry {
+                if exclude_connector == Some(name.as_str()) {
+                    continue;
+                }
+                if env_var_name(&name) == target {
+                    return Ok(true);
+                }
+                if value
+                    .get("secret_env_key")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| v == target)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub fn remove_api_key(name: &str, is_connector: bool, env_keys: Option<&[String]>) -> Result<()> {
+    let path = omg_env_path()?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let storage = env_var_name(name);
+    let mut keys: Vec<String> = env_keys
+        .map(|v| v.iter().filter(|k| is_valid_env_key(k)).cloned().collect())
+        .unwrap_or_default();
+    if !keys.contains(&storage) {
+        keys.insert(0, storage);
+    }
+    keys.dedup();
+    let (exclude_provider, exclude_connector) = if is_connector {
+        (None, Some(name))
+    } else {
+        (Some(name), None)
+    };
+    let mut entries = parse_env_entries(&std::fs::read_to_string(&path)?);
+    let mut retained = Vec::new();
+    for (k, v) in entries {
+        if keys.contains(&k) && is_env_key_referenced(&k, exclude_provider, exclude_connector)? {
+            retained.push((k, v));
+        } else if !keys.contains(&k) {
+            retained.push((k, v));
+        }
+    }
+    write_env_entries(&retained)?;
+    Ok(())
+}
+
+fn valid_env_keys(provider: &ProviderConfig) -> Vec<String> {
+    let mut keys: Vec<_> = provider
+        .env_key
+        .as_ref()
+        .map(|keys| {
+            keys.iter()
+                .filter(|k| is_valid_env_key(k))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let storage = env_var_name(&provider.id);
+    if !keys.contains(&storage) {
+        keys.push(storage);
+    }
+    if keys.is_empty() {
+        vec![env_var_name(&provider.id)]
+    } else {
+        keys
+    }
+}
+
+fn resolve_api_key_with_maps(
+    provider: &ProviderConfig,
+    env: &HashMap<String, String>,
+    dotenv: &HashMap<String, String>,
+) -> Option<String> {
+    let keys = valid_env_keys(provider);
+    for k in &keys {
+        if let Some(v) = env.get(k) {
+            if !v.is_empty() {
+                return Some(v.clone());
+            }
+        }
+    }
     for k in &keys {
         if let Some(v) = dotenv.get(k) {
             if !v.is_empty() {
@@ -205,14 +439,23 @@ pub fn resolve_api_key(provider: &ProviderConfig) -> Option<String> {
     None
 }
 
-pub fn resolve_env_key(key: &str) -> Option<String> {
+pub fn resolve_api_key(provider: &ProviderConfig) -> Result<Option<String>> {
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let dotenv = load_env_file()?;
+    Ok(resolve_api_key_with_maps(provider, &env, &dotenv))
+}
+
+pub fn resolve_env_key(key: &str) -> Result<Option<String>> {
+    if !is_valid_env_key(key) {
+        return Ok(None);
+    }
     if let Ok(v) = std::env::var(key) {
         if !v.is_empty() {
-            return Some(v);
+            return Ok(Some(v));
         }
     }
-    let dotenv = load_env_file();
-    dotenv.get(key).filter(|v| !v.is_empty()).cloned()
+    let dotenv = load_env_file()?;
+    Ok(dotenv.get(key).filter(|v| !v.is_empty()).cloned())
 }
 
 pub fn list_providers() -> Result<Vec<ProviderConfig>> {
@@ -232,7 +475,11 @@ pub fn remove_provider(id: &str) -> Result<()> {
         cfg.default_model = None;
     }
     save_omg_config(&cfg)?;
-    remove_api_key(id, provider.as_ref().and_then(|p| p.env_key.as_deref()))?;
+    remove_api_key(
+        id,
+        false,
+        provider.as_ref().and_then(|p| p.env_key.as_deref()),
+    )?;
     remove_provider_from_grok_config(id)?;
     Ok(())
 }
@@ -245,9 +492,10 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: "gpt-4o".into(),
             base_url: "https://api.openai.com/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            env_key: provider_env_keys(id, Some("OPENAI_API_KEY")),
             extra_headers: None,
-            context_window: Some(200_000),
+            context_window: Some(128_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -258,12 +506,13 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: "claude-3-5-sonnet-20241022".into(),
             base_url: "https://api.anthropic.com/v1".into(),
             api_backend: Some("messages".into()),
-            env_key: Some(vec!["ANTHROPIC_API_KEY".into()]),
+            env_key: provider_env_keys(id, Some("ANTHROPIC_API_KEY")),
             extra_headers: Some(HashMap::from([(
                 "anthropic-version".into(),
                 "2023-06-01".into(),
             )])),
             context_window: Some(200_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -274,9 +523,10 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: "grok-4.5".into(),
             base_url: "https://api.x.ai/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["XAI_API_KEY".into()]),
+            env_key: provider_env_keys(id, Some("XAI_API_KEY")),
             extra_headers: None,
             context_window: Some(500_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -287,12 +537,13 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: "anthropic/claude-3.5-sonnet".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OPENROUTER_API_KEY".into()]),
+            env_key: provider_env_keys(id, Some("OPENROUTER_API_KEY")),
             extra_headers: Some(HashMap::from([
                 ("HTTP-Referer".into(), "https://oh-my-grok.build".into()),
                 ("X-Title".into(), "oh-my-grok-build".into()),
             ])),
             context_window: Some(200_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -303,9 +554,10 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: "codellama".into(),
             base_url: DEFAULT_OLLAMA_URL.into(),
             api_backend: Some("chat_completions".into()),
-            env_key: None,
+            env_key: provider_env_keys(id, None),
             extra_headers: None,
             context_window: Some(128_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -316,9 +568,10 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: "local-model".into(),
             base_url: DEFAULT_LMSTUDIO_URL.into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["LMSTUDIO_API_KEY".into(), "OPENAI_API_KEY".into()]),
+            env_key: provider_env_keys(id, Some("LMSTUDIO_API_KEY")),
             extra_headers: None,
             context_window: Some(128_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -329,9 +582,10 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: String::new(),
             base_url: "http://localhost:8000/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OMGB_VLLM_API_KEY".into()]),
+            env_key: provider_env_keys(id, Some("OMGB_VLLM_API_KEY")),
             extra_headers: None,
             context_window: Some(128_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -342,9 +596,10 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: String::new(),
             base_url: "http://localhost:8080/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OMGB_LLAMA_CPP_API_KEY".into()]),
+            env_key: provider_env_keys(id, Some("OMGB_LLAMA_CPP_API_KEY")),
             extra_headers: None,
             context_window: Some(128_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -355,9 +610,10 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             model: String::new(),
             base_url: "http://localhost:5000/v1".into(),
             api_backend: Some("chat_completions".into()),
-            env_key: Some(vec!["OMGB_TABBY_API_KEY".into()]),
+            env_key: provider_env_keys(id, Some("OMGB_TABBY_API_KEY")),
             extra_headers: None,
             context_window: Some(128_000),
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -366,7 +622,7 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
     }
 }
 
-pub fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
+pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
     let id = sanitize_provider_id(&args.id);
     if id.is_empty() {
         bail!("provider id is required");
@@ -388,10 +644,16 @@ pub fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--model is required"))?,
             base_url,
-            api_backend: Some(args.backend.as_str().into()),
+            api_backend: Some(
+                args.backend
+                    .as_ref()
+                    .map(|b| b.as_str().into())
+                    .unwrap_or_else(|| "chat_completions".into()),
+            ),
             env_key: None,
             extra_headers: None,
             context_window: None,
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
@@ -408,16 +670,76 @@ pub fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
         provider.base_url = base_url.clone();
     }
     if let Some(env_key) = &args.env_key {
+        if !is_valid_env_key(env_key) {
+            bail!(
+                "--env-key must end with _API_KEY and contain only uppercase A-Z, 0-9, and underscores"
+            );
+        }
         provider.env_key = Some(vec![env_key.clone()]);
     }
+    if let Some(cw) = args.context_window {
+        provider.context_window = Some(cw);
+    }
+    if let Some(th) = args.auto_compact_threshold_percent {
+        provider.auto_compact_threshold_percent = Some(th.clamp(0, 100));
+    }
     provider.id = id.clone();
-    provider.api_backend = Some(args.backend.as_str().into());
+    if provider.model.trim().is_empty() {
+        bail!("--model is required for provider '{id}'");
+    }
+    if let Some(backend) = &args.backend {
+        provider.api_backend = Some(backend.as_str().into());
+    }
 
-    if let Some(key) = &args.api_key {
-        let target = write_api_key(&id, provider.env_key.as_deref(), key)?;
-        if provider.env_key.is_none() {
-            provider.env_key = Some(vec![target]);
+    // Always prepend the provider-specific storage key so writes never clobber a shared canonical key.
+    let storage = env_var_name(&id);
+    let mut env_keys = provider.env_key.take().unwrap_or_default();
+    if !env_keys.iter().any(|k| k == &storage) {
+        env_keys.insert(0, storage);
+    }
+    provider.env_key = Some(env_keys);
+
+    if let Some(key) = args.api_key.as_deref() {
+        if !key.is_empty() {
+            let target = write_api_key(&id, provider.env_key.as_deref(), key)?;
+            if provider.env_key.is_none() {
+                provider.env_key = Some(vec![target]);
+            }
         }
+    }
+
+    if provider.context_window.is_none() {
+        let api_key = resolve_api_key(&provider)?;
+        let backend = provider
+            .api_backend
+            .as_deref()
+            .unwrap_or("chat_completions");
+        let extra = provider.extra_headers.clone().unwrap_or_default();
+        let allow_local = provider.id.starts_with("ollama")
+            || provider.id.starts_with("lmstudio")
+            || provider.id.starts_with("local-")
+            || is_url_host_loopback(&provider.base_url);
+        let allow_private = is_url_host_private(&provider.base_url).await;
+        // Reject insecure public HTTP before the provider is saved.
+        let _ = validate_url(&provider.base_url, allow_local, allow_private).await?;
+        let is_ollama = provider.id == "ollama" || is_ollama_url(&provider.base_url);
+        let cw = fetch_model_context_window(
+            &provider.base_url,
+            api_key.as_deref(),
+            backend,
+            &extra,
+            allow_local,
+            allow_private,
+            is_ollama,
+            &provider.model,
+        )
+        .await;
+        provider.context_window = cw
+            .or_else(|| fallback_context_window(&provider.model))
+            .or(Some(DEFAULT_CONTEXT_WINDOW));
+    }
+    if provider.auto_compact_threshold_percent.is_none() {
+        provider.auto_compact_threshold_percent = Some(80);
     }
 
     if args.default || cfg.default_model.is_none() {
@@ -451,8 +773,10 @@ pub fn set_default_provider(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn sync_provider_to_grok_config(provider: &ProviderConfig) -> Result<()> {
-    let mut gcfg = load_grok_config_table()?;
+fn apply_provider_to_grok_table(
+    provider: &ProviderConfig,
+    gcfg: &mut toml::map::Map<String, toml::Value>,
+) {
     let model_key = format!("omgb-{}", provider.id);
 
     let mut section = toml::map::Map::new();
@@ -466,8 +790,20 @@ fn sync_provider_to_grok_config(provider: &ProviderConfig) -> Result<()> {
         section.insert("api_backend".into(), toml::Value::String(backend.clone()));
     }
     if let Some(keys) = &provider.env_key {
-        if !keys.is_empty() {
-            section.insert("env_key".into(), toml::Value::String(keys[0].clone()));
+        let valid: Vec<_> = keys
+            .iter()
+            .filter(|k| is_valid_env_key(k))
+            .cloned()
+            .collect();
+        if !valid.is_empty() {
+            if valid.len() == 1 {
+                section.insert("env_key".into(), toml::Value::String(valid[0].clone()));
+            } else {
+                section.insert(
+                    "env_key".into(),
+                    toml::Value::Array(valid.into_iter().map(toml::Value::String).collect()),
+                );
+            }
         }
     }
     if let Some(headers) = &provider.extra_headers {
@@ -480,23 +816,36 @@ fn sync_provider_to_grok_config(provider: &ProviderConfig) -> Result<()> {
     if let Some(cw) = provider.context_window {
         section.insert("context_window".into(), toml::Value::Integer(cw as i64));
     }
+    if let Some(th) = provider.auto_compact_threshold_percent {
+        section.insert(
+            "auto_compact_threshold_percent".into(),
+            toml::Value::Integer(th as i64),
+        );
+    }
 
     let model = gcfg
         .entry("model")
         .or_insert(toml::Value::Table(toml::map::Map::new()));
     if let toml::Value::Table(m) = model {
-        m.insert(model_key.clone(), toml::Value::Table(section));
+        m.insert(model_key, toml::Value::Table(section));
     }
+}
 
+fn set_grok_default_if_unset(gcfg: &mut toml::map::Map<String, toml::Value>, model_key: &str) {
     let models = gcfg
         .entry("models")
         .or_insert(toml::Value::Table(toml::map::Map::new()));
     if let toml::Value::Table(m) = models {
         if !m.contains_key("default") {
-            m.insert("default".into(), toml::Value::String(model_key));
+            m.insert("default".into(), toml::Value::String(model_key.into()));
         }
     }
+}
 
+fn sync_provider_to_grok_config(provider: &ProviderConfig) -> Result<()> {
+    let mut gcfg = load_grok_config_table()?;
+    apply_provider_to_grok_table(provider, &mut gcfg);
+    set_grok_default_if_unset(&mut gcfg, &format!("omgb-{}", provider.id));
     save_grok_config_table(&gcfg)?;
     Ok(())
 }
@@ -540,63 +889,122 @@ fn load_grok_config_table() -> Result<toml::map::Map<String, toml::Value>> {
 
 fn save_grok_config_table(table: &toml::map::Map<String, toml::Value>) -> Result<()> {
     let path = grok_config_path();
-    std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("grok config path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
     let raw = toml::to_string_pretty(&toml::Value::Table(table.clone()))?;
-    std::fs::write(&path, raw)?;
+    let tmp = parent.join(format!("config.toml.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, raw)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
-pub async fn discover_local_models(args: &DiscoverArgs) -> Result<Vec<(String, Vec<String>)>> {
+pub async fn discover_local_models(
+    args: &DiscoverArgs,
+) -> Result<Vec<(String, String, Vec<ModelListEntry>)>> {
     let mut out = Vec::new();
     let ollama = args.ollama_url.as_deref().unwrap_or(DEFAULT_OLLAMA_URL);
     let lmstudio = args.lmstudio_url.as_deref().unwrap_or(DEFAULT_LMSTUDIO_URL);
 
-    if let Some(models) =
-        fetch_model_list(ollama, None, "chat_completions", &HashMap::new(), true).await
+    if let Some(models) = fetch_model_list(
+        ollama,
+        None,
+        "chat_completions",
+        &HashMap::new(),
+        true,
+        true,
+    )
+    .await
     {
         if !models.is_empty() {
-            out.push(("ollama".into(), models));
+            out.push(("ollama".into(), ollama.into(), models));
         }
     }
-    if let Some(models) =
-        fetch_model_list(lmstudio, None, "chat_completions", &HashMap::new(), true).await
+    if let Some(models) = fetch_model_list(
+        lmstudio,
+        None,
+        "chat_completions",
+        &HashMap::new(),
+        true,
+        true,
+    )
+    .await
     {
         if !models.is_empty() {
-            out.push(("lmstudio".into(), models));
+            out.push(("lmstudio".into(), lmstudio.into(), models));
         }
     }
     Ok(out)
 }
 
-pub fn add_discovered_providers(discovered: &[(String, Vec<String>)]) -> Result<()> {
+pub fn add_discovered_providers(
+    discovered: &[(String, String, Vec<ModelListEntry>)],
+) -> Result<()> {
     let mut cfg = load_omg_config()?;
-    for (provider, models) in discovered {
-        if models.is_empty() {
-            continue;
+    let mut first_id: Option<String> = None;
+    for (provider, base_url, models) in discovered {
+        for model in models {
+            let model_id = sanitize_provider_id(&model.id);
+            let id = format!("{provider}-{model_id}");
+            let config = ProviderConfig {
+                id: id.clone(),
+                name: format!("{provider} {model_id} (local)"),
+                model: model.id.clone(),
+                base_url: base_url.into(),
+                api_backend: Some("chat_completions".into()),
+                env_key: provider_env_keys(&id, Some(provider.as_str())),
+                extra_headers: None,
+                context_window: Some(model.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)),
+                auto_compact_threshold_percent: Some(80),
+                temperature: None,
+                top_p: None,
+                max_completion_tokens: None,
+            };
+            cfg.providers.insert(id.clone(), config);
+            if first_id.is_none() {
+                first_id = Some(id);
+            }
         }
-        let base_url = match provider.as_str() {
-            "ollama" => DEFAULT_OLLAMA_URL,
-            _ => DEFAULT_LMSTUDIO_URL,
-        };
-        let id = provider.clone();
-        let config = ProviderConfig {
-            id: id.clone(),
-            name: format!("{provider} (local)"),
-            model: models[0].clone(),
-            base_url: base_url.into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: None,
-            extra_headers: None,
-            context_window: Some(128_000),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        };
-        cfg.providers.insert(id, config.clone());
-        sync_provider_to_grok_config(&config)?;
+    }
+    if cfg.default_model.is_none() {
+        if let Some(id) = first_id {
+            cfg.default_model = Some(format!("omgb-{id}"));
+        }
     }
     save_omg_config(&cfg)?;
+
+    let mut gcfg = load_grok_config_table()?;
+    for p in cfg.providers.values() {
+        apply_provider_to_grok_table(p, &mut gcfg);
+    }
+    if let Some(default) = cfg.default_model.as_deref() {
+        set_grok_default_if_unset(&mut gcfg, default);
+    }
+    save_grok_config_table(&gcfg)?;
     Ok(())
+}
+
+fn extract_context_window(value: &serde_json::Value) -> Option<u64> {
+    fn is_context_key(k: &str) -> bool {
+        k == "context_length"
+            || k == "context_window"
+            || k.ends_with(".context_length")
+            || k.ends_with(".context_window")
+    }
+
+    value
+        .get("context_length")
+        .or_else(|| value.get("context_window"))
+        .or_else(|| value.get("max_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            value.get("model_info").and_then(|mi| {
+                mi.as_object()
+                    .and_then(|obj| obj.iter().find(|(k, _)| is_context_key(k)).map(|(_, v)| v))
+                    .and_then(|v| v.as_u64())
+            })
+        })
 }
 
 async fn fetch_model_list(
@@ -605,9 +1013,10 @@ async fn fetch_model_list(
     backend: &str,
     extra_headers: &HashMap<String, String>,
     allow_local: bool,
-) -> Option<Vec<String>> {
+    allow_private: bool,
+) -> Option<Vec<ModelListEntry>> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let url = validate_url(&url, allow_local).await.ok()?;
+    let url = validate_url(&url, allow_local, allow_private).await.ok()?;
 
     let mut headers = extra_headers.clone();
     if let Some(key) = api_key {
@@ -618,19 +1027,116 @@ async fn fetch_model_list(
         }
     }
 
-    let text = http_get_text(&url, Duration::from_secs(10)).await.ok()?;
+    let text = http_get_text(&url, Some(&headers), Duration::from_secs(10))
+        .await
+        .ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    json.get("data")?
-        .as_array()?
-        .iter()
-        .filter_map(|m| m.get("id")?.as_str().map(|s| s.to_string()))
-        .collect::<Vec<_>>()
-        .into()
+    Some(
+        json.get("data")?
+            .as_array()?
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("id")?.as_str()?.to_string();
+                let context_window = extract_context_window(m);
+                Some(ModelListEntry { id, context_window })
+            })
+            .collect(),
+    )
+}
+
+/// Convert an OpenAI-compatible Ollama base URL (e.g. `http://host:11434/v1`)
+/// into the corresponding `/api/show` endpoint. The trailing `/v1` path segment
+/// (with or without a trailing slash) is removed; any other path prefix is
+/// preserved.
+fn ollama_show_url(base_url: &str) -> Option<String> {
+    let mut url = Url::parse(base_url).ok()?;
+    let mut segs: Vec<String> = url
+        .path_segments()?
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if segs.last().map_or(false, |s| s == "v1") {
+        segs.pop();
+    }
+    segs.push("api".into());
+    segs.push("show".into());
+    let mut ps = url.path_segments_mut().ok()?;
+    ps.clear();
+    for s in &segs {
+        ps.push(s);
+    }
+    drop(ps);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+async fn fetch_model_context_window(
+    base_url: &str,
+    api_key: Option<&str>,
+    backend: &str,
+    extra_headers: &HashMap<String, String>,
+    allow_local: bool,
+    allow_private: bool,
+    is_ollama: bool,
+    model: &str,
+) -> Option<u64> {
+    let models = fetch_model_list(
+        base_url,
+        api_key,
+        backend,
+        extra_headers,
+        allow_local,
+        allow_private,
+    )
+    .await?;
+    let entry = models.iter().find(|m| m.id == model);
+    if let Some(cw) = entry.and_then(|m| m.context_window) {
+        return Some(cw);
+    }
+    if is_ollama {
+        let show_url = ollama_show_url(base_url)?;
+        let vurl = validate_url(&show_url, allow_local, allow_private)
+            .await
+            .ok()?;
+        let mut headers = extra_headers.clone();
+        if let Some(key) = api_key {
+            headers.insert("Authorization".into(), format!("Bearer {key}"));
+        }
+        let body = serde_json::json!({"name": model});
+        let (_, text) = http_post_json(&vurl, &headers, body, Duration::from_secs(10))
+            .await
+            .ok()?;
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        return extract_context_window(&json);
+    }
+    None
+}
+
+fn fallback_context_window(model: &str) -> Option<u64> {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("gpt-4o") || lower.contains("gpt-4-turbo") {
+        Some(128_000)
+    } else if lower.contains("claude-3") {
+        Some(200_000)
+    } else if lower.contains("grok-4.5") || lower.contains("grok-4") {
+        Some(500_000)
+    } else if lower.contains("grok-2") {
+        Some(131_072)
+    } else if lower.contains("llama-3") || lower.contains("codellama") || lower.contains("qwen2") {
+        Some(128_000)
+    } else if lower.contains("mistral") || lower.contains("mixtral") {
+        Some(128_000)
+    } else if lower.contains("phi-3") || lower.contains("phi3") {
+        Some(128_000)
+    } else {
+        None
+    }
 }
 
 pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
     let provider = get_provider(id)?.ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
-    let api_key = resolve_api_key(&provider);
+    let api_key = resolve_api_key(&provider)?;
     let base_url = provider.base_url.trim_end_matches('/').to_string();
     let backend = provider
         .api_backend
@@ -646,10 +1152,11 @@ pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
         }
     }
 
-    let allow_local = provider.id == "ollama"
-        || provider.id == "lmstudio"
-        || provider.base_url.contains("localhost")
-        || provider.base_url.contains("127.0.0.1");
+    let allow_local = provider.id.starts_with("ollama")
+        || provider.id.starts_with("lmstudio")
+        || provider.id.starts_with("local-")
+        || is_url_host_loopback(&provider.base_url);
+    let allow_private = is_url_host_private(&provider.base_url).await;
 
     if let Some(models) = fetch_model_list(
         &base_url,
@@ -657,6 +1164,7 @@ pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
         backend,
         &headers,
         allow_local,
+        allow_private,
     )
     .await
     {
@@ -666,39 +1174,45 @@ pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
     }
 
     if backend == "chat_completions" {
-        let url = validate_url(&format!("{base_url}/chat/completions"), allow_local).await?;
+        let url = validate_url(
+            &format!("{base_url}/chat/completions"),
+            allow_local,
+            allow_private,
+        )
+        .await?;
         let body = serde_json::json!({
             "model": provider.model,
             "messages": [{"role": "system", "content": "ping"}],
             "max_tokens": 1,
         });
-        let (status, text) = http_post_json(&url, headers, body, Duration::from_secs(10)).await?;
+        let (status, text) = http_post_json(&url, &headers, body, Duration::from_secs(10)).await?;
         if status == 200 {
             Ok((true, None))
         } else {
             Ok((false, Some(format!("HTTP {status}: {text}"))))
         }
     } else if backend == "responses" {
-        let url = validate_url(&format!("{base_url}/responses"), allow_local).await?;
+        let url =
+            validate_url(&format!("{base_url}/responses"), allow_local, allow_private).await?;
         let body = serde_json::json!({
             "model": provider.model,
             "input": "ping",
             "max_output_tokens": 1,
         });
-        let (status, text) = http_post_json(&url, headers, body, Duration::from_secs(10)).await?;
+        let (status, text) = http_post_json(&url, &headers, body, Duration::from_secs(10)).await?;
         if status == 200 {
             Ok((true, None))
         } else {
             Ok((false, Some(format!("HTTP {status}: {text}"))))
         }
     } else if backend == "messages" {
-        let url = validate_url(&format!("{base_url}/messages"), allow_local).await?;
+        let url = validate_url(&format!("{base_url}/messages"), allow_local, allow_private).await?;
         let body = serde_json::json!({
             "model": provider.model,
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 1,
         });
-        let (status, text) = http_post_json(&url, headers, body, Duration::from_secs(10)).await?;
+        let (status, text) = http_post_json(&url, &headers, body, Duration::from_secs(10)).await?;
         if status == 200 {
             Ok((true, None))
         } else {
@@ -714,7 +1228,10 @@ pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
 
 pub fn sanitize_provider_id(id: &str) -> String {
     id.to_ascii_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "-")
+        .replace(
+            |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
+            "-",
+        )
         .trim_matches('-')
         .to_string()
 }
@@ -728,6 +1245,21 @@ mod tests {
         assert_eq!(sanitize_provider_id("OpenAI"), "openai");
         assert_eq!(sanitize_provider_id("my provider!"), "my-provider");
         assert_eq!(sanitize_provider_id("-llama-cpp-"), "llama-cpp");
+        assert_eq!(sanitize_provider_id("café"), "caf");
+        assert!(sanitize_provider_id("---").is_empty());
+    }
+
+    #[test]
+    fn test_is_valid_env_key() {
+        assert!(is_valid_env_key("OMGB_OPENAI_API_KEY"));
+        assert!(!is_valid_env_key("PATH"));
+        assert!(!is_valid_env_key("OMGB_CAFÉ_API_KEY"));
+        assert!(!is_valid_env_key(""));
+    }
+
+    #[test]
+    fn test_write_api_key_rejects_invalid_env_var() {
+        assert!(write_api_key("café", None, "secret").is_err());
     }
 
     #[test]
@@ -737,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_api_key_prefers_env() {
+    fn test_resolve_api_key_prefers_env_over_dotenv() {
         let provider = ProviderConfig {
             id: "test".into(),
             name: "Test".into(),
@@ -747,12 +1279,28 @@ mod tests {
             env_key: Some(vec!["OMGB_TEST_API_KEY".into()]),
             extra_headers: None,
             context_window: None,
+            auto_compact_threshold_percent: Some(80),
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
         };
-        std::env::set_var("OMGB_TEST_API_KEY", "secret");
-        assert_eq!(resolve_api_key(&provider), Some("secret".into()));
-        std::env::remove_var("OMGB_TEST_API_KEY");
+        let mut env = HashMap::new();
+        env.insert("OMGB_TEST_API_KEY".into(), "from-env".into());
+        let mut dotenv = HashMap::new();
+        dotenv.insert("OMGB_TEST_API_KEY".into(), "from-dotenv".into());
+        assert_eq!(
+            resolve_api_key_with_maps(&provider, &env, &dotenv),
+            Some("from-env".into())
+        );
+        let empty_env = HashMap::new();
+        assert_eq!(
+            resolve_api_key_with_maps(&provider, &empty_env, &dotenv),
+            Some("from-dotenv".into())
+        );
+        let empty_dotenv = HashMap::new();
+        assert_eq!(
+            resolve_api_key_with_maps(&provider, &env, &empty_dotenv),
+            Some("from-env".into())
+        );
     }
 }
