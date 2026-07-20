@@ -6949,7 +6949,6 @@ dependencies = [
  "shlex",
  "tokio",
  "tokio-tungstenite 0.27.0",
- "tokio-util",
  "toml",
  "tracing",
  "url",
@@ -6959,10 +6958,7 @@ dependencies = [
  "xai-grok-pager",
  "xai-grok-pager-minimal",
  "xai-grok-shell",
- "xai-grok-telemetry",
- "xai-grok-tools",
- "xai-grok-update",
- "xai-grok-version",
+ "xai-tty-utils",
 ]
 
 [[package]]

@@ -55,9 +55,15 @@ pub fn list_events(limit: usize, json: bool) -> Result<()> {
     let mut events: Vec<TimelineEvent> = raw
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| match serde_json::from_str(l) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                eprintln!("warning: skipping malformed timeline line: {e}");
+                None
+            }
+        })
         .collect();
-    events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    events.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
     let events = events.into_iter().take(limit);
 
     if json {

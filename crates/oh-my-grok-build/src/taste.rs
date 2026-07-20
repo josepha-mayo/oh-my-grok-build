@@ -1,6 +1,5 @@
 //! Taste/preference learning store for `omgb`.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -29,7 +28,7 @@ fn load_store() -> Result<TasteStore> {
         return Ok(TasteStore::default());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)
+    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
 fn save_store(store: &TasteStore) -> Result<()> {
@@ -90,10 +89,10 @@ pub fn taste_preamble() -> String {
         return String::new();
     };
     let mut parts = Vec::new();
-    for n in store.likes.iter().rev().take(10).rev() {
+    for n in store.likes.iter().rev().take(10) {
         parts.push(format!("Prefer: {}", n.note));
     }
-    for n in store.dislikes.iter().rev().take(10).rev() {
+    for n in store.dislikes.iter().rev().take(10) {
         parts.push(format!("Avoid: {}", n.note));
     }
     if parts.is_empty() {

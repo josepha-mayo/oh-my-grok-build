@@ -128,7 +128,7 @@ fn validate_host_name(host: &str) -> anyhow::Result<()> {
     if host.is_empty() {
         anyhow::bail!("URL has no host");
     }
-    if CLOUD_METADATA_HOSTS.contains(&host.as_str()) {
+    if CLOUD_METADATA_HOSTS.contains(&host) {
         anyhow::bail!("cloud metadata host blocked");
     }
     if local_hostname().as_deref() == Some(host) {
@@ -149,7 +149,7 @@ fn reject_userinfo(url: &Url) -> anyhow::Result<()> {
 /// and other scoped addresses are rejected as private by the caller.
 fn lookup_addr(host: &str, port: u16) -> String {
     let ip = host.split('%').next().unwrap_or(host);
-    if ip.parse::<IpAddr>().map_or(false, |ip| ip.is_ipv6()) {
+    if ip.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
         format!("[{ip}]:{port}")
     } else {
         format!("{host}:{port}")
@@ -250,7 +250,7 @@ pub async fn is_url_host_private(raw: &str) -> bool {
     let port = lookup_port(&url);
     resolve_host(&host, port, true, true)
         .await
-        .map_or(false, |addrs| addrs.iter().any(|a| is_private_ip(a.ip())))
+        .is_ok_and(|addrs| addrs.iter().any(|a| is_private_ip(a.ip())))
 }
 
 /// Open a WebSocket/WebSocket-over-TLS connection to `raw`, validating the
@@ -284,7 +284,7 @@ pub async fn connect_ws_url(
         .next()
         .unwrap_or(host.as_str())
         .parse::<IpAddr>()
-        .map_or(false, |ip| ip.is_ipv6())
+        .is_ok_and(|ip| ip.is_ipv6())
     {
         format!("[{}]", host.split('%').next().unwrap_or(host.as_str()))
     } else {
@@ -384,9 +384,11 @@ pub async fn http_post_json(
     Ok((status, text))
 }
 
+#[allow(dead_code)]
 pub const DEFAULT_BIND_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 2419));
 
+#[allow(dead_code)]
 pub fn default_bind_addr() -> SocketAddr {
     DEFAULT_BIND_ADDR
 }

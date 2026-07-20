@@ -33,7 +33,9 @@ fn load_records() -> Result<Vec<SubagentRecord>> {
     let raw = std::fs::read_to_string(&path)?;
     raw.lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).map_err(|e| anyhow::anyhow!("{path}: {e}: {l}")))
+        .map(|l| {
+            serde_json::from_str(l).map_err(|e| anyhow::anyhow!("{}: {e}: {l}", path.display()))
+        })
         .collect()
 }
 
@@ -49,6 +51,7 @@ fn append_record(record: &SubagentRecord) -> Result<()> {
         .append(true)
         .open(&path)?;
     writeln!(file, "{line}")?;
+    crate::providers::restrict_env_file_permissions(&path)?;
     Ok(())
 }
 
@@ -66,38 +69,6 @@ fn log_path(id: &str, ext: &str) -> Result<PathBuf> {
         bail!("invalid subagent id '{id}'");
     }
     Ok(logs_dir()?.join(format!("{id}.{ext}")))
-}
-
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-#[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    let Ok(output) = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-    else {
-        return false;
-    };
-    let pid_s = pid.to_string();
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().any(|line| {
-        let mut parts = line.split("\",\"");
-        let Some(pid_field) = parts.nth(1) else {
-            return false;
-        };
-        pid_field.trim_matches('"') == pid_s
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_alive(_pid: u32) -> bool {
-    true
 }
 
 pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
@@ -118,23 +89,26 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
     cmd.arg("exec")
         .arg("--prompt-file")
         .arg(&prompt_file)
+        .arg("--prompt-file-own")
+        .kill_on_drop(false)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file));
+    crate::configure_detached_cmd(&mut cmd);
     if yolo {
         cmd.arg("--yolo");
     }
 
-    let mut child = cmd.spawn()?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&prompt_file).await;
+            return Err(anyhow::anyhow!("failed to spawn subagent: {e}"));
+        }
+    };
     let pid = child
         .id()
         .ok_or_else(|| anyhow::anyhow!("could not get subagent pid"))?;
-
-    tokio::spawn(async move {
-        let mut child = child;
-        let _ = child.wait().await;
-        let _ = tokio::fs::remove_file(&prompt_file).await;
-    });
 
     let record = SubagentRecord {
         id: id.clone(),
@@ -148,6 +122,10 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
     };
     append_record(&record)?;
     println!("spawned subagent {id} (pid {pid})");
+    tokio::spawn(async move {
+        // Reap the detached child once it exits so it does not become a zombie.
+        let _ = child.wait().await;
+    });
     Ok(())
 }
 
@@ -157,7 +135,7 @@ pub fn list() -> Result<()> {
         println!("No subagents recorded.");
     } else {
         for r in records {
-            let alive = if process_alive(r.pid) {
+            let alive = if crate::process_alive(r.pid) {
                 "running"
             } else {
                 "exited"
@@ -185,7 +163,7 @@ pub fn kill(id: &str) -> Result<()> {
         .find(|r| r.id == id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("subagent '{id}' not found"))?;
-    if !process_alive(record.pid) {
+    if !crate::process_alive(record.pid) {
         println!("subagent {} (pid {}) is not running", record.id, record.pid);
         return Ok(());
     }
