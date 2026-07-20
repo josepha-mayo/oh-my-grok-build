@@ -1,13 +1,13 @@
 //! BYOK and local-model provider management for `omgb`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::args::{AddProviderArgs, ApiBackend, DiscoverArgs};
+use crate::args::{AddProviderArgs, DiscoverArgs};
 use crate::net::{http_get_text, http_post_json, is_url_host_private, validate_url};
 use url::Url;
 
@@ -55,8 +55,6 @@ pub struct OmgConfig {
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mcp_servers: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +88,7 @@ pub fn load_omg_config() -> Result<OmgConfig> {
         return Ok(OmgConfig::default());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)
+    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
 pub fn save_omg_config(config: &OmgConfig) -> Result<()> {
@@ -98,7 +96,9 @@ pub fn save_omg_config(config: &OmgConfig) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("config.json.tmp.{}", std::process::id()));
     std::fs::write(&tmp, serde_json::to_string_pretty(config)?)?;
-    std::fs::rename(&tmp, omg_config_path()?)?;
+    let path = omg_config_path()?;
+    std::fs::rename(&tmp, &path)?;
+    restrict_env_file_permissions(&path)?;
     Ok(())
 }
 
@@ -126,17 +126,19 @@ pub(crate) fn env_keys_to_load() -> HashSet<String> {
     }
     if let Ok(dir) = omg_dir() {
         let connectors_path = dir.join("connectors.json");
-        if let Ok(raw) = std::fs::read_to_string(&connectors_path) {
-            if let Ok(registry) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&raw) {
-                for (name, value) in registry {
-                    keys.insert(env_var_name(&name));
-                    if let Some(secret) = value
-                        .get("secret_env_key")
-                        .and_then(|v| v.as_str())
-                        .filter(|k| is_valid_env_key(k))
-                    {
-                        keys.insert(secret.to_string());
-                    }
+        if let Ok(raw) = std::fs::read_to_string(&connectors_path)
+            && let Ok(serde_json::Value::Object(registry)) =
+                serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(serde_json::Value::Object(connectors)) = registry.get("connectors")
+        {
+            for (name, value) in connectors {
+                keys.insert(env_var_name(name));
+                if let Some(secret) = value
+                    .get("secret_env_key")
+                    .and_then(|v| v.as_str())
+                    .filter(|k| is_valid_env_key(k))
+                {
+                    keys.insert(secret.to_string());
                 }
             }
         }
@@ -243,16 +245,23 @@ pub(crate) fn restrict_env_file_permissions(path: &std::path::Path) -> Result<()
     }
     #[cfg(windows)]
     {
-        if let Ok(user) = std::env::var("USERNAME") {
-            let _ = std::process::Command::new("icacls")
-                .arg(path)
-                .arg("/inheritance:r")
-                .status();
-            let _ = std::process::Command::new("icacls")
-                .arg(path)
-                .arg("/grant:r")
-                .arg(format!("{}:F", user))
-                .status();
+        let user = std::env::var("USERNAME").map_err(|_| {
+            anyhow::anyhow!("USERNAME env var not set; cannot restrict file permissions")
+        })?;
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .status()?;
+        if !status.success() {
+            bail!("icacls /inheritance:r failed for {}", path.display());
+        }
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/grant:r")
+            .arg(format!("{user}:F"))
+            .status()?;
+        if !status.success() {
+            bail!("icacls /grant:r failed for {}", path.display());
         }
     }
     Ok(())
@@ -334,29 +343,31 @@ fn is_env_key_referenced(
             }
             if p.env_key
                 .as_ref()
-                .map_or(false, |keys| keys.contains(target))
+                .is_some_and(|keys| keys.iter().any(|k| k == target))
             {
                 return Ok(true);
             }
         }
     }
     let connectors_path = omg_dir()?.join("connectors.json");
-    if let Ok(raw) = std::fs::read_to_string(&connectors_path) {
-        if let Ok(registry) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&raw) {
-            for (name, value) in registry {
-                if exclude_connector == Some(name.as_str()) {
-                    continue;
-                }
-                if env_var_name(&name) == target {
-                    return Ok(true);
-                }
-                if value
-                    .get("secret_env_key")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|v| v == target)
-                {
-                    return Ok(true);
-                }
+    if let Ok(raw) = std::fs::read_to_string(&connectors_path)
+        && let Ok(serde_json::Value::Object(registry)) =
+            serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(serde_json::Value::Object(connectors)) = registry.get("connectors")
+    {
+        for (name, value) in connectors {
+            if exclude_connector == Some(name.as_str()) {
+                continue;
+            }
+            if env_var_name(name) == target {
+                return Ok(true);
+            }
+            if value
+                .get("secret_env_key")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == target)
+            {
+                return Ok(true);
             }
         }
     }
@@ -381,12 +392,10 @@ pub fn remove_api_key(name: &str, is_connector: bool, env_keys: Option<&[String]
     } else {
         (Some(name), None)
     };
-    let mut entries = parse_env_entries(&std::fs::read_to_string(&path)?);
+    let entries = parse_env_entries(&std::fs::read_to_string(&path)?);
     let mut retained = Vec::new();
     for (k, v) in entries {
-        if keys.contains(&k) && is_env_key_referenced(&k, exclude_provider, exclude_connector)? {
-            retained.push((k, v));
-        } else if !keys.contains(&k) {
+        if !keys.contains(&k) || is_env_key_referenced(&k, exclude_provider, exclude_connector)? {
             retained.push((k, v));
         }
     }
@@ -423,17 +432,17 @@ fn resolve_api_key_with_maps(
 ) -> Option<String> {
     let keys = valid_env_keys(provider);
     for k in &keys {
-        if let Some(v) = env.get(k) {
-            if !v.is_empty() {
-                return Some(v.clone());
-            }
+        if let Some(v) = env.get(k)
+            && !v.is_empty()
+        {
+            return Some(v.clone());
         }
     }
     for k in &keys {
-        if let Some(v) = dotenv.get(k) {
-            if !v.is_empty() {
-                return Some(v.clone());
-            }
+        if let Some(v) = dotenv.get(k)
+            && !v.is_empty()
+        {
+            return Some(v.clone());
         }
     }
     None
@@ -449,10 +458,10 @@ pub fn resolve_env_key(key: &str) -> Result<Option<String>> {
     if !is_valid_env_key(key) {
         return Ok(None);
     }
-    if let Ok(v) = std::env::var(key) {
-        if !v.is_empty() {
-            return Ok(Some(v));
-        }
+    if let Ok(v) = std::env::var(key)
+        && !v.is_empty()
+    {
+        return Ok(Some(v));
     }
     let dotenv = load_env_file()?;
     Ok(dotenv.get(key).filter(|v| !v.is_empty()).cloned())
@@ -631,6 +640,8 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
     let mut cfg = load_omg_config()?;
     let mut provider = if let Some(t) = &args.template {
         provider_template(t).ok_or_else(|| anyhow::anyhow!("unknown template '{t}'"))?
+    } else if let Some(p) = provider_template(&id) {
+        p
     } else {
         let base_url = args
             .base_url
@@ -699,17 +710,17 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
     }
     provider.env_key = Some(env_keys);
 
-    if let Some(key) = args.api_key.as_deref() {
-        if !key.is_empty() {
-            let target = write_api_key(&id, provider.env_key.as_deref(), key)?;
-            if provider.env_key.is_none() {
-                provider.env_key = Some(vec![target]);
-            }
-        }
-    }
+    // API keys are only accepted via the OMGB_API_KEY environment variable so they
+    // never appear in shell history or process listings. Do not persist the key
+    // until the provider config has been fully validated and saved.
+    let api_key = std::env::var("OMGB_API_KEY").ok().filter(|s| !s.is_empty());
 
     if provider.context_window.is_none() {
-        let api_key = resolve_api_key(&provider)?;
+        let api_key_for_fetch = if let Some(ref k) = api_key {
+            Some(k.clone())
+        } else {
+            resolve_api_key(&provider)?
+        };
         let backend = provider
             .api_backend
             .as_deref()
@@ -725,7 +736,7 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
         let is_ollama = provider.id == "ollama" || is_ollama_url(&provider.base_url);
         let cw = fetch_model_context_window(
             &provider.base_url,
-            api_key.as_deref(),
+            api_key_for_fetch.as_deref(),
             backend,
             &extra,
             allow_local,
@@ -748,6 +759,13 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
     cfg.providers.insert(id.clone(), provider.clone());
     save_omg_config(&cfg)?;
     sync_provider_to_grok_config(&provider)?;
+
+    // Persist the API key only after the provider config has been saved. This
+    // avoids leaving orphaned secrets in ~/.omgb/.env if validation fails.
+    if let Some(key) = api_key {
+        write_api_key(&id, provider.env_key.as_deref(), &key)?;
+    }
+
     Ok(provider)
 }
 
@@ -835,10 +853,10 @@ fn set_grok_default_if_unset(gcfg: &mut toml::map::Map<String, toml::Value>, mod
     let models = gcfg
         .entry("models")
         .or_insert(toml::Value::Table(toml::map::Map::new()));
-    if let toml::Value::Table(m) = models {
-        if !m.contains_key("default") {
-            m.insert("default".into(), toml::Value::String(model_key.into()));
-        }
+    if let toml::Value::Table(m) = models
+        && !m.contains_key("default")
+    {
+        m.insert("default".into(), toml::Value::String(model_key.into()));
     }
 }
 
@@ -856,18 +874,18 @@ fn remove_provider_from_grok_config(id: &str) -> Result<()> {
     if let Some(toml::Value::Table(m)) = gcfg.get_mut("model") {
         m.remove(&model_key);
     }
-    if let Some(toml::Value::Table(m)) = gcfg.get_mut("models") {
-        if m.get("default").and_then(|v| v.as_str()) == Some(&model_key) {
-            let remaining: Vec<String> = gcfg
-                .get("model")
-                .and_then(|v| v.as_table())
-                .map(|t| t.keys().cloned().collect())
-                .unwrap_or_default();
-            if let Some(first) = remaining.first() {
-                m.insert("default".into(), toml::Value::String(first.clone()));
-            } else {
-                m.remove("default");
-            }
+    let remaining: Vec<String> = gcfg
+        .get("model")
+        .and_then(|v| v.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some(toml::Value::Table(m)) = gcfg.get_mut("models")
+        && m.get("default").and_then(|v| v.as_str()) == Some(&model_key)
+    {
+        if let Some(first) = remaining.first() {
+            m.insert("default".into(), toml::Value::String(first.clone()));
+        } else {
+            m.remove("default");
         }
     }
     save_grok_config_table(&gcfg)?;
@@ -916,10 +934,9 @@ pub async fn discover_local_models(
         true,
     )
     .await
+        && !models.is_empty()
     {
-        if !models.is_empty() {
-            out.push(("ollama".into(), ollama.into(), models));
-        }
+        out.push(("ollama".into(), ollama.into(), models));
     }
     if let Some(models) = fetch_model_list(
         lmstudio,
@@ -930,10 +947,9 @@ pub async fn discover_local_models(
         true,
     )
     .await
+        && !models.is_empty()
     {
-        if !models.is_empty() {
-            out.push(("lmstudio".into(), lmstudio.into(), models));
-        }
+        out.push(("lmstudio".into(), lmstudio.into(), models));
     }
     Ok(out)
 }
@@ -967,10 +983,10 @@ pub fn add_discovered_providers(
             }
         }
     }
-    if cfg.default_model.is_none() {
-        if let Some(id) = first_id {
-            cfg.default_model = Some(format!("omgb-{id}"));
-        }
+    if cfg.default_model.is_none()
+        && let Some(id) = first_id
+    {
+        cfg.default_model = Some(format!("omgb-{id}"));
     }
     save_omg_config(&cfg)?;
 
@@ -1055,7 +1071,7 @@ fn ollama_show_url(base_url: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
-    if segs.last().map_or(false, |s| s == "v1") {
+    if segs.last().is_some_and(|s| s == "v1") {
         segs.pop();
     }
     segs.push("api".into());
@@ -1123,11 +1139,14 @@ fn fallback_context_window(model: &str) -> Option<u64> {
         Some(500_000)
     } else if lower.contains("grok-2") {
         Some(131_072)
-    } else if lower.contains("llama-3") || lower.contains("codellama") || lower.contains("qwen2") {
-        Some(128_000)
-    } else if lower.contains("mistral") || lower.contains("mixtral") {
-        Some(128_000)
-    } else if lower.contains("phi-3") || lower.contains("phi3") {
+    } else if lower.contains("llama-3")
+        || lower.contains("codellama")
+        || lower.contains("qwen2")
+        || lower.contains("mistral")
+        || lower.contains("mixtral")
+        || lower.contains("phi-3")
+        || lower.contains("phi3")
+    {
         Some(128_000)
     } else {
         None
@@ -1167,10 +1186,9 @@ pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
         allow_private,
     )
     .await
+        && !models.is_empty()
     {
-        if !models.is_empty() {
-            return Ok((true, None));
-        }
+        return Ok((true, None));
     }
 
     if backend == "chat_completions" {

@@ -27,7 +27,7 @@ use args::*;
 
 fn desktop_control_allowed() -> bool {
     std::env::var("OMGB_ALLOW_DESKTOP_CONTROL")
-        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
 /// Loads `*_API_KEY` entries referenced by configured providers/connectors
@@ -63,9 +63,13 @@ pub fn main() -> Result<()> {
 
     let cli = OmgbArgs::parse();
 
-    if let Some(OmgbCommand::Autonomous(ref args)) = cli.command.as_ref() {
+    if let Some(OmgbCommand::Autonomous(args)) = cli.command.as_ref() {
         let cwd = std::env::current_dir()?;
-        xai_grok_shell::config::apply_sandbox(None, Some(&args.sandbox_profile), Some(&cwd));
+        xai_grok_shell::config::apply_sandbox(
+            None,
+            Some(args.sandbox_profile.as_str()),
+            Some(&cwd),
+        );
     }
 
     xai_grok_pager_minimal::install();
@@ -129,7 +133,7 @@ fn config_sandbox_profile() -> Option<String> {
 }
 
 async fn run_tui(args: TuiArgs) -> Result<()> {
-    let mut argv = vec!["grok".to_string()];
+    let mut argv = vec!["omgb".to_string()];
     if let Some(m) = args.model {
         argv.push("--model".to_string());
         argv.push(m);
@@ -143,36 +147,151 @@ async fn run_tui(args: TuiArgs) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_exec_prompt(args: &ExecArgs) -> Result<String> {
-    if let Some(path) = &args.prompt_file {
-        return tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read prompt file: {e}"));
+fn resolve_path(raw: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mut has_normal = false;
+    for comp in raw.components() {
+        match comp {
+            std::path::Component::Normal(_) => has_normal = true,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                bail!("path must not contain '..' components: {}", raw.display())
+            }
+            _ => {}
+        }
     }
-    if let Some(p) = &args.prompt {
-        return Ok(p.clone());
+    if !has_normal {
+        bail!(
+            "path must contain at least one file or directory component: {}",
+            raw.display()
+        );
     }
-    bail!("prompt is required")
+    if raw.is_absolute() {
+        Ok(raw.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(raw))
+    }
 }
 
 pub(crate) async fn write_prompt_temp(prompt: &str) -> Result<PathBuf> {
     let path = std::env::temp_dir().join(format!("omgb-prompt-{}.txt", uuid::Uuid::new_v4()));
     tokio::fs::write(&path, prompt.as_bytes()).await?;
+    let path2 = path.clone();
+    tokio::task::spawn_blocking(move || restrict_temp_permissions(&path2)).await??;
     Ok(path)
 }
 
-async fn run_exec(args: ExecArgs) -> Result<()> {
-    let prompt = resolve_exec_prompt(&args).await?;
-    if let Some(path) = &args.output_file {
-        let (prompt_file, own_prompt) = if let Some(p) = &args.prompt_file {
-            (p.clone(), false)
+#[cfg(unix)]
+fn restrict_temp_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restrict_temp_permissions(_path: &std::path::Path) -> Result<()> {
+    // Windows TEMP is already per-user; no Unix-style mode setting.
+    Ok(())
+}
+
+pub(crate) struct PromptFileGuard(PathBuf);
+impl Drop for PromptFileGuard {
+    fn drop(&mut self) {
+        let path = std::mem::take(&mut self.0);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            std::mem::drop(rt.spawn_blocking(move || std::fs::remove_file(&path)));
         } else {
-            (write_prompt_temp(&prompt).await?, true)
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+pub(crate) fn configure_detached_cmd(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    xai_tty_utils::detach_command(cmd);
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(windows)]
+pub(crate) fn process_alive(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+    else {
+        return false;
+    };
+    let pid_s = pid.to_string();
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().any(|line| {
+        let mut parts = line.split("\",\"");
+        let Some(pid_field) = parts.nth(1) else {
+            return false;
+        };
+        pid_field.trim_matches('"') == pid_s
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+async fn run_exec(args: ExecArgs) -> Result<()> {
+    let output_path = args.output_file.as_deref().map(resolve_path).transpose()?;
+    let prompt_file = if let Some(p) = &args.prompt_file {
+        let p = resolve_path(p)?;
+        if !p.is_file() {
+            bail!(
+                "prompt file does not exist or is not a file: {}",
+                p.display()
+            );
+        }
+        Some(p)
+    } else {
+        None
+    };
+
+    let prompt = if let Some(p) = &prompt_file {
+        tokio::fs::read_to_string(p)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read prompt file: {e}"))?
+    } else if let Some(p) = &args.prompt {
+        p.clone()
+    } else {
+        bail!("prompt is required")
+    };
+
+    if let Some(path) = output_path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let own_prompt = args.prompt_file_own || prompt_file.is_none();
+        let child_prompt_file = if let Some(p) = prompt_file {
+            p
+        } else {
+            write_prompt_temp(&prompt).await?
+        };
+        let _prompt_guard = if own_prompt {
+            Some(PromptFileGuard(child_prompt_file.clone()))
+        } else {
+            None
         };
         let mut cmd = Command::new(std::env::current_exe()?);
         cmd.arg("exec")
             .arg("--prompt-file")
-            .arg(&prompt_file)
+            .arg(&child_prompt_file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(m) = &args.model {
@@ -184,21 +303,30 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
         if args.json {
             cmd.arg("--json");
         }
-        let out = cmd.output().await?;
-        if own_prompt {
-            let _ = tokio::fs::remove_file(&prompt_file).await;
+        if let Some(t) = &args.tools {
+            cmd.arg("--tools").arg(t);
         }
+        if let Some(dt) = &args.disallowed_tools {
+            cmd.arg("--disallowed-tools").arg(dt);
+        }
+        let out = cmd.output().await?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             bail!("exec failed: {stderr}");
         }
-        std::fs::write(path, &out.stdout)?;
+        std::fs::write(&path, &out.stdout)?;
         println!("wrote output to {}", path.display());
         if args.commit || args.commit_untracked {
             git_commit_all("omgb exec", args.commit_untracked, Some(path.as_path())).await?;
         }
         return Ok(());
     }
+
+    let _prompt_guard = if args.prompt_file_own {
+        prompt_file.as_ref().map(|p| PromptFileGuard(p.clone()))
+    } else {
+        None
+    };
 
     run_single_turn_with(
         &prompt,
@@ -210,6 +338,8 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
             OutputFormat::Plain
         },
         None,
+        args.tools.clone(),
+        args.disallowed_tools.clone(),
         None,
         None,
     )
@@ -241,7 +371,9 @@ async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
         true,
         OutputFormat::Plain,
         Some(50),
-        Some("bash,edit,file_search,read,write".to_string()),
+        Some("run_terminal_cmd,read_file,search_replace,grep,list_dir".to_string()),
+        None,
+        None,
         None,
     )
     .await
@@ -251,14 +383,17 @@ async fn run_use(args: UseArgs) -> Result<()> {
     if !(args.yolo || desktop_control_allowed()) {
         bail!("desktop control requires --yolo or OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on");
     }
+    let yolo = args.yolo || desktop_control_allowed();
     let prompt = format!("{}\n\nUse the computer as needed.", args.prompt);
     run_single_turn_with(
         &prompt,
         args.model,
-        args.yolo,
+        yolo,
         OutputFormat::Plain,
         None,
-        Some("computer,read,write,bash".to_string()),
+        Some("run_terminal_cmd,read_file,search_replace,grep,list_dir".to_string()),
+        None,
+        None,
         None,
     )
     .await
@@ -268,6 +403,7 @@ async fn run_browser(args: BrowserArgs) -> Result<()> {
     if !(args.yolo || desktop_control_allowed()) {
         bail!("desktop control requires --yolo or OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on");
     }
+    let yolo = args.yolo || desktop_control_allowed();
     let mut prompt = args.prompt.clone();
     if let Some(url) = args.url {
         crate::net::validate_url(&url, args.allow_local, args.allow_private).await?;
@@ -277,10 +413,12 @@ async fn run_browser(args: BrowserArgs) -> Result<()> {
     run_single_turn_with(
         &prompt,
         args.model,
-        args.yolo,
+        yolo,
         OutputFormat::Plain,
         None,
-        Some("browser,computer,read,write,bash".to_string()),
+        None,
+        None,
+        Some("browser-use".to_string()),
         None,
     )
     .await
@@ -293,6 +431,8 @@ async fn run_single_turn_with(
     output_format: OutputFormat,
     max_turns: Option<u32>,
     cli_tools: Option<String>,
+    cli_disallowed_tools: Option<String>,
+    agent: Option<String>,
     cwd: Option<PathBuf>,
 ) -> Result<()> {
     let full_prompt = format!("{}{}", prompt, taste::taste_preamble());
@@ -311,10 +451,10 @@ async fn run_single_turn_with(
         fork_session: false,
         worktree: None,
         restore_code: false,
-        agent: None,
+        agent,
         agents_json: None,
         cli_tools,
-        cli_disallowed_tools: None,
+        cli_disallowed_tools,
         disable_web_search: false,
         allow_rules: Vec::new(),
         deny_rules: Vec::new(),
@@ -385,10 +525,10 @@ async fn git_author() -> Result<(String, String)> {
     if let (Ok(name), Ok(email)) = (
         std::env::var("OMGB_GIT_AUTHOR_NAME"),
         std::env::var("OMGB_GIT_AUTHOR_EMAIL"),
-    ) {
-        if !name.is_empty() && !email.is_empty() {
-            return Ok((name, email));
-        }
+    ) && !name.is_empty()
+        && !email.is_empty()
+    {
+        return Ok((name, email));
     }
     let name = git_config("user.name").await?.ok_or_else(|| {
         anyhow::anyhow!("git author name not configured; set user.name or OMGB_GIT_AUTHOR_NAME")
@@ -432,10 +572,10 @@ async fn git_commit_all(
 
     let (name, email) = git_author().await?;
     let commit = Command::new("git")
-        .env("GIT_AUTHOR_NAME", name)
-        .env("GIT_AUTHOR_EMAIL", email)
-        .env("GIT_COMMITTER_NAME", name)
-        .env("GIT_COMMITTER_EMAIL", email)
+        .env("GIT_AUTHOR_NAME", &name)
+        .env("GIT_AUTHOR_EMAIL", &email)
+        .env("GIT_COMMITTER_NAME", &name)
+        .env("GIT_COMMITTER_EMAIL", &email)
         .args(["commit", "-m", message, "--no-gpg-sign"])
         .status()
         .await?;
@@ -499,6 +639,8 @@ async fn run_undo(args: UndoArgs) -> Result<()> {
 }
 
 async fn run_loop(args: LoopArgs) -> Result<()> {
+    const MAX_DIFF_CHARS: usize = 16 * 1024;
+
     if !git_worktree_status().await?.0 {
         bail!("git working tree is not clean; commit or stash changes before running `omgb loop`");
     }
@@ -506,7 +648,7 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
     let mut iteration = 0;
     let mut prompt = args.prompt.clone();
     let mut clean = true;
-    let mut status = String::new();
+    let mut status;
     while iteration < args.max_iterations {
         iteration += 1;
         println!("\n--- iteration {iteration} ---");
@@ -515,6 +657,8 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
             args.model.clone(),
             args.yolo,
             OutputFormat::Plain,
+            None,
+            None,
             None,
             None,
             None,
@@ -527,8 +671,8 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
             break;
         }
         let mut diff = git_diff_text().await?;
-        if diff.len() > 16_384 {
-            let mut end = 16_384;
+        if diff.len() > MAX_DIFF_CHARS {
+            let mut end = MAX_DIFF_CHARS;
             while !diff.is_char_boundary(end) {
                 end -= 1;
             }
@@ -673,7 +817,7 @@ async fn run_team(args: TeamArgs) -> Result<()> {
         let yolo = args.yolo;
         let worktree = std::env::temp_dir().join(format!("omgb-team-{i}-{}", uuid::Uuid::new_v4()));
 
-        tasks.push(tokio::spawn(async move {
+        tasks.push(async move {
             let branch = create_worktree(&worktree).await?;
             run_single_turn_with(
                 &prompt,
@@ -682,16 +826,18 @@ async fn run_team(args: TeamArgs) -> Result<()> {
                 OutputFormat::Plain,
                 None,
                 None,
+                None,
+                None,
                 Some(worktree.clone()),
             )
             .await?;
             Ok::<_, anyhow::Error>((worktree, branch))
-        }));
+        });
     }
 
     let mut worktrees = Vec::new();
-    for t in tasks {
-        match t.await? {
+    for result in futures::future::join_all(tasks).await {
+        match result {
             Ok(w) => worktrees.push(w),
             Err(e) => eprintln!("agent failed: {e}"),
         }
@@ -759,13 +905,13 @@ async fn remove_worktree(path: &PathBuf) -> Result<()> {
             path.display()
         );
     }
-    if let Err(e) = tokio::fs::remove_dir_all(path).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "warning: failed to remove worktree directory {}: {e}",
-                path.display()
-            );
-        }
+    if let Err(e) = tokio::fs::remove_dir_all(path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "warning: failed to remove worktree directory {}: {e}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -821,10 +967,20 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
     if !merge.success() {
         bail!("git merge failed");
     }
-    let _ = Command::new("git")
+    let delete = Command::new("git")
         .args(["branch", "-D", branch])
         .status()
         .await;
+    if let Err(e) = delete {
+        eprintln!("warning: failed to delete team branch {branch}: {e}");
+    } else if let Ok(status) = delete
+        && !status.success()
+    {
+        eprintln!(
+            "warning: failed to delete team branch {branch}: exit {}",
+            status.code().unwrap_or(-1)
+        );
+    }
     Ok(())
 }
 
@@ -842,6 +998,7 @@ async fn run_swarm(args: SwarmArgs) -> Result<()> {
         let yolo = args.yolo;
         let output_file =
             std::env::temp_dir().join(format!("omgb-swarm-{i}-{}.txt", uuid::Uuid::new_v4()));
+        let exe = exe.clone();
 
         tasks.push(tokio::spawn(async move {
             let prompt_file = write_prompt_temp(&prompt).await?;
@@ -934,7 +1091,6 @@ async fn run_harness(args: HarnessArgs) -> Result<()> {
             command,
             url,
             cwd,
-            api_key,
             secret_env_key,
             allow_local,
             allow_private,
@@ -945,7 +1101,6 @@ async fn run_harness(args: HarnessArgs) -> Result<()> {
                 command,
                 url,
                 cwd,
-                api_key,
                 secret_env_key,
                 allow_local,
                 allow_private,

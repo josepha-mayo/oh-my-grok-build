@@ -4,12 +4,16 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Local, Utc};
 use croner::Cron;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn schedule_path() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join("schedule.jsonl"))
@@ -41,8 +45,8 @@ impl PidFile {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        if !file.try_lock_exclusive()? {
-            bail!("scheduler daemon is already running");
+        if let Err(e) = file.try_lock_exclusive() {
+            bail!("scheduler daemon is already running: {e}");
         }
         file.set_len(0)?;
         let mut file = file;
@@ -92,7 +96,9 @@ fn load_jobs() -> Result<Vec<ScheduledJob>> {
     let raw = std::fs::read_to_string(&path)?;
     raw.lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).map_err(|e| anyhow::anyhow!("{path}: {e}: {l}")))
+        .map(|l| {
+            serde_json::from_str(l).map_err(|e| anyhow::anyhow!("{}: {e}: {l}", path.display()))
+        })
         .collect()
 }
 
@@ -109,12 +115,13 @@ fn save_jobs(jobs: &[ScheduledJob]) -> Result<()> {
     }
     drop(f);
     std::fs::rename(&tmp, &path)?;
+    crate::providers::restrict_env_file_permissions(&path)?;
     Ok(())
 }
 
-async fn with_jobs<F, R>(mut f: F) -> Result<R>
+async fn with_jobs<F, R>(f: F) -> Result<R>
 where
-    F: FnMut(&mut Vec<ScheduledJob>) -> Result<R>,
+    F: FnOnce(&mut Vec<ScheduledJob>) -> Result<R>,
 {
     let _lock = lock_schedule().await?;
     let mut jobs = load_jobs()?;
@@ -200,6 +207,7 @@ pub async fn run_job(name: &str, capture: bool) -> Result<()> {
     };
     let exe = std::env::current_exe()?.to_string_lossy().to_string();
     let prompt_file = crate::write_prompt_temp(&job.prompt).await?;
+    let _prompt_guard = crate::PromptFileGuard(prompt_file.clone());
 
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("exec")
@@ -212,8 +220,9 @@ pub async fn run_job(name: &str, capture: bool) -> Result<()> {
     if let Some(model) = &job.model {
         cmd.arg("--model").arg(model);
     }
+    crate::configure_detached_cmd(&mut cmd);
 
-    let result = if capture {
+    if capture {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn()?;
         let mut stdout = child.stdout.take().unwrap();
@@ -225,13 +234,24 @@ pub async fn run_job(name: &str, capture: bool) -> Result<()> {
             .open(&log_path)
             .await?;
         let mut log2 = log.try_clone().await?;
-        tokio::spawn(async move {
+        let copy_out = tokio::spawn(async move {
             let _ = tokio::io::copy(&mut stdout, &mut log).await;
         });
-        tokio::spawn(async move {
+        let copy_err = tokio::spawn(async move {
             let _ = tokio::io::copy(&mut stderr, &mut log2).await;
         });
-        let status = child.wait().await?;
+        let status = match tokio::time::timeout(DEFAULT_JOB_TIMEOUT, child.wait()).await {
+            Ok(s) => s?,
+            Err(_) => {
+                let _ = child.kill().await;
+                bail!(
+                    "job '{name}' timed out after {}s",
+                    DEFAULT_JOB_TIMEOUT.as_secs()
+                );
+            }
+        };
+        let _ = copy_out.await;
+        let _ = copy_err.await;
         if !status.success() {
             Err(anyhow::anyhow!(
                 "job '{name}' exited with status {}",
@@ -242,7 +262,13 @@ pub async fn run_job(name: &str, capture: bool) -> Result<()> {
         }
     } else {
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        let status = cmd.status().await?;
+        let status = match tokio::time::timeout(DEFAULT_JOB_TIMEOUT, cmd.status()).await {
+            Ok(s) => s?,
+            Err(_) => bail!(
+                "job '{name}' timed out after {}s",
+                DEFAULT_JOB_TIMEOUT.as_secs()
+            ),
+        };
         if !status.success() {
             Err(anyhow::anyhow!(
                 "job '{name}' exited with status {}",
@@ -251,41 +277,7 @@ pub async fn run_job(name: &str, capture: bool) -> Result<()> {
         } else {
             Ok(())
         }
-    };
-    let _ = tokio::fs::remove_file(&prompt_file).await;
-    result
-}
-
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-#[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    let Ok(output) = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-    else {
-        return false;
-    };
-    let pid_s = pid.to_string();
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().any(|line| {
-        let mut parts = line.split("\",\"");
-        let Some(pid_field) = parts.nth(1) else {
-            return false;
-        };
-        pid_field.trim_matches('"') == pid_s
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_alive(_pid: u32) -> bool {
-    true
+    }
 }
 
 pub async fn spawn_daemon() -> Result<()> {
@@ -295,44 +287,65 @@ pub async fn spawn_daemon() -> Result<()> {
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
-    }
+        .stderr(Stdio::null())
+        .kill_on_drop(false);
+    crate::configure_detached_cmd(&mut cmd);
     cmd.spawn()?;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let path = pid_path()?;
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(pid) = raw.trim().parse::<u32>() {
-            if process_alive(pid) {
-                println!("scheduler daemon started (pid {pid})");
-                return Ok(());
-            }
-        }
+    if let Ok(raw) = std::fs::read_to_string(&path)
+        && let Ok(pid) = raw.trim().parse::<u32>()
+        && crate::process_alive(pid)
+    {
+        println!("scheduler daemon started (pid {pid})");
+        return Ok(());
     }
     bail!("scheduler daemon failed to start")
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sig = signal(SignalKind::terminate())?;
+        sig.recv().await;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::future::pending().await
+    }
 }
 
 pub async fn run_daemon_loop() -> Result<()> {
     let _pid_file = PidFile::acquire()?;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(DAEMON_POLL_INTERVAL) => {}
+            _ = shutdown_signal() => {
+                println!("scheduler: received shutdown signal");
+                return Ok(());
+            }
+        }
         let due_jobs: Result<Vec<ScheduledJob>> =
             with_jobs_read(|jobs| Ok(jobs.iter().filter(|j| is_due(j)).cloned().collect())).await;
-        match due_jobs {
-            Ok(jobs) => {
-                let mut set = tokio::task::JoinSet::new();
-                for job in jobs {
-                    set.spawn(async move { run_job(&job.name, true).await });
-                }
-                while let Some(res) = set.join_next().await {
-                    if let Ok(Err(_)) = res {
-                        // Job output is captured in ~/.omgb/scheduler.log.
-                    }
+        if let Ok(jobs) = due_jobs {
+            let mut set = tokio::task::JoinSet::new();
+            for job in jobs {
+                set.spawn(async move { run_job(&job.name, true).await });
+            }
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!("scheduler: job error: {e}"),
+                    Err(e) => eprintln!("scheduler: job task panicked: {e}"),
                 }
             }
-            Err(_) => {}
         }
     }
 }
@@ -345,7 +358,7 @@ pub fn stop_daemon() -> Result<()> {
         .trim()
         .parse::<u32>()
         .map_err(|_| anyhow::anyhow!("scheduler pid file does not contain a valid pid"))?;
-    if !process_alive(pid) {
+    if !crate::process_alive(pid) {
         let _ = std::fs::remove_file(&path);
         println!("scheduler is not running");
         return Ok(());
@@ -362,7 +375,7 @@ pub fn stop_daemon() -> Result<()> {
             .args(["/PID", &pid.to_string(), "/F"])
             .spawn()?;
     }
-    let _ = std::fs::remove_file(pid_path());
+    let _ = std::fs::remove_file(pid_path()?);
     println!("sent stop to scheduler (pid {pid})");
     Ok(())
 }
@@ -430,7 +443,7 @@ fn parse_interval(expr: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeDelta;
+    use chrono::{Datelike, TimeDelta, TimeZone};
 
     #[test]
     fn test_parse_interval() {

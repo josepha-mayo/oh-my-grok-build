@@ -34,10 +34,16 @@ fn safe_filename(input: &str) -> String {
 }
 
 fn sanitize_output_path(dir: &Path, raw: &Path) -> Result<PathBuf> {
+    let mut has_normal = false;
     for comp in raw.components() {
-        if !matches!(comp, std::path::Component::Normal(_)) {
-            bail!("invalid output path: must be a relative path with no '..' components");
+        match comp {
+            std::path::Component::Normal(_) => has_normal = true,
+            std::path::Component::CurDir => {}
+            _ => bail!("invalid output path: must be a relative path with no '..' components"),
         }
+    }
+    if !has_normal {
+        bail!("invalid output path: must contain at least one file or directory component");
     }
     Ok(dir.join(raw))
 }
@@ -58,9 +64,16 @@ struct WebResult {
     snippet: String,
 }
 
-const SEARCH_USER_AGENT: &str = "oh-my-grok-build/0.1.0 (research; +https://oh-my-grok.build)";
+const SEARCH_USER_AGENT: &str = concat!(
+    "oh-my-grok-build/",
+    env!("CARGO_PKG_VERSION"),
+    " (research; +https://oh-my-grok.build)"
+);
+const DEFAULT_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RESULTS: usize = 100;
 
 pub async fn research(topic: &str, count: usize) -> Result<String> {
+    let count = count.min(MAX_RESULTS);
     let mut report = format!("Research: {}\n\n", topic);
 
     match arxiv_research(topic, count).await {
@@ -89,7 +102,7 @@ async fn arxiv_research(topic: &str, count: usize) -> Result<String> {
         "https://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results={count}&sortBy=relevance&sortOrder=descending"
     );
     let vurl = validate_url(&url, false, false).await?;
-    let text = http_get_text(&vurl, None, Duration::from_secs(30)).await?;
+    let text = http_get_text(&vurl, None, DEFAULT_SEARCH_TIMEOUT).await?;
     let entries = parse_atom(&text)?;
 
     if entries.is_empty() {
@@ -115,29 +128,29 @@ async fn ddg_instant_answer(topic: &str, count: usize) -> Option<Vec<WebResult>>
     let url =
         format!("https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1");
     let vurl = validate_url(&url, false, false).await.ok()?;
-    let text = http_get_text(&vurl, None, Duration::from_secs(30))
+    let text = http_get_text(&vurl, None, DEFAULT_SEARCH_TIMEOUT)
         .await
         .ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
 
-    let mut out = Vec::new();
-    if let Some(abstract_text) = json.get("AbstractText").and_then(|v| v.as_str()) {
-        if !abstract_text.is_empty() {
-            if let Some(url) = json.get("AbstractURL").and_then(|v| v.as_str()) {
-                out.push(WebResult {
-                    title: json
-                        .get("Heading")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    url: url.to_string(),
-                    snippet: abstract_text.to_string(),
-                });
-            }
-        }
+    let mut candidates = Vec::new();
+    if let (Some(abstract_text), Some(url)) = (
+        json.get("AbstractText")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty()),
+        json.get("AbstractURL").and_then(|v| v.as_str()),
+    ) {
+        candidates.push((
+            json.get("Heading")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            url.to_string(),
+            abstract_text.to_string(),
+        ));
     }
 
-    fn collect_topics(value: &serde_json::Value, out: &mut Vec<WebResult>) {
+    fn collect_topics(value: &serde_json::Value, out: &mut Vec<(String, String, String)>) {
         if let Some(arr) = value.as_array() {
             for item in arr {
                 if let Some(topics) = item.get("Topics") {
@@ -146,17 +159,24 @@ async fn ddg_instant_answer(topic: &str, count: usize) -> Option<Vec<WebResult>>
                     item.get("Text").and_then(|v| v.as_str()),
                     item.get("FirstURL").and_then(|v| v.as_str()),
                 ) {
-                    out.push(WebResult {
-                        title: String::new(),
-                        url: url.to_string(),
-                        snippet: text.to_string(),
-                    });
+                    out.push((String::new(), url.to_string(), text.to_string()));
                 }
             }
         }
     }
     if let Some(topics) = json.get("RelatedTopics") {
-        collect_topics(topics, &mut out);
+        collect_topics(topics, &mut candidates);
+    }
+
+    let mut out = Vec::new();
+    for (title, url, snippet) in candidates {
+        if let Some(vurl) = validated_search_url(&url).await {
+            out.push(WebResult {
+                title,
+                url: vurl,
+                snippet,
+            });
+        }
     }
 
     if out.is_empty() {
@@ -172,8 +192,8 @@ async fn web_search_html(topic: &str, count: usize) -> Result<Vec<WebResult>> {
     let vurl = validate_url(&url, false, false).await?;
     let mut headers = HashMap::new();
     headers.insert("User-Agent".into(), SEARCH_USER_AGENT.into());
-    let text = http_get_text(&vurl, Some(&headers), Duration::from_secs(30)).await?;
-    parse_duckduckgo_html(&text, count)
+    let text = http_get_text(&vurl, Some(&headers), DEFAULT_SEARCH_TIMEOUT).await?;
+    parse_duckduckgo_html(&text, count).await
 }
 
 async fn web_search(topic: &str, count: usize) -> Result<String> {
@@ -200,7 +220,7 @@ async fn web_search(topic: &str, count: usize) -> Result<String> {
     Ok(report)
 }
 
-fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult>> {
+async fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult>> {
     let document = Html::parse_document(html);
     let result_selector = Selector::parse(".result").map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let title_selector = Selector::parse(".result__a").map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -214,7 +234,7 @@ fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult>> {
         if let Some(a) = result.select(&title_selector).next() {
             title = a.text().collect::<Vec<_>>().join(" ").trim().to_string();
             if let Some(href) = a.value().attr("href") {
-                url = extract_ddg_url(href).unwrap_or_else(|| href.to_string());
+                url = validated_search_url(href).await.unwrap_or_default();
             }
         }
         let snippet = result
@@ -243,7 +263,7 @@ fn extract_ddg_url(raw: &str) -> Option<String> {
     if parsed.host_str() == Some("duckduckgo.com") || parsed.host_str() == Some("r.duckduckgo.com")
     {
         if let Some((_, uddg)) = parsed.query_pairs().find(|(k, _)| k == "uddg") {
-            return urlencoding::decode(&*uddg)
+            return urlencoding::decode(&uddg)
                 .ok()
                 .and_then(|s| url::Url::parse(s.as_ref()).ok().map(|_| s.into_owned()));
         }
@@ -252,20 +272,29 @@ fn extract_ddg_url(raw: &str) -> Option<String> {
     Some(url)
 }
 
+async fn validated_search_url(raw: &str) -> Option<String> {
+    let url = extract_ddg_url(raw)?;
+    validate_url(&url, false, false).await.ok().map(|_| url)
+}
+
 async fn exec_prompt(model: &str, prompt: &str) -> Result<String> {
     let prompt_file = crate::write_prompt_temp(prompt).await?;
+    let _prompt_guard = crate::PromptFileGuard(prompt_file.clone());
     let exe = std::env::current_exe()?;
     let mut cmd = tokio::process::Command::new(exe);
+    // Limit the patch-generation agent to read-only tools so it cannot modify the repo
+    // or run arbitrary commands while still being able to inspect files and references.
     cmd.arg("exec")
         .arg("--model")
         .arg(model)
         .arg("--yolo")
+        .arg("--tools")
+        .arg("read_file,grep,list_dir,web_search,web_fetch")
         .arg("--prompt-file")
         .arg(&prompt_file)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let out = cmd.output().await?;
-    let _ = tokio::fs::remove_file(&prompt_file).await;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("failed to generate patch: {stderr}");
@@ -289,6 +318,7 @@ pub async fn run_research(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&report_path, &report)?;
+    crate::providers::restrict_env_file_permissions(&report_path)?;
     println!("wrote research report to {}", report_path.display());
 
     if let Some(model) = model {
@@ -299,6 +329,7 @@ pub async fn run_research(
             Ok(patch) => {
                 let patch_path = report_path.with_extension("patch");
                 std::fs::write(&patch_path, &patch)?;
+                crate::providers::restrict_env_file_permissions(&patch_path)?;
                 println!("wrote patch to {}", patch_path.display());
             }
             Err(e) => {
@@ -331,16 +362,14 @@ fn parse_atom(text: &str) -> Result<Vec<ArxivEntry>> {
                         pdf: String::new(),
                         authors: Vec::new(),
                     });
-                } else if current.is_some() && name == "link" {
-                    if let (Some(title), Some(href)) =
+                } else if current.is_some()
+                    && name == "link"
+                    && let (Some(title), Some(href)) =
                         (attr_value(&e, "title"), attr_value(&e, "href"))
-                    {
-                        if title == "pdf" {
-                            if let Some(entry) = current.as_mut() {
-                                entry.pdf = href;
-                            }
-                        }
-                    }
+                    && title == "pdf"
+                    && let Some(entry) = current.as_mut()
+                {
+                    entry.pdf = href;
                 }
                 current_tag = name;
             }
@@ -370,10 +399,10 @@ fn parse_atom(text: &str) -> Result<Vec<ArxivEntry>> {
             }
             Event::End(e) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                if name == "entry" {
-                    if let Some(entry) = current.take() {
-                        entries.push(entry);
-                    }
+                if name == "entry"
+                    && let Some(entry) = current.take()
+                {
+                    entries.push(entry);
                 }
                 current_tag.clear();
             }
@@ -465,8 +494,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_duckduckgo_html_extracts_results() {
+    #[tokio::test]
+    async fn test_parse_duckduckgo_html_extracts_results() {
         let html = r#"<!DOCTYPE html>
 <html><body>
 <div class="result">
@@ -474,7 +503,7 @@ mod tests {
     <a class="result__snippet">This is an example page.</a>
 </div>
 </body></html>"#;
-        let results = parse_duckduckgo_html(html, 5).unwrap();
+        let results = parse_duckduckgo_html(html, 5).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Example");
         assert_eq!(results[0].url, "https://example.com");

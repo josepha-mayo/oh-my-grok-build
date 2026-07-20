@@ -24,9 +24,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
-use tokio_tungstenite::tungstenite::protocol::{
-    CloseCode as UpstreamCloseCode, CloseFrame as UpstreamCloseFrame,
-};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame as UpstreamCloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as UpstreamCloseCode;
 use tracing::{info, warn};
 use url::Url;
 
@@ -106,15 +105,12 @@ fn print_pairing_info(bind_addr: SocketAddr, secret: &str, advertise_host: Optio
     // connect with an Authorization header instead of putting the secret in
     // the WebSocket URL (which would be logged by proxies and servers).
     let payload = pairing_payload(&url, secret);
-    match qrcode::QrCode::new(payload.as_bytes()) {
-        Ok(code) => {
-            let qr = code.render().dark_color('#').light_color(' ').build();
-            println!("  pairing QR:");
-            for line in qr.lines() {
-                println!("    {line}");
-            }
+    if let Ok(code) = qrcode::QrCode::new(payload.as_bytes()) {
+        let qr = code.render().dark_color('#').light_color(' ').build();
+        println!("  pairing QR:");
+        for line in qr.lines() {
+            println!("    {line}");
         }
-        Err(_) => {}
     }
 }
 
@@ -304,7 +300,7 @@ async fn spawn_upstream_agent(
 
         if connected {
             // The handle keeps the upstream server alive; ignore its result.
-            let _ = handle;
+            std::mem::drop(handle);
             return Ok(addr);
         }
         handle.abort();
@@ -316,7 +312,7 @@ struct ProxyState {
     secret_hash: [u8; 32],
     allowed_origins: Option<Vec<String>>,
     rate_limit_per_minute: Option<u32>,
-    rate_limiter: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    rate_limiter: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
     upstream_url: String,
     upstream_secret: String,
 }
@@ -387,7 +383,16 @@ async fn handle_proxy(client_ws: WebSocket, state: Arc<ProxyState>) {
                         break;
                     }
                 }
-                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                Ok(Message::Ping(p)) => {
+                    if up_write.send(UpstreamMessage::Ping(p)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Pong(p)) => {
+                    if up_write.send(UpstreamMessage::Pong(p)).await.is_err() {
+                        break;
+                    }
+                }
                 Ok(Message::Close(frame)) => {
                     let frame = frame.map(|f| UpstreamCloseFrame {
                         code: UpstreamCloseCode::from(f.code),
@@ -414,7 +419,16 @@ async fn handle_proxy(client_ws: WebSocket, state: Arc<ProxyState>) {
                         break;
                     }
                 }
-                Ok(UpstreamMessage::Ping(_) | UpstreamMessage::Pong(_)) => continue,
+                Ok(UpstreamMessage::Ping(p)) => {
+                    if client_write.send(Message::Ping(p)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(UpstreamMessage::Pong(p)) => {
+                    if client_write.send(Message::Pong(p)).await.is_err() {
+                        break;
+                    }
+                }
                 Ok(UpstreamMessage::Close(frame)) => {
                     let client_msg = frame.map(|f| CloseFrame {
                         code: f.code.into(),
@@ -474,7 +488,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
             "serving on a non-loopback address requires --insecure-allow-lan; traffic will not be encrypted"
         );
     }
-    if !bind_addr.ip().is_loopback() && allowed_origins.as_ref().map_or(true, |v| v.is_empty()) {
+    if !bind_addr.ip().is_loopback() && allowed_origins.as_ref().is_none_or(|v| v.is_empty()) {
         bail!(
             "serving on a non-loopback address requires --allowed-origins (use '*' to allow any origin)"
         );
@@ -494,7 +508,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
         secret_hash,
         allowed_origins,
         rate_limit_per_minute,
-        rate_limiter: Mutex::new(HashMap::new()),
+        rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         upstream_url,
         upstream_secret,
     });
@@ -674,7 +688,7 @@ mod tests {
             secret_hash: *blake3::hash(secret.as_bytes()).as_bytes(),
             allowed_origins: None,
             rate_limit_per_minute: None,
-            rate_limiter: Mutex::new(HashMap::new()),
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             upstream_url: String::new(),
             upstream_secret: String::new(),
         })
@@ -695,7 +709,6 @@ mod tests {
         let headers = HeaderMap::new();
         let query = xai_grok_shell::agent::server::WsQueryParams {
             server_key: Some("my-token".into()),
-            connector: None,
         };
         assert!(validate_auth(&headers, &query, &state).await);
     }

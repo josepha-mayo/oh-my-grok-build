@@ -93,10 +93,19 @@ pub struct ExecArgs {
     pub model: Option<String>,
     #[arg(long, value_name = "FILE")]
     pub prompt_file: Option<PathBuf>,
-    #[arg(long)]
+    /// Internal: delete --prompt-file after the prompt is consumed.
+    #[arg(long, hide = true)]
+    pub prompt_file_own: bool,
+    #[arg(long, default_value_t = true)]
     pub yolo: bool,
     #[arg(long)]
     pub json: bool,
+    /// Comma-separated list of built-in tools to allow (e.g. read_file,grep,list_dir).
+    #[arg(long, value_name = "TOOLS")]
+    pub tools: Option<String>,
+    /// Comma-separated list of built-in tools to disallow (e.g. run_terminal_cmd,search_replace).
+    #[arg(long, value_name = "TOOLS")]
+    pub disallowed_tools: Option<String>,
     #[arg(long)]
     pub output_file: Option<PathBuf>,
     /// Commit changes after the prompt finishes
@@ -114,7 +123,7 @@ pub struct LoopArgs {
     pub model: Option<String>,
     #[arg(short = 'n', long, default_value = "10")]
     pub max_iterations: u32,
-    #[arg(long)]
+    #[arg(long, default_value_t = true)]
     pub yolo: bool,
     /// Commit changes after the loop finishes (required for auto-commit)
     #[arg(long)]
@@ -172,9 +181,6 @@ pub struct AddProviderArgs {
     /// API backend (defaults to chat-completions for custom providers)
     #[arg(long, value_enum)]
     pub backend: Option<ApiBackend>,
-    /// API key value to store (also reads OMGB_API_KEY env var if omitted)
-    #[arg(long, env = "OMGB_API_KEY")]
-    pub api_key: Option<String>,
     /// Environment variable name(s) to read the key from at runtime (defaults to OMGB_<id>_API_KEY, plus the canonical env var for built-in templates)
     #[arg(long)]
     pub env_key: Option<String>,
@@ -224,7 +230,7 @@ pub struct CronArgs {
     #[arg(long)]
     pub name: Option<String>,
     /// Run the job in yolo (non-interactive) mode
-    #[arg(long)]
+    #[arg(long, default_value_t = true)]
     pub yolo: bool,
 }
 
@@ -260,7 +266,7 @@ pub struct TeamArgs {
     pub model: Option<String>,
     #[arg(short, long, default_value = "2")]
     pub agents: usize,
-    #[arg(long)]
+    #[arg(long, default_value_t = true)]
     pub yolo: bool,
 }
 
@@ -271,7 +277,7 @@ pub struct SwarmArgs {
     pub model: Option<String>,
     #[arg(short, long, default_value = "3")]
     pub count: usize,
-    #[arg(long)]
+    #[arg(long, default_value_t = true)]
     pub yolo: bool,
 }
 
@@ -287,7 +293,7 @@ pub enum SubagentCommand {
     Spawn {
         prompt: String,
         /// Run the subagent in yolo (non-interactive) mode
-        #[arg(long)]
+        #[arg(long, default_value_t = true)]
         yolo: bool,
     },
     /// List running subagents
@@ -338,9 +344,6 @@ pub enum HarnessCommand {
         url: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// API key / secret value to store (also reads OMGB_API_KEY env var if omitted)
-        #[arg(long, env = "OMGB_API_KEY")]
-        api_key: Option<String>,
         /// Environment variable name to expose the connector secret as in the child process
         /// (defaults to a per-type value such as OPENAI_API_KEY for codex).
         #[arg(long)]

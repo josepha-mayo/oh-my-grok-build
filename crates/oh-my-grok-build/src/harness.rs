@@ -11,8 +11,130 @@ use tokio::io::AsyncReadExt;
 use crate::args::HarnessType;
 use crate::taste::taste_preamble;
 
+const IS_WINDOWS: bool = cfg!(windows);
+
 fn registry_path() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join("connectors.json"))
+}
+
+fn apply_minimal_env(cmd: &mut tokio::process::Command) {
+    cmd.env_clear();
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "SystemRoot",
+        "SystemDrive",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TERM",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "USER",
+        "USERNAME",
+        "LOGNAME",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+}
+
+fn base_dirs() -> Vec<PathBuf> {
+    if IS_WINDOWS {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:\\Windows"));
+        let root = PathBuf::from(root);
+        [
+            root.join("System32"),
+            root.clone(),
+            root.join("System32").join("Wbem"),
+        ]
+        .to_vec()
+    } else {
+        ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+            .map(PathBuf::from)
+            .to_vec()
+    }
+}
+
+fn executable_extensions() -> Vec<String> {
+    if IS_WINDOWS {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| {
+                String::from(".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY")
+            })
+            .split(';')
+            .map(|s| s.to_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn resolve_executable(name: &str, cwd: Option<&std::path::Path>) -> PathBuf {
+    let candidate = PathBuf::from(name);
+    if candidate.is_absolute() {
+        return candidate;
+    }
+
+    let exts = if IS_WINDOWS {
+        executable_extensions()
+    } else {
+        Vec::new()
+    };
+    let try_dir = |dir: &std::path::Path| -> Option<PathBuf> {
+        let joined = dir.join(&candidate);
+        if joined.is_file() {
+            return Some(joined);
+        }
+        for ext in &exts {
+            let with_ext = dir.join(format!("{name}{ext}"));
+            if with_ext.is_file() {
+                return Some(with_ext);
+            }
+        }
+        None
+    };
+
+    let is_relative_path = candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::Normal(_)))
+        && candidate.components().count() > 1;
+
+    // Single-component names and relative paths are both resolved against cwd first,
+    // then PATH, so connectors whose binaries live in the connector cwd work.
+    if let Some(dir) = cwd {
+        if let Some(p) = try_dir(dir) {
+            return p;
+        }
+        if is_relative_path {
+            return candidate;
+        }
+    }
+
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if let Some(p) = try_dir(&dir) {
+                return p;
+            }
+        }
+    }
+    candidate
+}
+
+fn minimal_path(binary_dir: Option<&std::path::Path>) -> String {
+    let mut dirs = base_dirs();
+    if let Some(dir) = binary_dir
+        && !dirs.iter().any(|d| d.as_path() == dir)
+    {
+        dirs.insert(0, dir.to_path_buf());
+    }
+    std::env::join_paths(dirs)
+        .map(|os| os.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -72,7 +194,7 @@ fn load_registry() -> Result<ConnectorRegistry> {
         return Ok(ConnectorRegistry::default());
     }
     let raw = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)
+    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
 fn save_registry(registry: &ConnectorRegistry) -> Result<()> {
@@ -84,6 +206,7 @@ fn save_registry(registry: &ConnectorRegistry) -> Result<()> {
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     std::fs::write(&tmp, serde_json::to_string_pretty(registry)?)?;
     std::fs::rename(&tmp, &path)?;
+    crate::providers::restrict_env_file_permissions(&path)?;
     Ok(())
 }
 
@@ -116,7 +239,6 @@ pub fn add_connector(
     mut command: Option<String>,
     url: Option<String>,
     cwd: Option<PathBuf>,
-    api_key: Option<String>,
     secret_env_key: Option<String>,
     allow_local: bool,
     allow_private: bool,
@@ -143,21 +265,15 @@ pub fn add_connector(
     let child_key = secret_env_key
         .clone()
         .or_else(|| default_secret_env_key(&type_str).map(|s| s.to_string()));
-    if let Some(ref key) = child_key {
-        if !crate::providers::is_valid_env_key(key) {
-            bail!(
-                "secret-env-key must end with _API_KEY and contain only uppercase A-Z, 0-9, and underscores"
-            );
-        }
+    if let Some(ref key) = child_key
+        && !crate::providers::is_valid_env_key(key)
+    {
+        bail!(
+            "secret-env-key must end with _API_KEY and contain only uppercase A-Z, 0-9, and underscores"
+        );
     }
 
-    if let Some(key) = api_key {
-        if !key.is_empty() {
-            let storage = crate::providers::env_var_name(&name);
-            crate::providers::write_api_key(&name, Some(std::slice::from_ref(&storage)), &key)?;
-        }
-    }
-
+    let storage = crate::providers::env_var_name(&name);
     registry.connectors.insert(
         name.clone(),
         ConnectorConfig {
@@ -171,7 +287,15 @@ pub fn add_connector(
             allow_private,
         },
     );
-    save_registry(&registry)
+    save_registry(&registry)?;
+
+    // API keys are only accepted via OMGB_API_KEY; persist the secret only after
+    // the connector registry has been saved successfully.
+    if let Some(key) = std::env::var("OMGB_API_KEY").ok().filter(|s| !s.is_empty()) {
+        crate::providers::write_api_key(&storage, Some(std::slice::from_ref(&storage)), &key)?;
+    }
+
+    Ok(())
 }
 
 pub fn list_connectors() -> Result<Vec<ConnectorConfig>> {
@@ -230,7 +354,16 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         bail!("connector command must contain {placeholder}");
     }
 
-    let mut cmd = tokio::process::Command::new(&parts[0]);
+    let parent_cwd = std::env::current_dir()?;
+    let resolve_dir = cfg
+        .cwd
+        .as_ref()
+        .map(|c| parent_cwd.join(c))
+        .or_else(|| Some(parent_cwd.clone()));
+    let resolved = resolve_executable(&parts[0], resolve_dir.as_deref());
+    let binary_dir = resolved.parent().map(|p| p.to_path_buf());
+
+    let mut cmd = tokio::process::Command::new(&resolved);
     cmd.args(&parts[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -239,6 +372,9 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         validate_cwd(cwd)?;
         cmd.current_dir(cwd);
     }
+    apply_minimal_env(&mut cmd);
+    cmd.env("PATH", minimal_path(binary_dir.as_deref()));
+
     let storage = crate::providers::env_var_name(name);
     if let Some(ref child_key) = cfg.secret_env_key {
         if !crate::providers::is_valid_env_key(child_key) {
@@ -311,7 +447,6 @@ mod tests {
             "héllo".into(),
             HarnessType::Codex,
             Some("codex exec --json {prompt}".into()),
-            None,
             None,
             None,
             None,
