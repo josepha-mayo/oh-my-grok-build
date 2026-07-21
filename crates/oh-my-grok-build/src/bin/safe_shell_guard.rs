@@ -59,6 +59,9 @@ const UNANALYZABLE_COMMANDS: &[&str] = &[
     "nsenter",
     "pkexec",
     "run0",
+    "wscript",
+    "cscript",
+    "mshta",
 ];
 
 const WINDOWS_CMD_LAUNCHERS: &[&str] = &["start", "call", "runas"];
@@ -110,6 +113,21 @@ const NORMALIZABLE_STEMS: &[&str] = &[
 const WIN_EXEC_EXTS: &[&str] = &[
     ".exe", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf", ".msc", ".cpl", ".scr", ".pif",
 ];
+
+/// Script extensions that, when executed directly, run arbitrary code through
+/// an interpreter. We block them unless the stripped base name is already a
+/// known unanalyzable or dangerous command.
+const SCRIPT_EXTS: &[&str] = &[
+    ".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf", ".py", ".pl", ".rb", ".sh", ".hta", ".scr",
+    ".pif", ".cpl", ".msc",
+];
+
+fn win_exec_ext(s: &str) -> Option<&str> {
+    WIN_EXEC_EXTS
+        .iter()
+        .find(|&&ext| s.len() >= ext.len() && s[s.len() - ext.len()..].eq_ignore_ascii_case(ext))
+        .copied()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum QuoteKind {
@@ -301,12 +319,11 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
 }
 
 fn strip_win_exec_ext(s: &str) -> &str {
-    for ext in WIN_EXEC_EXTS {
-        if s.len() >= ext.len() && s[s.len() - ext.len()..].eq_ignore_ascii_case(ext) {
-            return &s[..s.len() - ext.len()];
-        }
+    if let Some(ext) = win_exec_ext(s) {
+        &s[..s.len() - ext.len()]
+    } else {
+        s
     }
-    s
 }
 
 fn version_suffix_start(s: &str) -> Option<usize> {
@@ -433,6 +450,17 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
                 return Decision::Deny(format!(
                     "Blocked potentially destructive command: {}",
                     base
+                ));
+            }
+
+            if let Some(ext) = win_exec_ext(&cmd_token.value)
+                && SCRIPT_EXTS.contains(&ext)
+                && !UNANALYZABLE_COMMANDS.contains(&base.as_str())
+                && !DANGEROUS_COMMANDS.contains(&base.as_str())
+            {
+                return Decision::Deny(format!(
+                    "Blocked unanalyzable script file: {}",
+                    cmd_token.value
                 ));
             }
 
@@ -1576,6 +1604,28 @@ mod tests {
                     r
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn windows_script_hosts_and_extensions() {
+        for (cmd, reason) in &[
+            ("wscript script.js", "Blocked unanalyzable command: wscript"),
+            (
+                "cscript script.vbs",
+                "Blocked unanalyzable command: cscript",
+            ),
+            ("mshta foo.hta", "Blocked unanalyzable command: mshta"),
+            ("foo.js", "Blocked unanalyzable script file:"),
+            ("foo.bat", "Blocked unanalyzable script file:"),
+            ("foo.ps1", "Blocked unanalyzable script file:"),
+            ("cmd /c foo.js", "Blocked unanalyzable script file:"),
+            (
+                "cmd /c c:\\\\path\\\\foo.bat",
+                "Blocked unanalyzable script file:",
+            ),
+        ] {
+            deny(cmd, reason);
         }
     }
 

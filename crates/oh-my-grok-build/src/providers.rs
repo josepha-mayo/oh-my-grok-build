@@ -114,9 +114,11 @@ pub(crate) fn load_env_file() -> Result<HashMap<String, String>> {
     Ok(parse_env_entries(&raw).into_iter().collect())
 }
 
-/// Returns the set of `*_API_KEY` environment variable names that are
-/// referenced by configured providers or connectors. Only these keys are
-/// loaded into the process environment at startup.
+/// Returns the set of `*_API_KEY` environment variable names that should be
+/// loaded into the process environment at startup. Includes keys referenced by
+/// configured providers/connectors plus any valid `*_API_KEY` entries already
+/// present in `~/.omgb/.env`, so catalog-based MoE routing can find keys that
+/// have not yet been persisted into a provider config.
 pub(crate) fn env_keys_to_load() -> HashSet<String> {
     let mut keys = HashSet::new();
     if let Ok(cfg) = load_omg_config() {
@@ -142,6 +144,15 @@ pub(crate) fn env_keys_to_load() -> HashSet<String> {
                 {
                     keys.insert(secret.to_string());
                 }
+            }
+        }
+    }
+    if let Ok(path) = omg_env_path()
+        && let Ok(raw) = std::fs::read_to_string(&path)
+    {
+        for (k, _) in parse_env_entries(&raw) {
+            if is_valid_env_key(&k) {
+                keys.insert(k);
             }
         }
     }
@@ -477,6 +488,24 @@ pub fn list_providers() -> Result<Vec<ProviderConfig>> {
 pub fn get_provider(id: &str) -> Result<Option<ProviderConfig>> {
     let cfg = load_omg_config()?;
     Ok(cfg.providers.get(id).cloned())
+}
+
+/// If `id` is already in `~/.omgb/config.json`, return it. Otherwise try to
+/// materialise a known built-in or catalog template, persist it, and sync it to
+/// `~/.grok/config.toml` so upstream model resolution can use `omgb-{id}`.
+pub fn ensure_provider_configured(id: &str) -> Result<ProviderConfig> {
+    let id = sanitize_provider_id(id);
+    let mut cfg = load_omg_config()?;
+    if let Some(p) = cfg.providers.get(&id).cloned() {
+        return Ok(p);
+    }
+    let provider = provider_template(&id).ok_or_else(|| {
+        anyhow::anyhow!("provider '{id}' is not configured and has no known template")
+    })?;
+    cfg.providers.insert(id.clone(), provider.clone());
+    save_omg_config(&cfg)?;
+    sync_provider_to_grok_config(&provider)?;
+    Ok(provider)
 }
 
 pub fn remove_provider(id: &str) -> Result<()> {

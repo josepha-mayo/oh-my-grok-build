@@ -433,9 +433,11 @@ async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
 
 async fn run_use(args: UseArgs) -> Result<()> {
     if !(args.yolo || desktop_control_allowed()) {
-        bail!("desktop control requires --yolo or OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on");
+        bail!(
+            "desktop control requires OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on to enable; use --yolo to auto-approve tool use"
+        );
     }
-    let yolo = args.yolo || desktop_control_allowed();
+    let yolo = args.yolo;
     let prompt = format!("{}\n\nUse the computer as needed.", args.prompt);
     run_single_turn_with(
         &prompt,
@@ -453,9 +455,11 @@ async fn run_use(args: UseArgs) -> Result<()> {
 
 async fn run_browser(args: BrowserArgs) -> Result<()> {
     if !(args.yolo || desktop_control_allowed()) {
-        bail!("desktop control requires --yolo or OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on");
+        bail!(
+            "desktop control requires OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on to enable; use --yolo to auto-approve tool use"
+        );
     }
-    let yolo = args.yolo || desktop_control_allowed();
+    let yolo = args.yolo;
     let mut prompt = args.prompt.clone();
     if let Some(url) = args.url {
         crate::net::validate_url(&url, args.allow_local, args.allow_private).await?;
@@ -490,10 +494,11 @@ async fn run_single_turn_with(
     let full_prompt = format!("{}{}", prompt, taste::taste_preamble());
     let model = if let Some(m) = model {
         Some(m)
+    } else if let Ok(id) = moe::select_provider(prompt) {
+        providers::ensure_provider_configured(&id)?;
+        Some(format!("omgb-{id}"))
     } else {
-        moe::select_provider(prompt)
-            .ok()
-            .map(|id| format!("omgb-{id}"))
+        None
     };
     let options = HeadlessOptions {
         session_id: None,
