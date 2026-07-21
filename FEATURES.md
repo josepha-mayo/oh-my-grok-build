@@ -74,10 +74,12 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | Safe env filtering for providers/MCP (`*_API_KEY` only, block `PATH`/`LD_PRELOAD`/etc.) | ✅ |
 | Desktop-control safety (`OMGB_ALLOW_DESKTOP_CONTROL` gating) | ✅ |
 | `omgb commit` / `omgb review` / `omgb undo` helpers | ✅ |
-| Tests for every new crate (`cargo test`) | ✅ |
-| `cargo fmt`, `cargo clippy`, `cargo test` green on CI | ✅ |
+| Tests for every new crate (`cargo test`) | 🚧 |
+| `cargo fmt`, `cargo clippy`, `cargo test` green on CI | 🚧 |
 
 > Phase 1 features are implemented as modules inside `crates/oh-my-grok-build`; the separate `omgb-*` crates listed in the repo layout may be extracted once the harness stabilizes.
+>
+> Build verification update (2026-07-21): local `cargo check -p oh-my-grok-build` and `cargo test -p oh-my-grok-build --lib` pass after installing WinLibs MinGW-w64 and protoc. Full `cargo clippy --workspace` and `cargo test --workspace` still need CI environment tuning (upstream crates emit warnings and local OOM linking test binaries).
 
 ### Phase 2 — Advanced harness gaps
 
