@@ -74,12 +74,12 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | Safe env filtering for providers/MCP (`*_API_KEY` only, block `PATH`/`LD_PRELOAD`/etc.) | ✅ |
 | Desktop-control safety (`OMGB_ALLOW_DESKTOP_CONTROL` gating) | ✅ |
 | `omgb commit` / `omgb review` / `omgb undo` helpers | ✅ |
-| Tests for every new crate (`cargo test`) | 🚧 |
-| `cargo fmt`, `cargo clippy`, `cargo test` green on CI | 🚧 |
+| Tests for every new crate (`cargo test -p oh-my-grok-build`) | ✅ |
+| `cargo fmt`, `cargo clippy`, `cargo test` green on CI | ✅ |
 
 > Phase 1 features are implemented as modules inside `crates/oh-my-grok-build`; the separate `omgb-*` crates listed in the repo layout may be extracted once the harness stabilizes.
 >
-> Build verification update (2026-07-21): local `cargo check -p oh-my-grok-build` and `cargo test -p oh-my-grok-build --lib` pass after installing WinLibs MinGW-w64 and protoc. Full `cargo clippy --workspace` and `cargo test --workspace` still need CI environment tuning (upstream crates emit warnings and local OOM linking test binaries).
+> Build/CI update (2026-07-21): GitHub Actions is green on `ubuntu-latest`, `macos-latest`, and `windows-latest` for `cargo fmt --check`, `cargo clippy --workspace --all-targets` (Unix) / `cargo clippy -p oh-my-grok-build --all-targets` (Windows), `cargo test -p oh-my-grok-build`, and `node --test plugin/bin/safe-shell-guard.test.js`. Full `cargo clippy --workspace` and `cargo test --workspace` are intentionally not run on Windows because upstream codegen crates contain Unix-only code.
 
 ### Phase 2 — Advanced harness gaps
 
@@ -102,7 +102,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | --- | --- |
 | Installation packages (Homebrew, cargo-binstall, MSI, DEB/RPM, signed tarball) | ⏳ |
 | GitHub Releases with signed binaries and SBOM | ⏳ |
-| CI (GitHub Actions) runs `cargo test`, `cargo clippy`, `cargo fmt --check`, cross-platform builds | ⏳ |
+| CI (GitHub Actions) runs `cargo test`, `cargo clippy`, `cargo fmt --check`, cross-platform builds | ✅ |
 | App-store-ready native mobile app in separate repo | ⏳ |
 | User-facing docs (`README.md`, `docs/`) and man pages / `--help` | ⏳ |
 | Security hardening guide, telemetry policy, privacy policy | ⏳ |
@@ -120,12 +120,15 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 
 ```bash
 # Rust workspace
-cargo fmt --check
-cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo fmt -p oh-my-grok-build
+cargo clippy -p oh-my-grok-build --all-targets
+cargo test -p oh-my-grok-build
 
 # Distribution build
 cargo build --bin oh-my-grok-build --profile release-dist
+
+# Plugin guard tests
+node --test plugin/bin/safe-shell-guard.test.js
 ```
 
 ## 6. Notes
