@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${GROK_PLUGIN_ROOT}/bin/safe-shell-guard",
+            "command": "../bin/safe-shell-guard",
             "timeout": 5
           }
         ]

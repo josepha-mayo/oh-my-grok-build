@@ -91,7 +91,17 @@ fn pairing_host(bind_addr: SocketAddr, advertise_host: Option<IpAddr>) -> String
 
 fn pairing_url(bind_addr: SocketAddr, advertise_host: Option<IpAddr>) -> String {
     let host = pairing_host(bind_addr, advertise_host);
-    format!("ws://{host}:{}/ws", bind_addr.port())
+    let is_loopback = advertise_host
+        .map(|ip| ip.is_loopback())
+        .unwrap_or_else(|| bind_addr.ip().is_loopback());
+    let scheme = if is_loopback { "ws" } else { "wss" };
+    let port = bind_addr.port();
+    let default_port = if scheme == "wss" { 443 } else { 80 };
+    if port == default_port {
+        format!("{scheme}://{host}/ws")
+    } else {
+        format!("{scheme}://{host}:{port}/ws")
+    }
 }
 
 fn pairing_payload(url: &str, secret: &str) -> String {
@@ -495,7 +505,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     }
     if !bind_addr.ip().is_loopback() {
         eprintln!(
-            "warning: omgb serve is listening on a non-loopback address; WebSocket traffic is unencrypted"
+            "warning: omgb serve is listening on a non-loopback address; use a TLS-terminating reverse proxy because the pairing URL uses wss://"
         );
     }
 
@@ -635,14 +645,20 @@ mod tests {
     fn test_pairing_url_no_secret() {
         let bind = SocketAddr::new("0.0.0.0".parse().unwrap(), 2419);
         let host = Some("192.168.1.2".parse().unwrap());
-        assert_eq!(pairing_url(bind, host), "ws://192.168.1.2:2419/ws");
+        assert_eq!(pairing_url(bind, host), "wss://192.168.1.2:2419/ws");
+    }
+
+    #[test]
+    fn test_pairing_url_loopback() {
+        let bind = SocketAddr::new("127.0.0.1".parse().unwrap(), 2419);
+        assert_eq!(pairing_url(bind, None), "ws://127.0.0.1:2419/ws");
     }
 
     #[test]
     fn test_pairing_payload() {
-        let payload = pairing_payload("ws://192.168.1.2:2419/ws", "abc123");
+        let payload = pairing_payload("wss://192.168.1.2:2419/ws", "abc123");
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(parsed["url"], "ws://192.168.1.2:2419/ws");
+        assert_eq!(parsed["url"], "wss://192.168.1.2:2419/ws");
         assert_eq!(parsed["secret"], "abc123");
     }
 

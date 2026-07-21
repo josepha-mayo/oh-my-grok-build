@@ -9,7 +9,8 @@ __pycache__/
 # Local Windows protoc binary used when the DotSlash script isn't executable
 /bin/protoc.exe
 # Built safe-shell-guard binary copied from target (see AGENTS.md)
-/plugin/bin/safe-shell-guard*
+/plugin/bin/safe-shell-guard
+/plugin/bin/safe-shell-guard.exe
 # Temporary guard test artifacts
 /safe_shell_guard_test*
 /guard_test.*

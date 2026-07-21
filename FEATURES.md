@@ -79,7 +79,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 
 > Phase 1 features are implemented as modules inside `crates/oh-my-grok-build`; the separate `omgb-*` crates listed in the repo layout may be extracted once the harness stabilizes.
 >
-> Build/CI update (2026-07-21): GitHub Actions is green on `ubuntu-latest`, `macos-latest`, and `windows-latest` for `cargo fmt --check`, `cargo clippy --workspace --all-targets` (Unix) / `cargo clippy -p oh-my-grok-build --all-targets` (Windows), `cargo test -p oh-my-grok-build`, and `node --test plugin/bin/safe-shell-guard.test.js`. Full `cargo clippy --workspace` and `cargo test --workspace` are intentionally not run on Windows because upstream codegen crates contain Unix-only code.
+> Build/CI update (2026-07-21): GitHub Actions is green on `ubuntu-latest`, `macos-latest`, and `windows-latest` for `cargo fmt --check`, `cargo clippy --workspace --all-targets` (Unix) / `cargo clippy -p oh-my-grok-build --all-targets` (Windows), `cargo test -p oh-my-grok-build`, and `cargo build -p oh-my-grok-build --bin safe-shell-guard` with the binary copied to `plugin/bin/safe-shell-guard` for hook verification. Full `cargo clippy --workspace` and `cargo test --workspace` are intentionally not run on Windows because upstream codegen crates contain Unix-only code.
 
 ### Phase 2 — Advanced harness gaps
 

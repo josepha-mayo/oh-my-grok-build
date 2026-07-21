@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 
+use crate::net::is_url_host_loopback;
 use crate::providers::{
     ProviderConfig, env_var_name, is_valid_env_key, load_env_file, load_omg_config,
 };
@@ -126,7 +127,11 @@ pub fn provider_cost(id: &str) -> f64 {
 }
 
 fn is_local_provider(id: &str) -> bool {
-    LOCAL_IDS.contains(&id) || id.starts_with("local-") || id.contains("local")
+    LOCAL_IDS
+        .iter()
+        .any(|prefix| *prefix == id || id.starts_with(&format!("{prefix}-")))
+        || id.starts_with("local-")
+        || id.contains("local")
 }
 
 fn is_fast_provider(id: &str) -> bool {
@@ -157,10 +162,11 @@ fn task_contains_word(task: &str, word: &str) -> bool {
     false
 }
 
-/// Returns the configured providers that currently have a non-empty `*_API_KEY`
-/// in `~/.omgb/.env` or the process environment. Also detects catalog templates
-/// whose canonical env key is present even when they have not been explicitly
-/// configured.
+/// Returns the configured providers that are available: they have a non-empty
+/// `*_API_KEY` in `~/.omgb/.env` or the process environment, or their base URL
+/// points at a loopback/local endpoint (so keyless local servers can be routed
+/// to). Also detects catalog templates whose canonical env key is present even
+/// when they have not been explicitly configured.
 pub fn available_providers() -> Result<Vec<String>> {
     let cfg = load_omg_config()?;
     let dotenv = load_env_file().unwrap_or_default();
@@ -168,14 +174,14 @@ pub fn available_providers() -> Result<Vec<String>> {
     let mut ids = std::collections::HashSet::new();
 
     for provider in cfg.providers.values() {
-        if provider_has_key(provider, &dotenv) {
+        if provider_is_available(provider, &dotenv, true) {
             ids.insert(provider.id.clone());
         }
     }
 
     for template in crate::providers::catalog::TEMPLATES {
         let provider = template.to_provider_config();
-        if provider_has_key(&provider, &dotenv) {
+        if provider_is_available(&provider, &dotenv, false) {
             ids.insert(provider.id);
         }
     }
@@ -186,7 +192,14 @@ pub fn available_providers() -> Result<Vec<String>> {
     Ok(ids)
 }
 
-fn provider_has_key(provider: &ProviderConfig, dotenv: &HashMap<String, String>) -> bool {
+fn provider_is_available(
+    provider: &ProviderConfig,
+    dotenv: &HashMap<String, String>,
+    allow_loopback: bool,
+) -> bool {
+    if allow_loopback && is_url_host_loopback(&provider.base_url) {
+        return true;
+    }
     let storage = env_var_name(&provider.id);
     let mut keys: Vec<&str> = provider
         .env_key
@@ -218,7 +231,7 @@ pub fn select_provider(task: &str) -> Result<String> {
 /// making unit tests independent of the host environment.
 pub fn select_provider_from(available: &[String], task: &str) -> Result<String> {
     if available.is_empty() {
-        bail!("no providers configured with a non-empty *_API_KEY");
+        bail!("no providers available (set *_API_KEY or use a loopback local server)");
     }
 
     let task_lower = task.to_ascii_lowercase();

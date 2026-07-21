@@ -435,17 +435,17 @@ async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
 }
 
 async fn run_use(args: UseArgs) -> Result<()> {
-    if !(args.yolo || desktop_control_allowed()) {
-        bail!(
-            "desktop control requires OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on to enable; use --yolo to auto-approve tool use"
-        );
+    if !args.yolo {
+        bail!("`omgb use` requires --yolo to auto-approve tool use");
     }
-    let yolo = args.yolo;
+    if !desktop_control_allowed() {
+        bail!("desktop control requires OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on");
+    }
     let prompt = format!("{}\n\nUse the computer as needed.", args.prompt);
     run_single_turn_with(
         &prompt,
         args.model,
-        yolo,
+        args.yolo,
         OutputFormat::Plain,
         None,
         Some("run_terminal_cmd,read_file,search_replace,grep,list_dir".to_string()),
@@ -457,12 +457,12 @@ async fn run_use(args: UseArgs) -> Result<()> {
 }
 
 async fn run_browser(args: BrowserArgs) -> Result<()> {
-    if !(args.yolo || desktop_control_allowed()) {
-        bail!(
-            "desktop control requires OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on to enable; use --yolo to auto-approve tool use"
-        );
+    if !args.yolo {
+        bail!("`omgb browser` requires --yolo to auto-approve tool use");
     }
-    let yolo = args.yolo;
+    if !desktop_control_allowed() {
+        bail!("desktop control requires OMGB_ALLOW_DESKTOP_CONTROL=1/true/yes/on");
+    }
     let mut prompt = args.prompt.clone();
     if let Some(url) = args.url {
         crate::net::validate_url(&url, args.allow_local, args.allow_private).await?;
@@ -472,7 +472,7 @@ async fn run_browser(args: BrowserArgs) -> Result<()> {
     run_single_turn_with(
         &prompt,
         args.model,
-        yolo,
+        args.yolo,
         OutputFormat::Plain,
         None,
         None,

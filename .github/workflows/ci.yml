@@ -36,3 +36,11 @@ jobs:
       - run: cargo fmt --check
       - run: ${{ matrix.clippy }}
       - run: ${{ matrix.test }}
+      - name: Build and install safe-shell-guard hook binary
+        shell: bash
+        run: |
+          cargo build -p oh-my-grok-build --bin safe-shell-guard
+          mkdir -p plugin/bin
+          for f in target/debug/safe-shell-guard target/debug/safe-shell-guard.exe; do
+            if [ -f "$f" ]; then cp "$f" plugin/bin/; fi
+          done

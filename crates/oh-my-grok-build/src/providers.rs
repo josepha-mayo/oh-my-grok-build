@@ -1000,7 +1000,7 @@ pub fn add_discovered_providers(
                 model: model.id.clone(),
                 base_url: base_url.into(),
                 api_backend: Some("chat_completions".into()),
-                env_key: provider_env_keys(&id, Some(provider.as_str())),
+                env_key: provider_env_keys(&id, None),
                 extra_headers: None,
                 context_window: Some(model.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)),
                 auto_compact_threshold_percent: Some(80),

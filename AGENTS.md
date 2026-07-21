@@ -45,8 +45,8 @@ cargo clippy -p oh-my-grok-build
 cargo test -p oh-my-grok-build
 ```
 
-The binary is produced at `target/release/omgb` (`target\release\omgb.exe` on Windows).
-Build the `safe-shell-guard` hook binary with `cargo build --bin safe-shell-guard --release` and copy it to `plugin/bin/safe-shell-guard` (or `plugin\bin\safe-shell-guard.exe` on Windows) so the plugin hook can resolve it.
+The `omgb` binary is produced at `target/release/omgb` (`target\release\omgb.exe` on Windows).
+`cargo build -p oh-my-grok-build` also builds `safe-shell-guard` (`target/release/safe-shell-guard`/`safe-shell-guard.exe`). Copy that binary to `plugin/bin/safe-shell-guard` (or `plugin\bin\safe-shell-guard.exe` on Windows) so the plugin hook (`../bin/safe-shell-guard`) resolves it.
 
 ### Build dependencies
 
