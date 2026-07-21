@@ -14,11 +14,12 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            # Upstream codegen clippy still compiles on Unix; test only omgb.
             clippy: cargo clippy --workspace --all-targets
-            test: cargo test --workspace
+            test: cargo test -p oh-my-grok-build
           - os: macos-latest
             clippy: cargo clippy --workspace --all-targets
-            test: cargo test --workspace
+            test: cargo test -p oh-my-grok-build
           - os: windows-latest
             # Upstream codegen crates still contain Unix-only tests/examples.
             # Validate the omgb crate (which is intended to be cross-platform).
@@ -35,3 +36,4 @@ jobs:
       - run: cargo fmt --check
       - run: ${{ matrix.clippy }}
       - run: ${{ matrix.test }}
+      - run: node --test plugin/bin/safe-shell-guard.test.js
