@@ -13,6 +13,9 @@ const UNANALYZABLE_COMMANDS: &[&str] = &[
     "python",
     "python2",
     "python3",
+    "pythonw",
+    "py",
+    "pyw",
     "perl",
     "ruby",
     "node",
@@ -59,6 +62,7 @@ const UNANALYZABLE_COMMANDS: &[&str] = &[
     "nsenter",
     "pkexec",
     "run0",
+    "runas",
     "wscript",
     "cscript",
     "mshta",
@@ -72,6 +76,8 @@ const NORMALIZABLE_STEMS: &[&str] = &[
     "python",
     "python2",
     "python3",
+    "pythonw",
+    "pyw",
     "perl",
     "ruby",
     "node",
@@ -118,12 +124,19 @@ const WIN_EXEC_EXTS: &[&str] = &[
 /// an interpreter. We block them unless the stripped base name is already a
 /// known unanalyzable or dangerous command.
 const SCRIPT_EXTS: &[&str] = &[
-    ".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf", ".py", ".pl", ".rb", ".sh", ".hta", ".scr",
-    ".pif", ".cpl", ".msc",
+    ".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf", ".py", ".pyw", ".pl", ".rb", ".sh", ".hta",
+    ".scr", ".pif", ".cpl", ".msc",
 ];
 
 fn win_exec_ext(s: &str) -> Option<&str> {
     WIN_EXEC_EXTS
+        .iter()
+        .find(|&&ext| s.len() >= ext.len() && s[s.len() - ext.len()..].eq_ignore_ascii_case(ext))
+        .copied()
+}
+
+fn script_ext(s: &str) -> Option<&str> {
+    SCRIPT_EXTS
         .iter()
         .find(|&&ext| s.len() >= ext.len() && s[s.len() - ext.len()..].eq_ignore_ascii_case(ext))
         .copied()
@@ -453,8 +466,16 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
                 ));
             }
 
-            if let Some(ext) = win_exec_ext(&cmd_token.value)
-                && SCRIPT_EXTS.contains(&ext)
+            let exec_or_script_ext = win_exec_ext(&cmd_token.value)
+                .and_then(|ext| {
+                    if SCRIPT_EXTS.contains(&ext) {
+                        Some(ext)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| script_ext(&cmd_token.value));
+            if exec_or_script_ext.is_some()
                 && !UNANALYZABLE_COMMANDS.contains(&base.as_str())
                 && !DANGEROUS_COMMANDS.contains(&base.as_str())
             {
@@ -1188,7 +1209,10 @@ fn is_dangerous_rm_target(arg: &str) -> bool {
 
     if !home.is_empty() {
         let home_norm = normalize_target(&home);
-        if normalized.to_lowercase() == home_norm.to_lowercase() {
+        if normalized
+            .trim_end_matches(['/', '\\'])
+            .eq_ignore_ascii_case(home_norm.trim_end_matches(['/', '\\']))
+        {
             return true;
         }
     }
@@ -1581,6 +1605,17 @@ mod tests {
                 "cmd /c \"\" runas /user:admin powershell",
                 "Blocked unanalyzable command: runas",
             ),
+            (
+                "runas /user:admin powershell",
+                "Blocked unanalyzable command: runas",
+            ),
+            ("py -c \"print(1)\"", "Blocked unanalyzable command: py"),
+            ("pythonw script.py", "Blocked unanalyzable command: pythonw"),
+            (
+                "pythonw3.11 -c \"print(1)\"",
+                "Blocked unanalyzable command: pythonw",
+            ),
+            ("rm -rf ~/", "Blocked rm -rf on a dangerous target"),
         ] {
             deny(cmd, reason);
         }
@@ -1619,7 +1654,12 @@ mod tests {
             ("foo.js", "Blocked unanalyzable script file:"),
             ("foo.bat", "Blocked unanalyzable script file:"),
             ("foo.ps1", "Blocked unanalyzable script file:"),
+            ("foo.py", "Blocked unanalyzable script file:"),
+            ("foo.pyw", "Blocked unanalyzable script file:"),
+            ("foo.hta", "Blocked unanalyzable script file:"),
+            ("foo.pl", "Blocked unanalyzable script file:"),
             ("cmd /c foo.js", "Blocked unanalyzable script file:"),
+            ("cmd /c foo.py", "Blocked unanalyzable script file:"),
             (
                 "cmd /c c:\\\\path\\\\foo.bat",
                 "Blocked unanalyzable script file:",
