@@ -11,6 +11,7 @@ use chrono::{DateTime, Local, Utc};
 use croner::Cron;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(300);
@@ -220,38 +221,64 @@ pub async fn run_job(name: &str, capture: bool) -> Result<()> {
     if let Some(model) = &job.model {
         cmd.arg("--model").arg(model);
     }
-    crate::configure_detached_cmd(&mut cmd);
-
     if capture {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn()?;
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
+    } else {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    let (mut child, group) = crate::spawn_with_process_group(cmd)?;
+
+    if capture {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("scheduler stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("scheduler stderr was not piped"))?;
         let log_path = crate::providers::omg_dir()?.join("scheduler.log");
-        let mut log = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .await?;
-        let mut log2 = log.try_clone().await?;
-        let copy_out = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stdout, &mut log).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let writer = tokio::spawn(async move {
+            let parent = log_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("scheduler log path has no parent directory"))?;
+            tokio::fs::create_dir_all(parent).await?;
+            let mut log = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .await?;
+            while let Some(chunk) = rx.recv().await {
+                log.write_all(&chunk).await?;
+            }
+            log.flush().await?;
+            Ok::<_, anyhow::Error>(())
         });
-        let copy_err = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stderr, &mut log2).await;
-        });
+        let copy_out = tokio::spawn(copy_stream_to_log_sender(stdout, "stdout", tx.clone()));
+        let copy_err = tokio::spawn(copy_stream_to_log_sender(stderr, "stderr", tx));
         let status = match tokio::time::timeout(DEFAULT_JOB_TIMEOUT, child.wait()).await {
             Ok(s) => s?,
             Err(_) => {
-                let _ = child.kill().await;
+                crate::kill_child_and_reap(&mut child, group.as_ref()).await;
+                copy_out.abort();
+                copy_err.abort();
+                writer.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(copy_out, copy_err, writer)
+                })
+                .await;
                 bail!(
                     "job '{name}' timed out after {}s",
                     DEFAULT_JOB_TIMEOUT.as_secs()
                 );
             }
         };
-        let _ = copy_out.await;
-        let _ = copy_err.await;
+        crate::kill_process_group(group.as_ref());
+        let (c_out, c_err, w) = tokio::join!(copy_out, copy_err, writer);
+        c_out??;
+        c_err??;
+        w??;
         if !status.success() {
             Err(anyhow::anyhow!(
                 "job '{name}' exited with status {}",
@@ -261,14 +288,17 @@ pub async fn run_job(name: &str, capture: bool) -> Result<()> {
             Ok(())
         }
     } else {
-        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        let status = match tokio::time::timeout(DEFAULT_JOB_TIMEOUT, cmd.status()).await {
+        let status = match tokio::time::timeout(DEFAULT_JOB_TIMEOUT, child.wait()).await {
             Ok(s) => s?,
-            Err(_) => bail!(
-                "job '{name}' timed out after {}s",
-                DEFAULT_JOB_TIMEOUT.as_secs()
-            ),
+            Err(_) => {
+                crate::kill_child_and_reap(&mut child, group.as_ref()).await;
+                bail!(
+                    "job '{name}' timed out after {}s",
+                    DEFAULT_JOB_TIMEOUT.as_secs()
+                );
+            }
         };
+        crate::kill_process_group(group.as_ref());
         if !status.success() {
             Err(anyhow::anyhow!(
                 "job '{name}' exited with status {}",
@@ -289,8 +319,7 @@ pub async fn spawn_daemon() -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(false);
-    crate::configure_detached_cmd(&mut cmd);
-    cmd.spawn()?;
+    crate::spawn_detached(cmd)?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let path = pid_path()?;
     if let Ok(raw) = std::fs::read_to_string(&path)
@@ -438,6 +467,24 @@ fn parse_interval(expr: &str) -> Option<u64> {
         return None;
     }
     Some(secs)
+}
+
+async fn copy_stream_to_log_sender<R: tokio::io::AsyncRead + Unpin>(
+    mut stream: R,
+    label: &'static str,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                tx.send(buf[..n].to_vec()).await?;
+            }
+            Err(e) => bail!("failed to read scheduler {label}: {e}"),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
