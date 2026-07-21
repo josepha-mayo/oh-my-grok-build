@@ -77,6 +77,7 @@ const NORMALIZABLE_STEMS: &[&str] = &[
     "python2",
     "python3",
     "pythonw",
+    "py",
     "pyw",
     "perl",
     "ruby",
@@ -475,10 +476,7 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
                     }
                 })
                 .or_else(|| script_ext(&cmd_token.value));
-            if exec_or_script_ext.is_some()
-                && !UNANALYZABLE_COMMANDS.contains(&base.as_str())
-                && !DANGEROUS_COMMANDS.contains(&base.as_str())
-            {
+            if exec_or_script_ext.is_some() {
                 return Decision::Deny(format!(
                     "Blocked unanalyzable script file: {}",
                     cmd_token.value
@@ -1610,11 +1608,14 @@ mod tests {
                 "Blocked unanalyzable command: runas",
             ),
             ("py -c \"print(1)\"", "Blocked unanalyzable command: py"),
+            ("py3 -c \"print(1)\"", "Blocked unanalyzable command: py"),
+            ("py3.11 -c \"print(1)\"", "Blocked unanalyzable command: py"),
             ("pythonw script.py", "Blocked unanalyzable command: pythonw"),
             (
                 "pythonw3.11 -c \"print(1)\"",
                 "Blocked unanalyzable command: pythonw",
             ),
+            ("pyw3 -c \"print(1)\"", "Blocked unanalyzable command: pyw"),
             ("rm -rf ~/", "Blocked rm -rf on a dangerous target"),
         ] {
             deny(cmd, reason);

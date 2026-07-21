@@ -32,12 +32,15 @@ fn desktop_control_allowed() -> bool {
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
-/// Loads `*_API_KEY` entries referenced by configured providers/connectors
-/// from `~/.omgb/.env` into the process environment.
+/// Loads valid `*_API_KEY` entries from `~/.omgb/.env` into the process
+/// environment, including keys referenced by configured providers/connectors
+/// plus any valid `*_API_KEY` entries already present in the file. This lets
+/// catalog-based MoE routing discover keys before a provider has been persisted
+/// to config.
 ///
 /// This is a bridge to the upstream Grok Build harness, which reads provider
-/// secrets from the process environment via `env_key`. Only the keys that are
-/// actually referenced are loaded, and only before any other thread starts.
+/// secrets from the process environment via `env_key`. It is called only before
+/// any other thread starts.
 ///
 /// # Safety
 /// Must be called before any other thread can read the environment. This is the
@@ -57,7 +60,7 @@ unsafe fn load_omg_env_into_process() -> Result<()> {
 }
 
 pub fn main() -> Result<()> {
-    // Load referenced API keys from ~/.omgb/.env before anything else can read
+    // Load valid *_API_KEY entries from ~/.omgb/.env before anything else can read
     // the process environment. This is safe because it is the very first
     // operation and runs before any other thread or signal handler is installed.
     // SAFETY: no other threads exist at this point.
