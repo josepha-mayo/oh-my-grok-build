@@ -14,27 +14,43 @@ use crate::providers::{
     ProviderConfig, env_var_name, is_valid_env_key, load_env_file, load_omg_config,
 };
 
-/// Approximate cost per 1M input+output tokens for known providers.
-/// Unknown cloud providers default to `5.0`; local providers are treated as `0.0`.
+/// Approximate cost index per 1M tokens (input+output average) for known
+/// providers. Values are derived from each provider's public pricing docs
+/// (2024-2025). Unknown cloud providers default to `5.0`; local providers are
+/// treated as `0.0`.
 const COSTS: &[(&str, f64)] = &[
-    ("openai", 5.0),
-    ("anthropic", 3.0),
-    ("openrouter", 2.5),
-    ("xai", 5.0),
+    // Major cloud APIs (pricing per 1M tokens, avg of input + output).
+    ("openai", 6.25),              // gpt-4o: $2.50 in / $10.00 out
+    ("anthropic", 9.0),            // claude-3-5-sonnet: $3.00 in / $15.00 out
+    ("claude-code", 9.0),          // same Anthropic endpoint as above
+    ("openrouter", 9.5),           // pass-through + ~5% fee; default claude-3.5-sonnet
+    ("xai", 4.0),                  // grok-4.5: $2.00 in / $6.00 out
+    ("codex", 3.75),               // codex-mini-latest: $1.50 in / $6.00 out
+    ("gemini", 0.19),              // gemini-1.5-flash: $0.075 in / $0.30 out
+    ("deepseek", 0.21),            // deepseek-chat: $0.14 in / $0.28 out
+    ("groq", 0.69),                // llama-3.3-70b-versatile: $0.59 in / $0.79 out
+    ("mistral", 4.0),              // mistral-large-latest: $2.00 in / $6.00 out
+    ("cohere", 6.25),              // command-r-plus: $2.50 in / $10.00 out
+    ("together", 1.04),            // Llama-3.3-70B-Instruct-Turbo: $1.04 / $1.04
+    ("fireworks", 0.9),            // llama-v3p1-70b-instruct: $0.90 / $0.90
+    ("perplexity", 1.0),           // sonar: $1.00 / $1.00
+    ("ai21", 0.3),                 // jamba-1.5-mini: $0.20 in / $0.40 out
+    ("deepinfra", 0.61),           // DeepSeek-V3: $0.32 in / $0.89 out
+    // Coding-assistant / harness-style providers.
+    ("opencode", 4.0),             // defaults to cloud-backed providers
+    ("hermes", 1.0),               // Together-hosted open models
+    ("pi", 5.0),                   // Inflection Pi (approximate)
+    ("github-models", 6.0),        // Azure-hosted OpenAI models
+    ("nvidia", 1.5),               // NIM Llama endpoints (approximate)
+    ("sambanova", 0.8),            // Llama endpoints (approximate)
+    ("lepton", 2.0),               // approximate
+    ("siliconflow", 0.5),          // approximate
+    // Keyless local providers (cost is electricity, not API spend).
     ("ollama", 0.0),
     ("lmstudio", 0.0),
     ("vllm", 0.0),
     ("llama-cpp", 0.0),
     ("tabby", 0.0),
-    ("groq", 0.5),
-    ("mistral", 2.0),
-    ("cohere", 1.5),
-    ("together", 2.0),
-    ("fireworks", 1.0),
-    ("perplexity", 1.0),
-    ("deepseek", 0.5),
-    ("ai21", 2.0),
-    ("gemini", 1.0),
     ("jan", 0.0),
     ("localai", 0.0),
     ("llamafile", 0.0),
@@ -55,12 +71,6 @@ const COSTS: &[(&str, f64)] = &[
     ("triton", 0.0),
     ("text-generation-inference", 0.0),
     ("lorax", 0.0),
-    ("opencode", 0.0),
-    // Cloud harness / coding assistants that have real API endpoints.
-    ("codex", 5.0),
-    ("claude-code", 3.0),
-    ("hermes", 2.0),
-    ("pi", 5.0),
 ];
 
 const LOCAL_IDS: &[&str] = &[
@@ -89,7 +99,6 @@ const LOCAL_IDS: &[&str] = &[
     "triton",
     "text-generation-inference",
     "lorax",
-    "opencode",
 ];
 
 const FAST_IDS: &[&str] = &[
@@ -298,9 +307,9 @@ mod tests {
 
     #[test]
     fn test_provider_cost_known_cloud() {
-        assert!((provider_cost("openai") - 5.0).abs() < 1e-9);
-        assert!((provider_cost("anthropic") - 3.0).abs() < 1e-9);
-        assert!((provider_cost("groq") - 0.5).abs() < 1e-9);
+        assert!((provider_cost("openai") - 6.25).abs() < 1e-9);
+        assert!((provider_cost("anthropic") - 9.0).abs() < 1e-9);
+        assert!((provider_cost("groq") - 0.69).abs() < 1e-9);
     }
 
     #[test]
@@ -316,9 +325,9 @@ mod tests {
 
     #[test]
     fn test_provider_cost_cloud_harness_not_local() {
-        assert!((provider_cost("codex") - 5.0).abs() < 1e-9);
-        assert!((provider_cost("claude-code") - 3.0).abs() < 1e-9);
-        assert!((provider_cost("hermes") - 2.0).abs() < 1e-9);
+        assert!((provider_cost("codex") - 3.75).abs() < 1e-9);
+        assert!((provider_cost("claude-code") - 9.0).abs() < 1e-9);
+        assert!((provider_cost("hermes") - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -330,7 +339,7 @@ mod tests {
     #[test]
     fn test_select_provider_fast_tie_breaker() {
         let available = vec!["perplexity".into(), "fireworks".into()];
-        // Both cost 1.0 and are fast; alphabetical tie-break picks fireworks.
+        // fireworks ($0.90) is cheaper than perplexity ($1.00) and both are fast.
         assert_eq!(
             select_provider_from(&available, "fast").unwrap(),
             "fireworks"

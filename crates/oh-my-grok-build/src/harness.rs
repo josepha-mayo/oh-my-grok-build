@@ -233,11 +233,17 @@ fn save_registry(registry: &ConnectorRegistry) -> Result<()> {
 
 fn default_secret_env_key(r#type: &str) -> Option<&'static str> {
     match r#type {
-        "codex" | "opencode" => Some("OPENAI_API_KEY"),
+        // OpenAI Codex CLI uses OPENAI_API_KEY by default (other providers
+        // are configured in ~/.codex/config.toml).
+        "codex" => Some("OPENAI_API_KEY"),
+        // Claude Code prioritizes ANTHROPIC_API_KEY over subscription auth.
         "claude" => Some("ANTHROPIC_API_KEY"),
-        "hermes" => Some("HERMES_API_KEY"),
-        "pi" => Some("PI_API_KEY"),
-        "omp" => Some("OMP_API_KEY"),
+        // Hermes Agent reads provider keys from ~/.hermes/.env; OpenRouter is
+        // the documented default/recommended provider.
+        "hermes" => Some("OPENROUTER_API_KEY"),
+        // OpenCode, Pi, and OMP are multi-provider wrappers with no single
+        // canonical key. Users should pass --secret-env-key or set the
+        // provider-specific env var before invoking the child.
         _ => None,
     }
 }
@@ -484,6 +490,16 @@ async fn run_http_connector(cfg: &ConnectorConfig, url: &str, prompt: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_secret_env_key_matches_cli_docs() {
+        assert_eq!(default_secret_env_key("codex"), Some("OPENAI_API_KEY"));
+        assert_eq!(default_secret_env_key("claude"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(default_secret_env_key("hermes"), Some("OPENROUTER_API_KEY"));
+        assert_eq!(default_secret_env_key("opencode"), None);
+        assert_eq!(default_secret_env_key("pi"), None);
+        assert_eq!(default_secret_env_key("omp"), None);
+    }
 
     #[test]
     fn test_add_connector_rejects_non_ascii_name() {
