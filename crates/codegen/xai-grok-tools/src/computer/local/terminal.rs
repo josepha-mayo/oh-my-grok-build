@@ -4609,6 +4609,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_parse_login_env_capture() {
         let stdout = "motd noise\n\x01/opt/rc/bin:/usr/bin\x01\
                       XDG_CONFIG_HOME=/Users/u/.config\0\
@@ -4639,6 +4640,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_parse_login_env_capture_path_only() {
         let (path, env) = parse_login_env_capture("\x01/usr/bin\x01");
         assert_eq!(path.as_deref(), Some("/usr/bin"));
