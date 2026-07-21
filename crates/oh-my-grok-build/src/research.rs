@@ -75,9 +75,13 @@ const MAX_RESULTS: usize = 100;
 pub async fn research(topic: &str, count: usize) -> Result<String> {
     let count = count.min(MAX_RESULTS);
     let mut report = format!("Research: {}\n\n", topic);
+    let mut found = false;
 
     match arxiv_research(topic, count).await {
-        Ok(text) => report.push_str(&text),
+        Ok(text) => {
+            report.push_str(&text);
+            found = true;
+        }
         Err(e) => report.push_str(&format!("arXiv search unavailable: {e}\n\n")),
     }
 
@@ -85,12 +89,13 @@ pub async fn research(topic: &str, count: usize) -> Result<String> {
         Ok(text) => {
             if !text.is_empty() {
                 report.push_str(&format!("\nWeb results:\n\n{text}"));
+                found = true;
             }
         }
         Err(e) => report.push_str(&format!("\nWeb search unavailable: {e}\n")),
     }
 
-    if report.trim().lines().count() <= 2 {
+    if !found {
         bail!("no research results for '{topic}'");
     }
     Ok(report)
@@ -204,7 +209,7 @@ async fn web_search(topic: &str, count: usize) -> Result<String> {
     };
 
     if results.is_empty() {
-        bail!("no web results for '{topic}'");
+        return Ok(String::new());
     }
 
     let mut report = String::new();
@@ -277,7 +282,7 @@ async fn validated_search_url(raw: &str) -> Option<String> {
     validate_url(&url, false, false).await.ok().map(|_| url)
 }
 
-async fn exec_prompt(model: &str, prompt: &str) -> Result<String> {
+async fn exec_prompt(model: &str, prompt: &str, yolo: bool) -> Result<String> {
     let prompt_file = crate::write_prompt_temp(prompt).await?;
     let _prompt_guard = crate::PromptFileGuard(prompt_file.clone());
     let exe = std::env::current_exe()?;
@@ -287,13 +292,15 @@ async fn exec_prompt(model: &str, prompt: &str) -> Result<String> {
     cmd.arg("exec")
         .arg("--model")
         .arg(model)
-        .arg("--yolo")
         .arg("--tools")
         .arg("read_file,grep,list_dir,web_search,web_fetch")
         .arg("--prompt-file")
         .arg(&prompt_file)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if yolo {
+        cmd.arg("--yolo");
+    }
     let out = cmd.output().await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -306,6 +313,7 @@ pub async fn run_research(
     topic: &str,
     count: usize,
     model: Option<String>,
+    yolo: bool,
     output: Option<PathBuf>,
 ) -> Result<()> {
     let report = research(topic, count).await?;
@@ -322,10 +330,13 @@ pub async fn run_research(
     println!("wrote research report to {}", report_path.display());
 
     if let Some(model) = model {
+        if !yolo {
+            bail!("--yolo is required to generate a patch with --model");
+        }
         let prompt = format!(
             "Given the following research report, propose a concise patch or implementation plan. Output only the patch content.\n\n{report}"
         );
-        match exec_prompt(&model, &prompt).await {
+        match exec_prompt(&model, &prompt, yolo).await {
             Ok(patch) => {
                 let patch_path = report_path.with_extension("patch");
                 std::fs::write(&patch_path, &patch)?;

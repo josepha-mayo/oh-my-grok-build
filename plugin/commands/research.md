@@ -7,7 +7,7 @@ allowed-tools: run_terminal_cmd
 # /research — deep arXiv research
 
 1. Identify the core topic from the user's message.
-2. Run `omgb research "<topic>" [--count <n>] [--model <model>]`.
+2. Run `omgb research "<topic>" [--count <n>] [--model <model>] [--yolo]`. `--yolo` is required when `--model` is used to generate a patch.
 3. Read the generated `~/.omgb/research/<topic>.md` report.
 4. If a `~/.omgb/research/<topic>.patch` exists, read it too.
 5. Summarize the findings, the identified research gaps, and the proposed patch or novel idea.

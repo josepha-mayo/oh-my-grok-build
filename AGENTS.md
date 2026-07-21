@@ -52,6 +52,7 @@ The binary is produced at `target/release/omgb` (`target\release\omgb.exe` on Wi
 
 - `protoc` (v29.3) must be on `PATH` (or set via `$PROTOC`). CI installs it via `arduino/setup-protoc@v3`.
 - On Windows with the `x86_64-pc-windows-gnu` target, a MinGW-w64 toolchain (e.g. WinLibs UCRT) must be on `PATH` so `cc` can find `gcc.exe`. Visual Studio Build Tools provide `cl.exe` for the MSVC target.
+- If your rustup default host is MSVC but you want to use the MinGW toolchain, run `rustup override set 1.92.0-x86_64-pc-windows-gnu` in the repo so `cargo` does not look for `link.exe`.
 
 ## Key principles
 
