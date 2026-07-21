@@ -15,7 +15,7 @@ This repo adds **oh-my-grok-build** (`omgb`) as an opinionated productivity, orc
 | `crates/codegen/` | Upstream Grok Build Rust source (treat as upstream; edit only when necessary) |
 | `crates/oh-my-grok-build/` | `omgb` Rust CLI: providers, scheduler, subagents, team mode, research, server/relay, connectors |
 | `plugin/` | Grok Build plugin: skills, hooks, agents, slash commands (incl. `/use`, `/browser`, `/schedule`, `/btw`) |
-| `grok-build-app/` | Native mobile app (planned; archived Capacitor prototype) |
+| `grok-build-app/` | Native mobile app in a separate private repo; not present in this workspace |
 | `AGENTS.md` | This file |
 
 ## Conventions
@@ -43,10 +43,10 @@ This repo adds **oh-my-grok-build** (`omgb`) as an opinionated productivity, orc
 cargo fmt -p oh-my-grok-build
 cargo clippy -p oh-my-grok-build
 cargo test -p oh-my-grok-build
-node --test plugin/bin/safe-shell-guard.test.js
 ```
 
 The binary is produced at `target/release/omgb` (`target\release\omgb.exe` on Windows).
+Build the `safe-shell-guard` hook binary with `cargo build --bin safe-shell-guard --release` and copy it to `plugin/bin/safe-shell-guard` (or `plugin\bin\safe-shell-guard.exe` on Windows) so the plugin hook can resolve it.
 
 ### Build dependencies
 

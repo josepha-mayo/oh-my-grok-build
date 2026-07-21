@@ -14,12 +14,14 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 
 mod args;
 mod harness;
+mod moe;
 mod net;
 mod providers;
 mod research;
 mod scheduler;
 mod server;
 mod subagents;
+mod swarm;
 mod taste;
 mod timeline;
 
@@ -486,6 +488,13 @@ async fn run_single_turn_with(
     cwd: Option<PathBuf>,
 ) -> Result<()> {
     let full_prompt = format!("{}{}", prompt, taste::taste_preamble());
+    let model = if let Some(m) = model {
+        Some(m)
+    } else {
+        moe::select_provider(prompt)
+            .ok()
+            .map(|id| format!("omgb-{id}"))
+    };
     let options = HeadlessOptions {
         session_id: None,
         resume: None,
@@ -1045,92 +1054,13 @@ async fn run_swarm(args: SwarmArgs) -> Result<()> {
     if !args.yolo {
         bail!("`omgb swarm` requires --yolo to auto-approve tool use");
     }
-    let exe = std::env::current_exe()?;
-    let mut tasks = Vec::new();
-    for i in 0..args.count {
-        let prompt = format!(
-            "Swarm member {}/{total}: {prompt}\n\nProvide a concise answer.",
-            i + 1,
-            total = args.count,
-            prompt = args.prompt
-        );
-        let model = args.model.clone();
-        let yolo = args.yolo;
-        let output_file =
-            std::env::temp_dir().join(format!("omgb-swarm-{i}-{}.txt", uuid::Uuid::new_v4()));
-        let exe = exe.clone();
-
-        tasks.push(tokio::spawn(async move {
-            let prompt_file = write_prompt_temp(&prompt).await?;
-            let mut cmd = Command::new(&exe);
-            cmd.arg("exec")
-                .arg("--output-file")
-                .arg(&output_file)
-                .arg("--prompt-file")
-                .arg(&prompt_file)
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit());
-            if let Some(m) = &model {
-                cmd.arg("--model").arg(m);
-            }
-            if yolo {
-                cmd.arg("--yolo");
-            }
-
-            let status = cmd.status().await?;
-            let _ = tokio::fs::remove_file(&prompt_file).await;
-            if !status.success() {
-                bail!("swarm member {} failed", i + 1);
-            }
-            let text = tokio::fs::read_to_string(&output_file).await?;
-            let _ = tokio::fs::remove_file(&output_file).await;
-            Ok::<_, anyhow::Error>(text)
-        }));
-    }
-
-    let mut outputs = Vec::new();
-    let mut failed = 0usize;
-    for t in tasks {
-        match t.await? {
-            Ok(text) => outputs.push(text),
-            Err(e) => {
-                eprintln!("{e}");
-                failed += 1;
-            }
-        }
-    }
-    if outputs.is_empty() {
-        bail!("all swarm members failed");
-    }
-
-    let winner = swarm_vote(&outputs);
-    println!("{winner}");
-    if failed > 0 {
-        eprintln!("warning: {failed} swarm member(s) failed; winner chosen from remaining outputs");
-    }
+    let result = if args.ensemble {
+        swarm::run_swarm_ensemble(&args.prompt, args.model, args.yolo, args.count).await?
+    } else {
+        swarm::run_swarm_task_splitting(&args.prompt, args.model, args.yolo, args.count).await?
+    };
+    println!("{result}");
     Ok(())
-}
-
-fn swarm_vote(outputs: &[String]) -> String {
-    let mut best = String::new();
-    let mut best_count = 0usize;
-    let mut best_index = usize::MAX;
-    let mut seen: std::collections::HashMap<String, (usize, usize, String)> =
-        std::collections::HashMap::new();
-
-    for (i, o) in outputs.iter().enumerate() {
-        let key = o.trim().to_string();
-        let entry = seen.entry(key).or_insert_with(|| (0, i, o.clone()));
-        entry.0 += 1;
-
-        let (count, idx, original) = (entry.0, entry.1, &entry.2);
-        if count > best_count || (count == best_count && idx < best_index) {
-            best_count = count;
-            best_index = idx;
-            best = original.clone();
-        }
-    }
-    best
 }
 
 async fn run_subagent(args: SubagentArgs) -> Result<()> {

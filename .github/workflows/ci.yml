@@ -36,4 +36,3 @@ jobs:
       - run: cargo fmt --check
       - run: ${{ matrix.clippy }}
       - run: ${{ matrix.test }}
-      - run: node --test plugin/bin/safe-shell-guard.test.js

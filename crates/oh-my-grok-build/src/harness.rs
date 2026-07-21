@@ -49,12 +49,22 @@ fn base_dirs() -> Vec<PathBuf> {
     if IS_WINDOWS {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:\\Windows"));
         let root = PathBuf::from(root);
-        [
+        let mut dirs = vec![
             root.join("System32"),
             root.clone(),
             root.join("System32").join("Wbem"),
-        ]
-        .to_vec()
+        ];
+        // Node-based connectors (e.g. codex/opencode) need node and global npm modules.
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            dirs.push(PathBuf::from(pf).join("nodejs"));
+        }
+        if let Ok(pf_x86) = std::env::var("ProgramFiles(x86)") {
+            dirs.push(PathBuf::from(pf_x86).join("nodejs"));
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+        dirs
     } else {
         ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
             .map(PathBuf::from)

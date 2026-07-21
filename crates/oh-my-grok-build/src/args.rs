@@ -286,6 +286,9 @@ pub struct SwarmArgs {
     /// Auto-approve tool use for each swarm member (required for non-interactive use).
     #[arg(long)]
     pub yolo: bool,
+    /// Use the original majority-vote ensemble instead of task splitting.
+    #[arg(long)]
+    pub ensemble: bool,
 }
 
 #[derive(Debug, Args, Clone)]

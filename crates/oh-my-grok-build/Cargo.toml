@@ -39,5 +39,9 @@ xai-grok-shell = { path = "../codegen/xai-grok-shell" }
 xai-tty-utils = { path = "../codegen/xai-tty-utils" }
 croner = { workspace = true }
 
+[[bin]]
+name = "safe-shell-guard"
+path = "src/bin/safe_shell_guard.rs"
+
 [lints]
 workspace = true

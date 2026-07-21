@@ -126,13 +126,10 @@ cargo test -p oh-my-grok-build
 
 # Distribution build
 cargo build --bin oh-my-grok-build --profile release-dist
-
-# Plugin guard tests
-node --test plugin/bin/safe-shell-guard.test.js
 ```
 
 ## 6. Notes
 
-- The legacy Node harness in `tools/oh-my-grok-build` is being replaced; its only purpose after the move is as a reference while features are ported to Rust. Once ported, it is deleted.
+- The legacy TypeScript/Node wrapper has been removed; all production code is now Rust.
 - Upstream Rust crates in `crates/codegen/xai-grok-*` should be edited sparingly. Prefer new `omgb-*` crates and public upstream APIs. If an upstream seam is missing, open an issue/PR to expose it rather than forking logic.
 - All new code follows `rustfmt.toml`/`clippy.toml`, keeps secrets out of logs, and never auto-approves dangerous tools unless `yolo`/`always-approve` is explicitly set.

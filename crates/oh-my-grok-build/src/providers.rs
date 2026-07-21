@@ -11,6 +11,8 @@ use crate::args::{AddProviderArgs, DiscoverArgs};
 use crate::net::{http_get_text, http_post_json, is_url_host_private, validate_url};
 use url::Url;
 
+pub mod catalog;
+
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LMSTUDIO_URL: &str = "http://localhost:1234/v1";
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
@@ -627,7 +629,7 @@ fn provider_template(id: &str) -> Option<ProviderConfig> {
             top_p: None,
             max_completion_tokens: None,
         }),
-        _ => None,
+        _ => catalog::provider_template(id),
     }
 }
 

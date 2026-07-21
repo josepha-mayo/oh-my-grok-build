@@ -1,0 +1,421 @@
+//! Mixture-of-Experts (MoE) provider routing for `omgb`.
+//!
+//! Picks the cheapest available provider (by approximate cost per 1M tokens) and
+//! applies keyword tie-breakers when the task hints at local, fast, code, or
+//! cheap preferences.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+use anyhow::{Result, bail};
+
+use crate::providers::{
+    ProviderConfig, env_var_name, is_valid_env_key, load_env_file, load_omg_config,
+};
+
+/// Approximate cost per 1M input+output tokens for known providers.
+/// Unknown cloud providers default to `5.0`; local providers are treated as `0.0`.
+const COSTS: &[(&str, f64)] = &[
+    ("openai", 5.0),
+    ("anthropic", 3.0),
+    ("openrouter", 2.5),
+    ("xai", 5.0),
+    ("ollama", 0.0),
+    ("lmstudio", 0.0),
+    ("vllm", 0.0),
+    ("llama-cpp", 0.0),
+    ("tabby", 0.0),
+    ("groq", 0.5),
+    ("mistral", 2.0),
+    ("cohere", 1.5),
+    ("together", 2.0),
+    ("fireworks", 1.0),
+    ("perplexity", 1.0),
+    ("deepseek", 0.5),
+    ("ai21", 2.0),
+    ("gemini", 1.0),
+    ("jan", 0.0),
+    ("localai", 0.0),
+    ("llamafile", 0.0),
+    ("text-generation-webui", 0.0),
+    ("koboldcpp", 0.0),
+    ("mistral-rs", 0.0),
+    ("sglang", 0.0),
+    ("tensorrt-llm", 0.0),
+    ("mlc-llm", 0.0),
+    ("xinference", 0.0),
+    ("faraday", 0.0),
+    ("aichat", 0.0),
+    ("ava", 0.0),
+    ("exllamav2", 0.0),
+    ("ctranslate2", 0.0),
+    ("ctransformers", 0.0),
+    ("candle", 0.0),
+    ("triton", 0.0),
+    ("text-generation-inference", 0.0),
+    ("lorax", 0.0),
+    ("opencode", 0.0),
+    // Cloud harness / coding assistants that have real API endpoints.
+    ("codex", 5.0),
+    ("claude-code", 3.0),
+    ("hermes", 2.0),
+    ("pi", 5.0),
+];
+
+const LOCAL_IDS: &[&str] = &[
+    "ollama",
+    "lmstudio",
+    "vllm",
+    "llama-cpp",
+    "tabby",
+    "jan",
+    "localai",
+    "llamafile",
+    "text-generation-webui",
+    "koboldcpp",
+    "mistral-rs",
+    "sglang",
+    "tensorrt-llm",
+    "mlc-llm",
+    "xinference",
+    "faraday",
+    "aichat",
+    "ava",
+    "exllamav2",
+    "ctranslate2",
+    "ctransformers",
+    "candle",
+    "triton",
+    "text-generation-inference",
+    "lorax",
+    "opencode",
+];
+
+const FAST_IDS: &[&str] = &[
+    "groq",
+    "fireworks",
+    "together",
+    "gemini",
+    "openrouter",
+    "deepseek",
+    "perplexity",
+    "mistral",
+    "cohere",
+];
+
+const CODE_HINTS: &[&str] = &[
+    "code",
+    "codellama",
+    "deepseek",
+    "qwen",
+    "mistral",
+    "mixtral",
+    "claude",
+    "gemini",
+    "groq",
+];
+
+pub fn provider_cost(id: &str) -> f64 {
+    if let Some((_, cost)) = COSTS.iter().find(|(k, _)| *k == id) {
+        return *cost;
+    }
+    if is_local_provider(id) {
+        return 0.0;
+    }
+    5.0
+}
+
+fn is_local_provider(id: &str) -> bool {
+    LOCAL_IDS.contains(&id) || id.starts_with("local-") || id.contains("local")
+}
+
+fn is_fast_provider(id: &str) -> bool {
+    FAST_IDS.contains(&id)
+}
+
+fn is_code_provider(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    CODE_HINTS.iter().any(|h| lower.contains(h))
+}
+
+/// Returns true when `word` appears in `task` as a whole word.
+fn task_contains_word(task: &str, word: &str) -> bool {
+    if task == word {
+        return true;
+    }
+    let word = word.as_bytes();
+    let task = task.as_bytes();
+    for (i, window) in task.windows(word.len()).enumerate() {
+        if window == word {
+            let prev = if i > 0 { task[i - 1] } else { b' ' };
+            let next = task.get(i + word.len()).copied().unwrap_or(b' ');
+            if !prev.is_ascii_alphanumeric() && !next.is_ascii_alphanumeric() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns the configured providers that currently have a non-empty `*_API_KEY`
+/// in `~/.omgb/.env` or the process environment. Also detects catalog templates
+/// whose canonical env key is present even when they have not been explicitly
+/// configured.
+pub fn available_providers() -> Result<Vec<String>> {
+    let cfg = load_omg_config()?;
+    let dotenv = load_env_file().unwrap_or_default();
+
+    let mut ids = std::collections::HashSet::new();
+
+    for provider in cfg.providers.values() {
+        if provider_has_key(provider, &dotenv) {
+            ids.insert(provider.id.clone());
+        }
+    }
+
+    for template in crate::providers::catalog::TEMPLATES {
+        let provider = template.to_provider_config();
+        if provider_has_key(&provider, &dotenv) {
+            ids.insert(provider.id);
+        }
+    }
+
+    let mut ids: Vec<String> = ids.into_iter().collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn provider_has_key(provider: &ProviderConfig, dotenv: &HashMap<String, String>) -> bool {
+    let storage = env_var_name(&provider.id);
+    let mut keys: Vec<&str> = provider
+        .env_key
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|k| is_valid_env_key(k))
+        .collect();
+    if !keys.contains(&storage.as_str()) {
+        keys.push(storage.as_str());
+    }
+    keys.into_iter().any(|k| {
+        std::env::var(k).ok().filter(|v| !v.is_empty()).is_some()
+            || dotenv.get(k).filter(|v| !v.is_empty()).is_some()
+    })
+}
+
+/// Selects the cheapest available provider for `task`.
+///
+/// Keyword hints (`code`, `local`, `fast`, `cheap`) are used only as tie-breakers
+/// after cost and key availability.
+pub fn select_provider(task: &str) -> Result<String> {
+    let available = available_providers()?;
+    select_provider_from(&available, task)
+}
+
+/// Same as [`select_provider`] but accepts an explicit available-provider list,
+/// making unit tests independent of the host environment.
+pub fn select_provider_from(available: &[String], task: &str) -> Result<String> {
+    if available.is_empty() {
+        bail!("no providers configured with a non-empty *_API_KEY");
+    }
+
+    let task_lower = task.to_ascii_lowercase();
+    let mut scored: Vec<(&String, f64, i32)> = available
+        .iter()
+        .map(|id| {
+            let cost = provider_cost(id);
+            let mut tie = 0;
+            if task_contains_word(&task_lower, "local") && is_local_provider(id) {
+                tie += 3;
+            }
+            if task_contains_word(&task_lower, "fast") && is_fast_provider(id) {
+                tie += 2;
+            }
+            if task_contains_word(&task_lower, "code") && is_code_provider(id) {
+                tie += 1;
+            }
+            if task_contains_word(&task_lower, "cheap") && cost < 1.0 {
+                tie += 1;
+            }
+            (id, cost, tie)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(b.0))
+    });
+
+    Ok(scored[0].0.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_temp_home(f: impl FnOnce(&std::path::Path)) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("omgb-moe-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("OMGB_HOME", &tmp) };
+
+        let saved: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| k.ends_with("_API_KEY"))
+            .collect();
+        for (k, _) in &saved {
+            unsafe { std::env::remove_var(k) };
+        }
+
+        f(&tmp);
+
+        for (k, v) in saved {
+            unsafe { std::env::set_var(k, v) };
+        }
+        unsafe { std::env::remove_var("OMGB_HOME") };
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_provider_cost_known_cloud() {
+        assert!((provider_cost("openai") - 5.0).abs() < 1e-9);
+        assert!((provider_cost("anthropic") - 3.0).abs() < 1e-9);
+        assert!((provider_cost("groq") - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_provider_cost_local_is_free() {
+        assert!((provider_cost("ollama") - 0.0).abs() < 1e-9);
+        assert!((provider_cost("jan") - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_provider_cost_unknown_defaults_to_five() {
+        assert!((provider_cost("some-unknown-cloud") - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_provider_cost_cloud_harness_not_local() {
+        assert!((provider_cost("codex") - 5.0).abs() < 1e-9);
+        assert!((provider_cost("claude-code") - 3.0).abs() < 1e-9);
+        assert!((provider_cost("hermes") - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_select_provider_prefers_cheapest() {
+        let available = vec!["openai".into(), "deepseek".into(), "ollama".into()];
+        assert_eq!(select_provider_from(&available, "do it").unwrap(), "ollama");
+    }
+
+    #[test]
+    fn test_select_provider_fast_tie_breaker() {
+        let available = vec!["perplexity".into(), "fireworks".into()];
+        // Both cost 1.0 and are fast; alphabetical tie-break picks fireworks.
+        assert_eq!(
+            select_provider_from(&available, "fast").unwrap(),
+            "fireworks"
+        );
+    }
+
+    #[test]
+    fn test_select_provider_local_tie_breaker() {
+        let available = vec!["ollama".into(), "lmstudio".into()];
+        // Both cost 0.0 and are local; "local" keeps them tied, sorted by id.
+        assert_eq!(
+            select_provider_from(&available, "local").unwrap(),
+            "lmstudio"
+        );
+    }
+
+    #[test]
+    fn test_select_provider_cheap_does_not_override_cost() {
+        let available = vec!["openai".into(), "ollama".into()];
+        assert_eq!(
+            select_provider_from(&available, "cheap fast").unwrap(),
+            "ollama"
+        );
+    }
+
+    #[test]
+    fn test_select_provider_empty_errors() {
+        assert!(select_provider_from(&[], "task").is_err());
+    }
+
+    #[test]
+    fn test_available_providers_reads_env_and_config() {
+        with_temp_home(|home| {
+            let provider = crate::providers::ProviderConfig {
+                id: "testprovider".into(),
+                name: "Test".into(),
+                model: "m".into(),
+                base_url: "http://localhost/v1".into(),
+                api_backend: None,
+                env_key: Some(vec!["OMGB_TESTPROVIDER_API_KEY".into()]),
+                extra_headers: None,
+                context_window: None,
+                auto_compact_threshold_percent: None,
+                temperature: None,
+                top_p: None,
+                max_completion_tokens: None,
+            };
+            let cfg = crate::providers::OmgConfig {
+                default_model: None,
+                providers: [("testprovider".into(), provider)]
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                relay: None,
+            };
+            crate::providers::save_omg_config(&cfg).unwrap();
+            std::fs::write(home.join(".env"), "OMGB_TESTPROVIDER_API_KEY=secret\n").unwrap();
+
+            assert_eq!(available_providers().unwrap(), vec!["testprovider"]);
+        });
+    }
+
+    #[test]
+    fn test_available_providers_uses_default_env_key() {
+        with_temp_home(|home| {
+            let provider = crate::providers::ProviderConfig {
+                id: "myprov".into(),
+                name: "My".into(),
+                model: "m".into(),
+                base_url: "http://localhost/v1".into(),
+                api_backend: None,
+                env_key: None,
+                extra_headers: None,
+                context_window: None,
+                auto_compact_threshold_percent: None,
+                temperature: None,
+                top_p: None,
+                max_completion_tokens: None,
+            };
+            let cfg = crate::providers::OmgConfig {
+                default_model: None,
+                providers: [("myprov".into(), provider)]
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                relay: None,
+            };
+            crate::providers::save_omg_config(&cfg).unwrap();
+            std::fs::write(home.join(".env"), "OMGB_MYPROV_API_KEY=secret\n").unwrap();
+
+            assert_eq!(available_providers().unwrap(), vec!["myprov"]);
+        });
+    }
+
+    #[test]
+    fn test_available_providers_detects_catalog_keys() {
+        with_temp_home(|home| {
+            std::fs::write(home.join(".env"), "OPENAI_API_KEY=sk-secret\n").unwrap();
+            let providers = available_providers().unwrap();
+            assert!(providers.contains(&"openai".to_string()));
+        });
+    }
+}
