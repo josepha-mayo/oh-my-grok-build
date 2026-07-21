@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,7 @@ use crate::args::HarnessType;
 use crate::taste::taste_preamble;
 
 const IS_WINDOWS: bool = cfg!(windows);
+const DEFAULT_CONNECTOR_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn registry_path() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join("connectors.json"))
@@ -74,10 +76,19 @@ fn executable_extensions() -> Vec<String> {
     }
 }
 
-fn resolve_executable(name: &str, cwd: Option<&std::path::Path>) -> PathBuf {
+fn resolve_executable(name: &str, cwd: Option<&std::path::Path>) -> Result<PathBuf> {
     let candidate = PathBuf::from(name);
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!(
+            "connector command must not contain '..' components: {}",
+            candidate.display()
+        );
+    }
     if candidate.is_absolute() {
-        return candidate;
+        return Ok(candidate);
     }
 
     let exts = if IS_WINDOWS {
@@ -108,21 +119,21 @@ fn resolve_executable(name: &str, cwd: Option<&std::path::Path>) -> PathBuf {
     // then PATH, so connectors whose binaries live in the connector cwd work.
     if let Some(dir) = cwd {
         if let Some(p) = try_dir(dir) {
-            return p;
+            return Ok(p);
         }
         if is_relative_path {
-            return candidate;
+            return Ok(candidate);
         }
     }
 
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
             if let Some(p) = try_dir(&dir) {
-                return p;
+                return Ok(p);
             }
         }
     }
-    candidate
+    Ok(candidate)
 }
 
 fn minimal_path(binary_dir: Option<&std::path::Path>) -> String {
@@ -360,7 +371,7 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         .as_ref()
         .map(|c| parent_cwd.join(c))
         .or_else(|| Some(parent_cwd.clone()));
-    let resolved = resolve_executable(&parts[0], resolve_dir.as_deref());
+    let resolved = resolve_executable(&parts[0], resolve_dir.as_deref())?;
     let binary_dir = resolved.parent().map(|p| p.to_path_buf());
 
     let mut cmd = tokio::process::Command::new(&resolved);
@@ -385,7 +396,8 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         }
     }
 
-    let mut child = cmd.spawn()?;
+    let (mut child, group) = crate::spawn_with_process_group(cmd)?;
+
     let mut stdout = child
         .stdout
         .take()
@@ -394,16 +406,38 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("connector stderr was not piped"))?;
-    let mut out = String::new();
-    let mut err = String::new();
-    let (read_out, read_err) =
-        tokio::join!(async { stdout.read_to_string(&mut out).await }, async {
-            stderr.read_to_string(&mut err).await
-        });
-    read_out?;
-    read_err?;
-    let status = child.wait().await?;
+    let out_handle = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s).await;
+        s
+    });
+    let err_handle = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s).await;
+        s
+    });
 
+    let status = match tokio::time::timeout(DEFAULT_CONNECTOR_TIMEOUT, child.wait()).await {
+        Ok(s) => s?,
+        Err(_) => {
+            crate::kill_child_and_reap(&mut child, group.as_ref()).await;
+            out_handle.abort();
+            err_handle.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(out_handle, err_handle)
+            })
+            .await;
+            bail!(
+                "connector '{name}' timed out after {}s",
+                DEFAULT_CONNECTOR_TIMEOUT.as_secs()
+            );
+        }
+    };
+
+    crate::kill_process_group(group.as_ref());
+    let (out, err) = tokio::join!(out_handle, err_handle);
+    let out = out.unwrap_or_default();
+    let err = err.unwrap_or_default();
     if !out.is_empty() {
         println!("{out}");
     }

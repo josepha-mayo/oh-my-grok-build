@@ -94,12 +94,11 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file));
-    crate::configure_detached_cmd(&mut cmd);
     if yolo {
         cmd.arg("--yolo");
     }
 
-    let mut child = match cmd.spawn() {
+    let mut child = match crate::spawn_detached(cmd) {
         Ok(c) => c,
         Err(e) => {
             let _ = tokio::fs::remove_file(&prompt_file).await;

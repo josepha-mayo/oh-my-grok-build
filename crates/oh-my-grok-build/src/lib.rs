@@ -205,15 +205,61 @@ impl Drop for PromptFileGuard {
     }
 }
 
-pub(crate) fn configure_detached_cmd(cmd: &mut tokio::process::Command) {
+pub(crate) fn spawn_detached(
+    mut cmd: tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
     #[cfg(unix)]
-    xai_tty_utils::detach_command(cmd);
+    xai_tty_utils::detach_command(&mut cmd);
     #[cfg(windows)]
     {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+        let base = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+        cmd.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB);
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if e.raw_os_error() == Some(5) => {
+                // Parent job does not allow breakaway; retry without it.
+                // We will not be able to assign the child to our own JobObject,
+                // but the command still runs and can be killed directly.
+                cmd.creation_flags(base);
+            }
+            Err(e) => return Err(e),
+        }
     }
+    cmd.spawn()
+}
+
+pub(crate) fn spawn_with_process_group(
+    cmd: tokio::process::Command,
+) -> Result<(tokio::process::Child, Option<xai_tty_utils::ProcessGroup>)> {
+    let child = spawn_detached(cmd)?;
+    let group = match xai_tty_utils::ProcessGroup::new() {
+        Ok(mut g) => match g.attach(&child) {
+            Ok(()) => Some(g),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    Ok((child, group))
+}
+
+pub(crate) fn kill_process_group(group: Option<&xai_tty_utils::ProcessGroup>) {
+    if let Some(g) = group {
+        let _ = g.kill();
+    }
+}
+
+pub(crate) async fn kill_child_and_reap(
+    child: &mut tokio::process::Child,
+    group: Option<&xai_tty_utils::ProcessGroup>,
+) {
+    if let Some(g) = group {
+        let _ = g.kill();
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 #[cfg(unix)]

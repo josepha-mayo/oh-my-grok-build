@@ -101,6 +101,11 @@ const UNANALYZABLE_COMMANDS = new Set([
   "run0",
 ]);
 
+// Windows cmd.exe builtins that launch other programs; the guard cannot
+// determine whether the launched program is safe, so block them only when
+// they appear as the effective command in a `cmd /c` / `cmd /k` context.
+const WINDOWS_CMD_LAUNCHERS = new Set(["start", "call", "runas"]);
+
 // Characters that separate commands or redirect I/O at the shell level.
 const SHELL_METACHARS = new Set([
   ";",
@@ -718,6 +723,20 @@ function parseInterpreter(tokens, i, cmdFlag) {
   return { allowed: false, reason: "Blocked interpreter without -c command string" };
 }
 
+// Find the first non-empty, non-option token in a `cmd /c` or `/k` command
+// line after cmd.exe strips leading empty quoted strings. Returns the index
+// and normalized base name, or null if none.
+function firstCommandToken(tokens, start) {
+  for (let k = start; k < tokens.length; k++) {
+    const v = tokens[k].value;
+    if (v.startsWith("/") && v.length > 1) continue;
+    const base = getBaseName(v);
+    if (!base) continue;
+    return { index: k, base };
+  }
+  return null;
+}
+
 function parseCmd(tokens, i) {
   let j = i + 1;
   while (j < tokens.length) {
@@ -725,9 +744,19 @@ function parseCmd(tokens, i) {
     if (v.toLowerCase() === "/c" || v.toLowerCase() === "/k") {
       if (j + 1 >= tokens.length) return { allowed: false, reason: "cmd missing command string" };
       if (j + 2 === tokens.length && tokens[j + 1].quoted !== null) {
-        return evaluate(tokens[j + 1].value);
+        const inner = tokenize(tokens[j + 1].value);
+        if (inner.error) return { allowed: false, reason: inner.error };
+        const first = firstCommandToken(inner.tokens, 0);
+        if (first && WINDOWS_CMD_LAUNCHERS.has(first.base)) {
+          return { allowed: false, reason: `Blocked unanalyzable command: ${first.base}` };
+        }
+        return evaluateTokens(inner.tokens, first ? first.index : inner.tokens.length);
       }
-      return evaluateTokens(tokens, j + 1);
+      const first = firstCommandToken(tokens, j + 1);
+      if (first && WINDOWS_CMD_LAUNCHERS.has(first.base)) {
+        return { allowed: false, reason: `Blocked unanalyzable command: ${first.base}` };
+      }
+      return evaluateTokens(tokens, first ? first.index : tokens.length);
     }
     if (v.startsWith("/") && v.length > 1) {
       j++;

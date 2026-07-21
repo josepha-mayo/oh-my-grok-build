@@ -46,6 +46,7 @@ describe("safe-shell-guard", () => {
     "env -S 'echo hello'",
     "env VAR=1 echo hello",
     'xargs echo "hello world"',
+    'cmd /c "" echo hello',
   ];
 
   for (const cmd of safe) {
@@ -111,6 +112,18 @@ describe("safe-shell-guard", () => {
     ["cmd /c format.com C:", "Blocked potentially destructive command: format"],
     ["python3.11.bat -c 'import os; os.system(\"rm -rf /\")'", "Blocked unanalyzable command: python"],
     ["node.js script.js", "Blocked unanalyzable command: node"],
+    // Windows cmd.exe program launchers must not bypass the interpreter/dangerous lists.
+    ["cmd /c start powershell", "Blocked unanalyzable command: start"],
+    ['cmd /c start /b powershell -Command "rm -rf /"', "Blocked unanalyzable command: start"],
+    ["cmd /c call powershell", "Blocked unanalyzable command: call"],
+    ["cmd /c runas /user:admin powershell", "Blocked unanalyzable command: runas"],
+    // Leading empty quoted strings must not bypass cmd launcher/dangerous checks.
+    ['cmd /c "" start powershell', "Blocked unanalyzable command: start"],
+    ['cmd /c "" start /b powershell -Command "rm -rf /"', "Blocked unanalyzable command: start"],
+    ['cmd /c "" format C:', "Blocked potentially destructive command: format"],
+    ['cmd /c "" powershell -Command "rm -rf /"', "Blocked unanalyzable command: powershell"],
+    ['cmd /c "" call foo.bat', "Blocked unanalyzable command: call"],
+    ['cmd /c "" runas /user:admin powershell', "Blocked unanalyzable command: runas"],
   ];
 
   for (const [cmd, expectedReason] of dangerous) {
