@@ -161,6 +161,9 @@ pub async fn add_job(
     model: Option<String>,
     yolo: bool,
 ) -> Result<()> {
+    if !yolo {
+        bail!("scheduled jobs require --yolo to auto-approve tool use");
+    }
     if parse_interval(expression).is_none() && Cron::from_str(expression).is_err() {
         bail!("invalid schedule expression: {expression}");
     }

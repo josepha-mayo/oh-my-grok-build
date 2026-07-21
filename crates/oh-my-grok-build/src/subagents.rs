@@ -72,6 +72,9 @@ fn log_path(id: &str, ext: &str) -> Result<PathBuf> {
 }
 
 pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
+    if !yolo {
+        bail!("subagent spawn requires --yolo to auto-approve tool use");
+    }
     let exe = std::env::current_exe()?.to_string_lossy().to_string();
     let id = format!(
         "sub-{}-{}",

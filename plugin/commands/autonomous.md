@@ -6,8 +6,8 @@ description: Fully autonomous mode via `omgb autonomous`. Runs with --yolo and w
 # /autonomous — high-autonomy mode
 
 1. Treat the user's last message as a mission, not a single question.
-2. Run it with `omgb autonomous "<mission>" [--model ...] [--sandbox-profile <profile>]`.
-3. The command always passes `--yolo` (auto-approve tool calls) to Grok.
+2. Run it with `omgb autonomous --yolo "<mission>" [--model ...] [--sandbox-profile <profile>]`.
+3. The command requires `--yolo` to auto-approve tool calls.
 4. Check `~/.grok/config.toml` for `[sandbox].profile` before launching. Warn on stderr if it is missing or set to `off`, because autonomous mode should only run inside a sandbox.
 5. Pass `--sandbox-profile <profile>` to set the `GROK_SANDBOX_PROFILE` environment variable for the spawned Grok process (best effort).
 6. Still respect hard guards:

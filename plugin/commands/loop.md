@@ -7,7 +7,7 @@ description: Start an autonomous diff-driven work loop via `omgb loop`. Requires
 
 1. Confirm the high-level goal with the user if unclear.
 2. Require a clean git working tree before starting; error otherwise.
-3. Run the initial prompt with `omgb loop "<goal>" [--model ...] [--max-iterations 5]`.
+3. Run the initial prompt with `omgb loop --yolo "<goal>" [--model ...] [--max-iterations 5]`.
 4. After each Grok run:
    - Run `git diff` and `git status --short`.
    - If the working tree is dirty, send Grok a follow-up prompt asking it to review the diff and fix issues.

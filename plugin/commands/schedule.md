@@ -7,7 +7,7 @@ allowed-tools: run_terminal_cmd
 # /schedule — scheduled background jobs
 
 1. Determine the user's intent:
-   - To add a cron job: run `omgb cron "<cron-expression>" "<prompt>" [--model <model>] [--yolo]`.
+   - To add a cron job: run `omgb cron --yolo "<cron-expression>" "<prompt>" [--model <model>]`.
    - To list jobs: run `omgb schedule list`.
    - To run a job now: run `omgb schedule run <name>`.
    - To delete a job: run `omgb schedule delete <name>`.

@@ -7,3 +7,5 @@ dist/
 __pycache__/
 *.pyc
 archive/oh-my-grok-build-ts/package-lock.json
+# Local Windows protoc binary used when the DotSlash script isn't executable
+/bin/protoc.exe

@@ -96,7 +96,8 @@ pub struct ExecArgs {
     /// Internal: delete --prompt-file after the prompt is consumed.
     #[arg(long, hide = true)]
     pub prompt_file_own: bool,
-    #[arg(long, default_value_t = true)]
+    /// Auto-approve tool executions (required for non-interactive headless use).
+    #[arg(long)]
     pub yolo: bool,
     #[arg(long)]
     pub json: bool,
@@ -123,7 +124,8 @@ pub struct LoopArgs {
     pub model: Option<String>,
     #[arg(short = 'n', long, default_value = "10")]
     pub max_iterations: u32,
-    #[arg(long, default_value_t = true)]
+    /// Auto-approve tool use for the loop (required for non-interactive use).
+    #[arg(long)]
     pub yolo: bool,
     /// Commit changes after the loop finishes (required for auto-commit)
     #[arg(long)]
@@ -140,6 +142,9 @@ pub struct AutonomousArgs {
     pub model: Option<String>,
     #[arg(long, default_value = "workspace")]
     pub sandbox_profile: String,
+    /// Auto-approve tool use for autonomous mode.
+    #[arg(long)]
+    pub yolo: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -229,8 +234,8 @@ pub struct CronArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub name: Option<String>,
-    /// Run the job in yolo (non-interactive) mode
-    #[arg(long, default_value_t = true)]
+    /// Auto-approve tool use for this scheduled job (required for non-interactive use).
+    #[arg(long)]
     pub yolo: bool,
 }
 
@@ -266,7 +271,8 @@ pub struct TeamArgs {
     pub model: Option<String>,
     #[arg(short, long, default_value = "2")]
     pub agents: usize,
-    #[arg(long, default_value_t = true)]
+    /// Auto-approve tool use for each team agent (required for non-interactive use).
+    #[arg(long)]
     pub yolo: bool,
 }
 
@@ -277,7 +283,8 @@ pub struct SwarmArgs {
     pub model: Option<String>,
     #[arg(short, long, default_value = "3")]
     pub count: usize,
-    #[arg(long, default_value_t = true)]
+    /// Auto-approve tool use for each swarm member (required for non-interactive use).
+    #[arg(long)]
     pub yolo: bool,
 }
 
@@ -292,8 +299,8 @@ pub enum SubagentCommand {
     /// Spawn a subagent with a prompt
     Spawn {
         prompt: String,
-        /// Run the subagent in yolo (non-interactive) mode
-        #[arg(long, default_value_t = true)]
+        /// Auto-approve tool use for the subagent (required for non-interactive use).
+        #[arg(long)]
         yolo: bool,
     },
     /// List running subagents
@@ -313,6 +320,9 @@ pub struct ResearchArgs {
     pub count: usize,
     #[arg(short, long)]
     pub model: Option<String>,
+    /// Auto-approve read-only patch-generation tools (required when --model is used).
+    #[arg(long)]
+    pub yolo: bool,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }

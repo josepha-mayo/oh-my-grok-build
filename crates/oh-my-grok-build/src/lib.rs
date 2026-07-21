@@ -99,7 +99,8 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Swarm(args) => run_swarm(args).await,
         OmgbCommand::Subagent(args) => run_subagent(args).await,
         OmgbCommand::Research(args) => {
-            research::run_research(&args.topic, args.count, args.model, args.output).await
+            research::run_research(&args.topic, args.count, args.model, args.yolo, args.output)
+                .await
         }
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
         OmgbCommand::Harness(args) => run_harness(args).await,
@@ -397,6 +398,9 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
 }
 
 async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
+    if !args.yolo {
+        bail!("autonomous mode requires --yolo to auto-approve tool use");
+    }
     if matches!(
         config_sandbox_profile().as_deref(),
         None | Some("") | Some("off")
@@ -414,7 +418,7 @@ async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
     run_single_turn_with(
         &prompt,
         args.model,
-        true,
+        args.yolo,
         OutputFormat::Plain,
         Some(50),
         Some("run_terminal_cmd,read_file,search_replace,grep,list_dir".to_string()),
@@ -687,6 +691,10 @@ async fn run_undo(args: UndoArgs) -> Result<()> {
 async fn run_loop(args: LoopArgs) -> Result<()> {
     const MAX_DIFF_CHARS: usize = 16 * 1024;
 
+    if !args.yolo {
+        bail!("`omgb loop` requires --yolo to auto-approve tool use");
+    }
+
     if !git_worktree_status().await?.0 {
         bail!("git working tree is not clean; commit or stash changes before running `omgb loop`");
     }
@@ -841,6 +849,9 @@ async fn run_schedule(args: ScheduleArgs) -> Result<()> {
 }
 
 async fn run_team(args: TeamArgs) -> Result<()> {
+    if !args.yolo {
+        bail!("`omgb team` requires --yolo to auto-approve tool use");
+    }
     let git = Command::new("git")
         .args(["rev-parse", "--git-dir"])
         .stdout(Stdio::null())
@@ -1031,6 +1042,9 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
 }
 
 async fn run_swarm(args: SwarmArgs) -> Result<()> {
+    if !args.yolo {
+        bail!("`omgb swarm` requires --yolo to auto-approve tool use");
+    }
     let exe = std::env::current_exe()?;
     let mut tasks = Vec::new();
     for i in 0..args.count {
