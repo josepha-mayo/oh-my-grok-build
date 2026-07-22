@@ -1,0 +1,193 @@
+//! Persistent session list / resume / fork helpers.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Result, bail};
+use chrono::DateTime;
+use serde::Deserialize;
+
+use crate::args::{
+    SessionCommand, SessionForkArgs, SessionNewArgs, SessionParams, SessionResumeArgs,
+};
+use crate::run_single_turn_with;
+use xai_grok_pager::headless::OutputFormat;
+
+#[derive(Debug, Deserialize, Default)]
+struct SessionSummary {
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    start_time: Option<i64>,
+    #[serde(default)]
+    last_message_time: Option<i64>,
+}
+
+fn sessions_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let encoded = xai_grok_config::encode_cwd_dirname(&cwd.to_string_lossy());
+    Ok(xai_grok_config::grok_home().join("sessions").join(encoded))
+}
+
+fn session_dir(id: &str) -> Result<PathBuf> {
+    Ok(sessions_root()?.join(id))
+}
+
+fn list_session_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    }
+    dirs
+}
+
+fn read_summary(path: &Path) -> Option<SessionSummary> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<SessionSummary>(&s).ok())
+}
+
+fn fmt_time(ts: Option<i64>) -> String {
+    ts.and_then(|t| DateTime::from_timestamp(t, 0))
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+pub async fn run_session(cmd: SessionCommand) -> Result<()> {
+    match cmd {
+        SessionCommand::List => list_sessions(),
+        SessionCommand::New(args) => run_session_new(args).await,
+        SessionCommand::Resume(args) => run_session_resume(args).await,
+        SessionCommand::Fork(args) => run_session_fork(args).await,
+    }
+}
+
+fn list_sessions() -> Result<()> {
+    let root = sessions_root()?;
+    let dirs = list_session_dirs(&root);
+    if dirs.is_empty() {
+        println!("No sessions found for this workspace.");
+        return Ok(());
+    }
+
+    let mut sessions: Vec<(PathBuf, SessionSummary)> = dirs
+        .into_iter()
+        .filter_map(|d| {
+            let summary = read_summary(&d.join("summary.json"))?;
+            Some((d, summary))
+        })
+        .collect();
+
+    sessions.sort_by(|a, b| b.1.last_message_time.cmp(&a.1.last_message_time));
+
+    for (dir, summary) in sessions {
+        let id = dir.file_name().unwrap_or_default().to_string_lossy();
+        println!(
+            "{}\n  cwd: {}\n  summary: {}\n  start: {}  last: {}",
+            id,
+            summary.cwd,
+            summary.summary.lines().next().unwrap_or(""),
+            fmt_time(summary.start_time),
+            fmt_time(summary.last_message_time)
+        );
+    }
+    Ok(())
+}
+
+async fn run_session_new(args: SessionNewArgs) -> Result<()> {
+    if let Some(ref sid) = args.session_id
+        && session_dir(sid)?.exists()
+    {
+        bail!("session already exists: {sid}");
+    }
+    let session = SessionParams {
+        session_id: args.session_id,
+        ..Default::default()
+    };
+    run_single_turn_with(
+        &args.prompt,
+        args.model,
+        args.yolo,
+        OutputFormat::Plain,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &session,
+    )
+    .await
+}
+
+async fn run_session_resume(args: SessionResumeArgs) -> Result<()> {
+    let resume = if args.continue_last {
+        Some(String::new())
+    } else {
+        args.source_session_id.clone()
+    };
+    let session = SessionParams {
+        resume,
+        session_id: args.target_session_id,
+        fork_session: args.fork_session,
+        continue_last: false,
+    };
+    let prompt = args.prompt.unwrap_or_default();
+    run_single_turn_with(
+        &prompt,
+        args.model,
+        args.yolo,
+        OutputFormat::Plain,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &session,
+    )
+    .await
+}
+
+async fn run_session_fork(args: SessionForkArgs) -> Result<()> {
+    let session = SessionParams {
+        resume: Some(args.parent_session_id),
+        session_id: args.new_session_id,
+        fork_session: true,
+        continue_last: false,
+    };
+    let prompt = args.prompt.unwrap_or_default();
+    run_single_turn_with(
+        &prompt,
+        args.model,
+        args.yolo,
+        OutputFormat::Plain,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &session,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_paths_under_grok_home() {
+        let tmp = std::env::temp_dir();
+        unsafe { std::env::set_var("GROK_HOME", tmp.as_os_str()) };
+        let root = sessions_root().unwrap();
+        assert!(root.to_string_lossy().contains("sessions"));
+        let dir = session_dir("sess-1").unwrap();
+        assert!(dir.to_string_lossy().contains("sess-1"));
+        unsafe { std::env::remove_var("GROK_HOME") };
+    }
+}

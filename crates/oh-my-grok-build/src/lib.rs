@@ -20,6 +20,7 @@ mod providers;
 mod research;
 mod scheduler;
 mod server;
+mod session;
 mod subagents;
 mod swarm;
 mod taste;
@@ -107,6 +108,7 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
             research::run_research(&args.topic, args.count, args.model, args.yolo, args.output)
                 .await
         }
+        OmgbCommand::Session(args) => session::run_session(args).await,
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
         OmgbCommand::Harness(args) => run_harness(args).await,
         OmgbCommand::Serve(args) => server::serve(&args).await,
@@ -143,6 +145,21 @@ async fn run_tui(args: TuiArgs) -> Result<()> {
     if let Some(m) = args.model {
         argv.push("--model".to_string());
         argv.push(m);
+    }
+    if let Some(sid) = args.session.session_id {
+        argv.push("--session-id".to_string());
+        argv.push(sid);
+    }
+    if let Some(r) = args.session.resume {
+        argv.push("--resume".to_string());
+        if !r.is_empty() {
+            argv.push(r);
+        }
+    } else if args.session.continue_last {
+        argv.push("--continue".to_string());
+    }
+    if args.session.fork_session {
+        argv.push("--fork-session".to_string());
     }
     if let Some(p) = args.prompt {
         argv.push("--".to_string());
@@ -394,6 +411,7 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
         args.disallowed_tools.clone(),
         None,
         None,
+        &args.session,
     )
     .await?;
     if args.commit || args.commit_untracked {
@@ -430,6 +448,7 @@ async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
         None,
         None,
         None,
+        &args.session,
     )
     .await
 }
@@ -452,6 +471,7 @@ async fn run_use(args: UseArgs) -> Result<()> {
         None,
         None,
         None,
+        &SessionParams::default(),
     )
     .await
 }
@@ -479,11 +499,12 @@ async fn run_browser(args: BrowserArgs) -> Result<()> {
         None,
         Some("browser-use".to_string()),
         None,
+        &SessionParams::default(),
     )
     .await
 }
 
-async fn run_single_turn_with(
+pub(crate) async fn run_single_turn_with(
     prompt: &str,
     model: Option<String>,
     yolo: bool,
@@ -493,6 +514,7 @@ async fn run_single_turn_with(
     cli_disallowed_tools: Option<String>,
     agent: Option<String>,
     cwd: Option<PathBuf>,
+    session: &SessionParams,
 ) -> Result<()> {
     let full_prompt = format!("{}{}", prompt, taste::taste_preamble());
     let model = if let Some(m) = model {
@@ -504,8 +526,8 @@ async fn run_single_turn_with(
         None
     };
     let options = HeadlessOptions {
-        session_id: None,
-        resume: None,
+        session_id: session.session_id.clone(),
+        resume: session.resume.clone(),
         cwd,
         yolo,
         trust: yolo,
@@ -514,8 +536,8 @@ async fn run_single_turn_with(
         model,
         rules: None,
         system_prompt_override: None,
-        continue_last_session: false,
-        fork_session: false,
+        continue_last_session: session.continue_last,
+        fork_session: session.fork_session,
         worktree: None,
         restore_code: false,
         agent,
@@ -733,6 +755,7 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
             None,
             None,
             None,
+            &args.session,
         )
         .await?;
 
@@ -903,6 +926,7 @@ async fn run_team(args: TeamArgs) -> Result<()> {
                 None,
                 None,
                 Some(worktree.clone()),
+                &SessionParams::default(),
             )
             .await?;
             Ok::<_, anyhow::Error>((worktree, branch))

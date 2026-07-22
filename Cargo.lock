@@ -6955,6 +6955,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "xai-crash-handler",
+ "xai-grok-config",
  "xai-grok-pager",
  "xai-grok-pager-minimal",
  "xai-grok-shell",

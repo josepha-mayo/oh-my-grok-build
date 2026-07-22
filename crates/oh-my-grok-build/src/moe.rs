@@ -20,31 +20,31 @@ use crate::providers::{
 /// treated as `0.0`.
 const COSTS: &[(&str, f64)] = &[
     // Major cloud APIs (pricing per 1M tokens, avg of input + output).
-    ("openai", 6.25),              // gpt-4o: $2.50 in / $10.00 out
-    ("anthropic", 9.0),            // claude-3-5-sonnet: $3.00 in / $15.00 out
-    ("claude-code", 9.0),          // same Anthropic endpoint as above
-    ("openrouter", 9.5),           // pass-through + ~5% fee; default claude-3.5-sonnet
-    ("xai", 4.0),                  // grok-4.5: $2.00 in / $6.00 out
-    ("codex", 3.75),               // codex-mini-latest: $1.50 in / $6.00 out
-    ("gemini", 0.19),              // gemini-1.5-flash: $0.075 in / $0.30 out
-    ("deepseek", 0.21),            // deepseek-chat: $0.14 in / $0.28 out
-    ("groq", 0.69),                // llama-3.3-70b-versatile: $0.59 in / $0.79 out
-    ("mistral", 4.0),              // mistral-large-latest: $2.00 in / $6.00 out
-    ("cohere", 6.25),              // command-r-plus: $2.50 in / $10.00 out
-    ("together", 1.04),            // Llama-3.3-70B-Instruct-Turbo: $1.04 / $1.04
-    ("fireworks", 0.9),            // llama-v3p1-70b-instruct: $0.90 / $0.90
-    ("perplexity", 1.0),           // sonar: $1.00 / $1.00
-    ("ai21", 0.3),                 // jamba-1.5-mini: $0.20 in / $0.40 out
-    ("deepinfra", 0.61),           // DeepSeek-V3: $0.32 in / $0.89 out
+    ("openai", 6.25),     // gpt-4o: $2.50 in / $10.00 out
+    ("anthropic", 9.0),   // claude-3-5-sonnet: $3.00 in / $15.00 out
+    ("claude-code", 9.0), // same Anthropic endpoint as above
+    ("openrouter", 9.5),  // pass-through + ~5% fee; default claude-3.5-sonnet
+    ("xai", 4.0),         // grok-4.5: $2.00 in / $6.00 out
+    ("codex", 3.75),      // codex-mini-latest: $1.50 in / $6.00 out
+    ("gemini", 0.19),     // gemini-1.5-flash: $0.075 in / $0.30 out
+    ("deepseek", 0.21),   // deepseek-chat: $0.14 in / $0.28 out
+    ("groq", 0.69),       // llama-3.3-70b-versatile: $0.59 in / $0.79 out
+    ("mistral", 4.0),     // mistral-large-latest: $2.00 in / $6.00 out
+    ("cohere", 6.25),     // command-r-plus: $2.50 in / $10.00 out
+    ("together", 1.04),   // Llama-3.3-70B-Instruct-Turbo: $1.04 / $1.04
+    ("fireworks", 0.9),   // llama-v3p1-70b-instruct: $0.90 / $0.90
+    ("perplexity", 1.0),  // sonar: $1.00 / $1.00
+    ("ai21", 0.3),        // jamba-1.5-mini: $0.20 in / $0.40 out
+    ("deepinfra", 0.61),  // DeepSeek-V3: $0.32 in / $0.89 out
     // Coding-assistant / harness-style providers.
-    ("opencode", 4.0),             // defaults to cloud-backed providers
-    ("hermes", 1.0),               // Together-hosted open models
-    ("pi", 5.0),                   // Inflection Pi (approximate)
-    ("github-models", 6.0),        // Azure-hosted OpenAI models
-    ("nvidia", 1.5),               // NIM Llama endpoints (approximate)
-    ("sambanova", 0.8),            // Llama endpoints (approximate)
-    ("lepton", 2.0),               // approximate
-    ("siliconflow", 0.5),          // approximate
+    ("opencode", 4.0),      // defaults to cloud-backed providers
+    ("hermes", 1.0),        // Together-hosted open models
+    ("pi", 5.0),            // Inflection Pi (approximate)
+    ("github-models", 6.0), // Azure-hosted OpenAI models
+    ("nvidia", 1.5),        // NIM Llama endpoints (approximate)
+    ("sambanova", 0.8),     // Llama endpoints (approximate)
+    ("lepton", 2.0),        // approximate
+    ("siliconflow", 0.5),   // approximate
     // Keyless local providers (cost is electricity, not API spend).
     ("ollama", 0.0),
     ("lmstudio", 0.0),

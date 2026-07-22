@@ -62,6 +62,9 @@ pub enum OmgbCommand {
     Serve(ServeArgs),
     /// Connect to an ACP relay
     Connect(ConnectArgs),
+    /// List, resume, or fork persistent sessions
+    #[command(subcommand)]
+    Session(SessionCommand),
     /// Computer use prompt
     Use(UseArgs),
     /// Browser use prompt
@@ -84,6 +87,8 @@ pub struct TuiArgs {
     pub prompt: Option<String>,
     #[arg(short, long)]
     pub model: Option<String>,
+    #[command(flatten)]
+    pub session: SessionParams,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -115,6 +120,8 @@ pub struct ExecArgs {
     /// Stage and commit untracked files as well
     #[arg(long)]
     pub commit_untracked: bool,
+    #[command(flatten)]
+    pub session: SessionParams,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -133,6 +140,8 @@ pub struct LoopArgs {
     /// Stage and commit untracked files as well as tracked changes
     #[arg(long)]
     pub commit_untracked: bool,
+    #[command(flatten)]
+    pub session: SessionParams,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -145,6 +154,8 @@ pub struct AutonomousArgs {
     /// Auto-approve tool use for autonomous mode.
     #[arg(long)]
     pub yolo: bool,
+    #[command(flatten)]
+    pub session: SessionParams,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -328,6 +339,87 @@ pub struct ResearchArgs {
     pub yolo: bool,
     #[arg(long)]
     pub output: Option<PathBuf>,
+}
+
+/// Session-selection flags shared by commands that open a Grok session.
+#[derive(Debug, Args, Clone, Default)]
+pub struct SessionParams {
+    /// Resume a session by ID, or the most recent if omitted.
+    #[arg(
+        long = "resume",
+        short = 'r',
+        value_name = "SESSION_ID",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    pub resume: Option<String>,
+    /// Continue the most recent session for this workspace.
+    #[arg(long = "continue", short = 'c')]
+    pub continue_last: bool,
+    /// Use a specific session ID for a new or forked session.
+    #[arg(long = "session-id", short = 's', value_name = "SESSION_ID")]
+    pub session_id: Option<String>,
+    /// When resuming or continuing, fork to a new session instead of reusing.
+    #[arg(long = "fork-session")]
+    pub fork_session: bool,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum SessionCommand {
+    /// List persisted sessions for the current workspace
+    List,
+    /// Resume a session (or the most recent) and continue a prompt
+    Resume(SessionResumeArgs),
+    /// Fork a session into a new branch
+    Fork(SessionForkArgs),
+    /// Start a fresh named session
+    New(SessionNewArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct SessionResumeArgs {
+    /// Session ID to resume, or omit to resume the most recent.
+    pub source_session_id: Option<String>,
+    #[arg(short, long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub yolo: bool,
+    #[arg(long = "continue", short = 'c')]
+    pub continue_last: bool,
+    #[arg(long = "fork-session")]
+    pub fork_session: bool,
+    /// New session ID when forking (requires --fork-session).
+    #[arg(long = "session-id", short = 's', value_name = "SESSION_ID")]
+    pub target_session_id: Option<String>,
+    /// Optional follow-up prompt (omit for an empty turn / TUI-less resume).
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct SessionForkArgs {
+    /// Parent session ID to fork from.
+    pub parent_session_id: String,
+    /// New session ID for the fork.
+    #[arg(long = "session-id", short = 's', value_name = "SESSION_ID")]
+    pub new_session_id: Option<String>,
+    #[arg(short, long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub yolo: bool,
+    /// Optional follow-up prompt.
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct SessionNewArgs {
+    #[arg(long = "session-id", short = 's', value_name = "SESSION_ID")]
+    pub session_id: Option<String>,
+    #[arg(short, long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub yolo: bool,
+    /// Initial prompt.
+    pub prompt: String,
 }
 
 #[derive(Debug, Args, Clone)]
