@@ -33,6 +33,9 @@ mod timeline;
 
 use args::*;
 
+#[cfg(test)]
+pub(crate) static OMGB_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn desktop_control_allowed() -> bool {
     std::env::var("OMGB_ALLOW_DESKTOP_CONTROL")
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))

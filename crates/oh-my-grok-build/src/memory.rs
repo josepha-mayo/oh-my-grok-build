@@ -235,15 +235,13 @@ fn fmt_time(ts: i64) -> String {
 mod tests {
     use super::*;
 
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn tmp_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("omgb-memory-test-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
     fn test_remember_and_recall() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
         unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
         let note = remember("Use anyhow for error handling", &["rust".to_string()]).unwrap();
@@ -255,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_list_and_compact() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
         unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
         remember("duplicate", &[]).unwrap();

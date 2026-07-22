@@ -302,12 +302,9 @@ pub async fn select_provider_or_fallback(prompt: &str) -> Result<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_temp_home(f: impl FnOnce(&std::path::Path)) {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("omgb-moe-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         unsafe { std::env::set_var("OMGB_HOME", &tmp) };
