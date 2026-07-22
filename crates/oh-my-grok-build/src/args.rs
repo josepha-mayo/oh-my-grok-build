@@ -68,6 +68,9 @@ pub enum OmgbCommand {
     /// Remember, recall, or manage persistent cross-session memory
     #[command(subcommand)]
     Memory(MemoryCommand),
+    /// Apply hashline-anchored, token-efficient file patches
+    #[command(subcommand)]
+    Hashline(HashlineCommand),
     /// Computer use prompt
     Use(UseArgs),
     /// Browser use prompt
@@ -476,6 +479,22 @@ pub struct MemoryListArgs {
     pub tag: Option<String>,
     #[arg(short, long, default_value = "20")]
     pub limit: usize,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum HashlineCommand {
+    /// Apply a hashline patch file to a target file
+    Apply(HashlineApplyArgs),
+    /// Verify a hashline patch without writing changes
+    Verify(HashlineApplyArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct HashlineApplyArgs {
+    pub file: std::path::PathBuf,
+    /// Patch file path, or `-` to read from stdin
+    #[arg(short, long, default_value = "-")]
+    pub patch: String,
 }
 
 #[derive(Debug, Args, Clone)]
