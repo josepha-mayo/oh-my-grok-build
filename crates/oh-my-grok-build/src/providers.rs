@@ -521,6 +521,9 @@ pub fn ensure_provider_configured(id: &str) -> Result<ProviderConfig> {
     let provider = provider_template(&id).ok_or_else(|| {
         anyhow::anyhow!("provider '{id}' is not configured and has no known template")
     })?;
+    if provider.model.trim().is_empty() {
+        bail!("provider '{id}' has no configured model; pass --model or discover local models");
+    }
     cfg.providers.insert(id.clone(), provider.clone());
     save_omg_config(&cfg)?;
     sync_provider_to_grok_config(&provider)?;
@@ -543,7 +546,7 @@ pub fn remove_provider(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn provider_template(id: &str) -> Option<ProviderConfig> {
+pub(crate) fn provider_template(id: &str) -> Option<ProviderConfig> {
     match id {
         "openai" => Some(ProviderConfig {
             id: "openai".into(),
@@ -1369,5 +1372,18 @@ mod tests {
             resolve_api_key_with_maps(&provider, &env, &empty_dotenv),
             Some("from-env".into())
         );
+    }
+
+    #[test]
+    fn test_ensure_provider_configured_rejects_empty_model() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let tmp =
+            std::env::temp_dir().join(format!("omgb-providers-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("OMGB_HOME", tmp.as_os_str()) };
+        let err = ensure_provider_configured("vllm").unwrap_err();
+        assert!(err.to_string().contains("no configured model"));
+        unsafe { std::env::remove_var("OMGB_HOME") };
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

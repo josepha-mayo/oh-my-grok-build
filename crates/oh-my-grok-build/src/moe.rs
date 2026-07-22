@@ -186,10 +186,10 @@ fn task_contains_word(task: &str, word: &str) -> bool {
 }
 
 /// Returns the configured providers that are available: they have a non-empty
-/// `*_API_KEY` in `~/.omgb/.env` or the process environment, or their base URL
-/// points at a loopback/local endpoint (so keyless local servers can be routed
-/// to). Also detects catalog templates whose canonical env key is present even
-/// when they have not been explicitly configured.
+/// `*_API_KEY` in `~/.omgb/.env` or the process environment (or their base URL
+/// points at a loopback/local endpoint for keyless local servers), and a usable
+/// model name. Also detects catalog templates whose canonical env key is present
+/// even when they have not been explicitly configured.
 pub fn available_providers() -> Result<Vec<String>> {
     let cfg = load_omg_config()?;
     let dotenv = load_env_file().unwrap_or_default();
@@ -203,8 +203,9 @@ pub fn available_providers() -> Result<Vec<String>> {
     }
 
     for template in crate::providers::catalog::TEMPLATES {
-        let provider = template.to_provider_config();
-        if provider_is_available(&provider, &dotenv, false) {
+        if let Some(provider) = crate::providers::provider_template(template.id)
+            && provider_is_available(&provider, &dotenv, false)
+        {
             ids.insert(provider.id);
         }
     }
@@ -220,6 +221,9 @@ fn provider_is_available(
     dotenv: &HashMap<String, String>,
     allow_loopback: bool,
 ) -> bool {
+    if provider.model.trim().is_empty() {
+        return false;
+    }
     if allow_loopback && is_url_host_loopback(&provider.base_url) {
         return true;
     }
@@ -477,6 +481,18 @@ mod tests {
             std::fs::write(home.join(".env"), "OPENAI_API_KEY=sk-secret\n").unwrap();
             let providers = available_providers().unwrap();
             assert!(providers.contains(&"openai".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_available_providers_skips_empty_model_templates() {
+        with_temp_home(|home| {
+            std::fs::write(home.join(".env"), "OMGB_VLLM_API_KEY=secret\n").unwrap();
+            let providers = available_providers().unwrap();
+            assert!(
+                !providers.contains(&"vllm".to_string()),
+                "vllm template has no model and should not be auto-routed"
+            );
         });
     }
 }

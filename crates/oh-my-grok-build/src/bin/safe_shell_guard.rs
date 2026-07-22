@@ -6,7 +6,8 @@ use std::io::{self, Read};
 const IS_WINDOWS: bool = cfg!(windows);
 
 const DANGEROUS_COMMANDS: &[&str] = &[
-    "mkfs", "fdisk", "diskpart", "format", "shutdown", "reboot", "halt", "poweroff",
+    "mkfs", "fdisk", "diskpart", "format", "shutdown", "reboot", "halt", "poweroff", "init",
+    "telinit",
 ];
 
 const UNANALYZABLE_COMMANDS: &[&str] = &[
@@ -515,6 +516,9 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
                     return Decision::Deny("Blocked destructive Windows rd/rmdir".into());
                 }
                 return Decision::Allow;
+            }
+            if base == "systemctl" {
+                return check_systemctl(tokens, i);
             }
             Decision::Allow
         }
@@ -1150,6 +1154,35 @@ fn check_find(tokens: &[Token], i: usize) -> Decision {
     Decision::Allow
 }
 
+const DANGEROUS_SYSTEMCTL_VERBS: &[&str] = &[
+    "poweroff",
+    "reboot",
+    "halt",
+    "shutdown",
+    "kexec",
+    "suspend",
+    "hibernate",
+    "hybrid-sleep",
+    "suspend-then-hibernate",
+    "emergency",
+    "rescue",
+];
+
+fn check_systemctl(tokens: &[Token], i: usize) -> Decision {
+    for t in tokens.iter().skip(i + 1) {
+        let v = &t.value;
+        if v.starts_with('-') {
+            continue;
+        }
+        if DANGEROUS_SYSTEMCTL_VERBS.contains(&v.as_str()) {
+            return Decision::Deny(format!("Blocked systemctl {v}"));
+        }
+        // First non-option token is not a destructive verb; allow further args.
+        break;
+    }
+    Decision::Allow
+}
+
 fn is_dangerous_rm_target(arg: &str) -> bool {
     let mut target = arg.to_string();
     if let Some(t) = target.strip_prefix('"') {
@@ -1640,6 +1673,33 @@ mod tests {
                     r
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn systemctl_blocks_destructive_verbs() {
+        for (cmd, reason) in &[
+            ("systemctl poweroff", "Blocked systemctl poweroff"),
+            ("systemctl --no-wall reboot", "Blocked systemctl reboot"),
+            ("systemctl halt", "Blocked systemctl halt"),
+            ("systemctl kexec", "Blocked systemctl kexec"),
+            ("systemctl suspend", "Blocked systemctl suspend"),
+            ("systemctl hibernate", "Blocked systemctl hibernate"),
+            ("init 0", "Blocked potentially destructive command: init"),
+            (
+                "telinit 6",
+                "Blocked potentially destructive command: telinit",
+            ),
+        ] {
+            deny(cmd, reason);
+        }
+        for cmd in &[
+            "systemctl status ssh",
+            "systemctl enable foo",
+            "systemctl start foo",
+            "systemctl restart ssh",
+        ] {
+            allow(cmd);
         }
     }
 
