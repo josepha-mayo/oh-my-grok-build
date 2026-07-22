@@ -14,6 +14,7 @@ chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 constant_time_eq = { workspace = true }
 dirs = { workspace = true }
+dunce = { workspace = true }
 fs2 = { workspace = true }
 gethostname = { workspace = true }
 futures = { workspace = true }

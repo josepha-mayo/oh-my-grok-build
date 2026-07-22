@@ -135,6 +135,15 @@ struct PrData {
     is_in_merge_queue: bool,
 }
 
+fn normalize_state(state: Option<&str>, is_draft: bool) -> String {
+    match state.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("merged") => "merged".into(),
+        Some("closed") => "closed".into(),
+        _ if is_draft => "draft".into(),
+        _ => "open".into(),
+    }
+}
+
 async fn gh_pr_view(branch: &str) -> Result<PrData> {
     let _ = ensure_gh()?;
     let mut cmd = tokio::process::Command::new("gh");
@@ -153,17 +162,7 @@ async fn gh_pr_view(branch: &str) -> Result<PrData> {
         .with_context(|| format!("could not parse `gh pr view` output for {branch}"))?;
     let url = parsed.url.unwrap_or_default();
     let number = parsed.number.unwrap_or(0);
-    let state = match parsed
-        .state
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("merged") => "merged".to_string(),
-        Some("closed") => "closed".to_string(),
-        _ if parsed.is_draft.unwrap_or(false) => "draft".to_string(),
-        _ => "open".to_string(),
-    };
+    let state = normalize_state(parsed.state.as_deref(), parsed.is_draft.unwrap_or(false));
     let is_in_merge_queue = if state == "open" {
         gh_pr_is_in_merge_queue(&url).await
     } else {
@@ -231,7 +230,13 @@ mod tests {
 
     #[test]
     fn pr_state_normalization() {
-        assert_eq!("open", "open");
+        assert_eq!(normalize_state(Some("MERGED"), false), "merged");
+        assert_eq!(normalize_state(Some("closed"), false), "closed");
+        assert_eq!(normalize_state(Some("OPEN"), true), "draft");
+        assert_eq!(normalize_state(Some("open"), false), "open");
+        assert_eq!(normalize_state(None, false), "open");
+        assert_eq!(normalize_state(None, true), "draft");
+        assert_eq!(normalize_state(Some("merged"), true), "merged");
     }
 
     #[test]

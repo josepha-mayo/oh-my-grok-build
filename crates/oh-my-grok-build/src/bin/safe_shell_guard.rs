@@ -6,8 +6,26 @@ use std::io::{self, Read};
 const IS_WINDOWS: bool = cfg!(windows);
 
 const DANGEROUS_COMMANDS: &[&str] = &[
-    "mkfs", "fdisk", "diskpart", "format", "shutdown", "reboot", "halt", "poweroff", "init",
+    "mkfs",
+    "fdisk",
+    "diskpart",
+    "format",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "init",
     "telinit",
+    "wipe",
+    "shred",
+    "cryptsetup",
+    "lvremove",
+    "vgremove",
+    "pvremove",
+    "mkswap",
+    "swapoff",
+    "usermod",
+    "groupmod",
 ];
 
 const UNANALYZABLE_COMMANDS: &[&str] = &[
@@ -33,6 +51,7 @@ const UNANALYZABLE_COMMANDS: &[&str] = &[
     "sftp",
     "chroot",
     "systemd-run",
+    "systemd-nspawn",
     "script",
     "screen",
     "tmux",
@@ -64,6 +83,24 @@ const UNANALYZABLE_COMMANDS: &[&str] = &[
     "pkexec",
     "run0",
     "runas",
+    "su",
+    "runuser",
+    "sg",
+    "ionice",
+    "taskset",
+    "flock",
+    "chrt",
+    "numactl",
+    "chronic",
+    "crontab",
+    "at",
+    "batch",
+    "reg",
+    "reg.exe",
+    "schtasks",
+    "sc",
+    "icacls",
+    "takeown",
     "wscript",
     "cscript",
     "mshta",
@@ -502,7 +539,7 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
                 if argv.iter().any(|a| {
                     a.len() >= 2
                         && a.starts_with('/')
-                        && "fFsSqQaA".contains(a.chars().nth(1).unwrap())
+                        && a.chars().nth(1).is_some_and(|c| "fFsSqQaA".contains(c))
                 }) {
                     return Decision::Deny("Blocked destructive Windows delete".into());
                 }
@@ -511,7 +548,9 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
             if base == "rd" || base == "rmdir" {
                 let argv: Vec<&str> = tokens[i..].iter().map(|t| t.value.as_str()).collect();
                 if argv.iter().any(|a| {
-                    a.len() >= 2 && a.starts_with('/') && "sSqQ".contains(a.chars().nth(1).unwrap())
+                    a.len() >= 2
+                        && a.starts_with('/')
+                        && a.chars().nth(1).is_some_and(|c| "sSqQ".contains(c))
                 }) {
                     return Decision::Deny("Blocked destructive Windows rd/rmdir".into());
                 }
@@ -533,9 +572,12 @@ fn skip_prefix(tokens: &[Token], i: usize) -> PrefixOutcome {
     match base.as_str() {
         "nohup" | "setsid" => PrefixOutcome::Continue(i + 1),
         "nice" => parse_nice(tokens, i),
+        "time" => parse_time(tokens, i),
         "env" => parse_env(tokens, i),
         "timeout" => parse_timeout(tokens, i),
         "stdbuf" => parse_stdbuf(tokens, i),
+        "command" => parse_command_prefix(tokens, i),
+        "builtin" => parse_builtin(tokens, i),
         "sudo" | "doas" => parse_sudo_doas(tokens, i, &base),
         "bash" | "sh" | "dash" | "zsh" | "ksh" | "csh" | "tcsh" | "fish" => {
             parse_interpreter(tokens, i, "-c")
@@ -567,11 +609,95 @@ fn parse_nice(tokens: &[Token], i: usize) -> PrefixOutcome {
             j += 1;
             continue;
         }
+        if v == "--" {
+            return PrefixOutcome::Continue(j + 1);
+        }
         if v.starts_with('-') && v != "--" {
             j += 1;
             continue;
         }
         break;
+    }
+    PrefixOutcome::Continue(j)
+}
+
+fn parse_time(tokens: &[Token], i: usize) -> PrefixOutcome {
+    let no_arg = [
+        "-a",
+        "-p",
+        "-q",
+        "-v",
+        "--portability",
+        "--quiet",
+        "--verbose",
+        "--help",
+        "--version",
+    ];
+    let mut j = i + 1;
+    while j < tokens.len() {
+        let v = &tokens[j].value;
+        if v == "-o" || v == "--output" || v == "-f" || v == "--format" {
+            if j + 1 >= tokens.len() {
+                return PrefixOutcome::Stop(Decision::Deny("time option requires value".into()));
+            }
+            j += 2;
+            continue;
+        }
+        if v.starts_with("--output=") || v.starts_with("--format=") {
+            j += 1;
+            continue;
+        }
+        if (v.starts_with("-o") || v.starts_with("-f")) && v.len() > 2 {
+            j += 1;
+            continue;
+        }
+        if no_arg.contains(&v.as_str()) {
+            j += 1;
+            continue;
+        }
+        if v == "--" {
+            return PrefixOutcome::Continue(j + 1);
+        }
+        if v.starts_with('-') {
+            return PrefixOutcome::Stop(Decision::Deny("Blocked unknown time option".into()));
+        }
+        break;
+    }
+    if j >= tokens.len() {
+        return PrefixOutcome::Stop(Decision::Deny("time missing command".into()));
+    }
+    PrefixOutcome::Continue(j)
+}
+
+fn parse_command_prefix(tokens: &[Token], i: usize) -> PrefixOutcome {
+    let mut j = i + 1;
+    while j < tokens.len() {
+        let v = &tokens[j].value;
+        if v == "-v" || v == "-V" || v == "--describe" {
+            return PrefixOutcome::Stop(Decision::Allow);
+        }
+        if v == "-p" || v == "--path-search" || v == "--help" || v == "--version" {
+            j += 1;
+            continue;
+        }
+        if v == "--" {
+            return PrefixOutcome::Continue(j + 1);
+        }
+        if v.starts_with('-') {
+            return PrefixOutcome::Stop(Decision::Deny("Blocked unknown command option".into()));
+        }
+        break;
+    }
+    if j >= tokens.len() {
+        return PrefixOutcome::Stop(Decision::Deny("command missing command name".into()));
+    }
+    PrefixOutcome::Continue(j)
+}
+
+fn parse_builtin(tokens: &[Token], i: usize) -> PrefixOutcome {
+    let j = i + 1;
+    if j >= tokens.len() {
+        return PrefixOutcome::Stop(Decision::Deny("builtin missing builtin name".into()));
     }
     PrefixOutcome::Continue(j)
 }
@@ -693,13 +819,21 @@ fn parse_timeout(tokens: &[Token], i: usize) -> PrefixOutcome {
             j += 1;
             continue;
         }
-        if v.starts_with('-') && v != "--" {
+        if v == "--" {
+            j += 1;
+            break;
+        }
+        if v.starts_with('-') {
             return PrefixOutcome::Stop(Decision::Deny("Blocked unknown timeout option".into()));
         }
-        if v == "--" {
-            return PrefixOutcome::Continue(j + 1);
-        }
         break;
+    }
+    if j >= tokens.len() {
+        return PrefixOutcome::Stop(Decision::Deny("timeout missing duration".into()));
+    }
+    j += 1; // skip duration
+    if j >= tokens.len() {
+        return PrefixOutcome::Stop(Decision::Deny("timeout missing command".into()));
     }
     PrefixOutcome::Continue(j)
 }
@@ -745,7 +879,9 @@ fn parse_stdbuf(tokens: &[Token], i: usize) -> PrefixOutcome {
 }
 
 fn parse_sudo_doas(tokens: &[Token], i: usize, kind: &str) -> PrefixOutcome {
-    let value_short: &[char] = &['u', 'g', 'p', 'r', 't', 'C', 'U', 'D', 'c', 'T'];
+    // Options that take a value.  -e/--edit are *not* listed here: sudo -e is
+    // equivalent to sudoedit and must be rejected outright.
+    let value_short: &[char] = &['u', 'g', 'p', 'r', 't', 'h', 'C', 'R', 'U', 'D', 'c', 'T'];
     let value_long: &[&str] = &[
         "user",
         "group",
@@ -755,7 +891,7 @@ fn parse_sudo_doas(tokens: &[Token], i: usize, kind: &str) -> PrefixOutcome {
         "close-from",
         "other-user",
         "chdir",
-        "command",
+        "chroot",
         "timeout",
         "askpass",
         "host",
@@ -767,6 +903,17 @@ fn parse_sudo_doas(tokens: &[Token], i: usize, kind: &str) -> PrefixOutcome {
         let v = &tokens[j].value;
         if v == "--" {
             return PrefixOutcome::Continue(j + 1);
+        }
+        // -h alone is --help, but -h <host> is --host and takes a value.
+        if v == "-h" && j + 1 == tokens.len() {
+            return PrefixOutcome::Stop(Decision::Allow);
+        }
+        // -e and --edit let the caller edit arbitrary files as another user.
+        if v == "-e" || v == "--edit" || v.starts_with("--edit=") {
+            return PrefixOutcome::Stop(Decision::Deny(format!(
+                "{} -e/--edit is not allowed",
+                kind
+            )));
         }
         if v.starts_with("--") {
             let eq = v.find('=').unwrap_or(v.len());
@@ -810,6 +957,16 @@ fn parse_sudo_doas(tokens: &[Token], i: usize, kind: &str) -> PrefixOutcome {
             continue;
         }
         break;
+    }
+    if j >= tokens.len() {
+        let help_version = ["--help", "-h", "--version", "-V"];
+        if tokens.len() == i + 2 && help_version.contains(&tokens[i + 1].value.as_str()) {
+            return PrefixOutcome::Stop(Decision::Allow);
+        }
+        return PrefixOutcome::Stop(Decision::Deny(format!(
+            "{} requires an explicit command",
+            kind
+        )));
     }
     PrefixOutcome::Continue(j)
 }
@@ -1111,6 +1268,7 @@ fn check_rm(tokens: &[Token], rm_index: usize) -> Decision {
     let argv: Vec<&str> = tokens.iter().map(|t| t.value.as_str()).collect();
     let mut recursive = false;
     let mut force = false;
+    let mut no_preserve_root = false;
     let mut saw_double_dash = false;
     for arg in argv.iter().skip(rm_index + 1).copied() {
         if !saw_double_dash && arg == "--" {
@@ -1125,6 +1283,12 @@ fn check_rm(tokens: &[Token], rm_index: usize) -> Decision {
                 if ["force", "f"].contains(&name) {
                     force = true;
                 }
+                if name == "no-preserve-root" {
+                    no_preserve_root = true;
+                }
+                if name == "preserve-root" {
+                    no_preserve_root = false;
+                }
             } else {
                 for ch in arg[1..].chars() {
                     if ch == 'r' || ch == 'R' {
@@ -1137,7 +1301,7 @@ fn check_rm(tokens: &[Token], rm_index: usize) -> Decision {
             }
             continue;
         }
-        if recursive && force && is_dangerous_rm_target(arg) {
+        if recursive && (force || no_preserve_root) && is_dangerous_rm_target(arg) {
             return Decision::Deny("Blocked rm -rf on a dangerous target".into());
         }
     }
@@ -1169,15 +1333,79 @@ const DANGEROUS_SYSTEMCTL_VERBS: &[&str] = &[
 ];
 
 fn check_systemctl(tokens: &[Token], i: usize) -> Decision {
-    for t in tokens.iter().skip(i + 1) {
-        let v = &t.value;
-        if v.starts_with('-') {
+    let value_long: &[&str] = &[
+        "host",
+        "machine",
+        "property",
+        "type",
+        "lines",
+        "output",
+        "prefix",
+        "state",
+        "root",
+        "image",
+        "image-policy",
+        "drop-in",
+        "name",
+        "uid",
+        "gid",
+        "setenv",
+    ];
+    let value_short: &[char] = &['H', 'M', 'p', 't', 'n', 'o', 'P', 'E'];
+    let mut j = i + 1;
+    while j < tokens.len() {
+        let v = &tokens[j].value;
+        if v == "--" {
+            j += 1;
+            continue;
+        }
+        if let Some(rest) = v.strip_prefix("--") {
+            if let Some(eq) = rest.find('=') {
+                let name = &rest[..eq];
+                if value_long.contains(&name) {
+                    j += 1;
+                    continue;
+                }
+            } else if value_long.contains(&rest) {
+                if j + 1 >= tokens.len() {
+                    return Decision::Deny("systemctl option requires value".into());
+                }
+                j += 2;
+                continue;
+            }
+            // Unknown or no-argument long option.
+            j += 1;
+            continue;
+        } else if v.starts_with('-') && v.len() > 1 {
+            let bytes = v.as_bytes();
+            let mut k = 1;
+            let mut consumed = false;
+            while k < bytes.len() {
+                let ch = bytes[k] as char;
+                if value_short.contains(&ch) {
+                    if k == bytes.len() - 1 {
+                        if j + 1 >= tokens.len() {
+                            return Decision::Deny("systemctl option requires value".into());
+                        }
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                    consumed = true;
+                    break;
+                }
+                k += 1;
+            }
+            if consumed {
+                continue;
+            }
+            j += 1;
             continue;
         }
         if DANGEROUS_SYSTEMCTL_VERBS.contains(&v.as_str()) {
             return Decision::Deny(format!("Blocked systemctl {v}"));
         }
-        // First non-option token is not a destructive verb; allow further args.
+        // First non-option token is not a destructive verb; allow unit names.
         break;
     }
     Decision::Allow
@@ -1185,19 +1413,6 @@ fn check_systemctl(tokens: &[Token], i: usize) -> Decision {
 
 fn is_dangerous_rm_target(arg: &str) -> bool {
     let mut target = arg.to_string();
-    if let Some(t) = target.strip_prefix('"') {
-        target = t.to_string();
-    }
-    if let Some(t) = target.strip_prefix('\'') {
-        target = t.to_string();
-    }
-    if let Some(t) = target.strip_suffix('"') {
-        target = t.to_string();
-    }
-    if let Some(t) = target.strip_suffix('\'') {
-        target = t.to_string();
-    }
-
     if target.split(['/', '\\']).any(|seg| seg == "..") {
         return true;
     }
@@ -1277,36 +1492,8 @@ fn is_dangerous_rm_target(arg: &str) -> bool {
         return true;
     }
 
-    if target.contains('*') {
-        let dir_part = target.split('*').next().unwrap_or("");
-        let norm_dir = normalize_target(dir_part);
-        if norm_dir == sep.to_string() || norm_dir == "/" || norm_dir == "\\" {
-            return true;
-        }
-        if norm_dir.len() == 3
-            && norm_dir.as_bytes()[0].is_ascii_alphabetic()
-            && norm_dir.as_bytes()[1] == b':'
-            && (norm_dir.as_bytes()[2] == b'\\' || norm_dir.as_bytes()[2] == b'/')
-        {
-            return true;
-        }
-        let clean_dir = norm_dir.trim_end_matches(['/', '\\']);
-        if !home.is_empty() {
-            let home_norm = normalize_target(&home);
-            if clean_dir.to_lowercase() == home_norm.to_lowercase() {
-                return true;
-            }
-        }
-        let ends_with_sep = dir_part.ends_with('/') || dir_part.ends_with('\\');
-        if !ends_with_sep && is_absolute_target(&norm_dir) {
-            let dir_segs: Vec<&str> = norm_dir
-                .split(['/', '\\'])
-                .filter(|s| !s.is_empty())
-                .collect();
-            if dir_segs.len() <= 2 {
-                return true;
-            }
-        }
+    if is_broad_glob_target(&target, &home) {
+        return true;
     }
 
     false
@@ -1324,6 +1511,52 @@ fn is_absolute_target(s: &str) -> bool {
     } else {
         s.starts_with('/')
     }
+}
+
+/// Returns true when `target` is a shell glob that can match many files in a
+/// sensitive directory, or a dotfile glob whose pattern can match `..'.
+fn is_broad_glob_target(target: &str, home: &str) -> bool {
+    let Some(first_wild) = target.find(['*', '?', '[']) else {
+        return false;
+    };
+    let dir_end = target[..=first_wild].rfind(['/', '\\']);
+    let (dir, base) = match dir_end {
+        Some(end) => (&target[..=end], &target[end + 1..]),
+        None => ("", target),
+    };
+
+    // Dotfile globs whose pattern (after the leading dot) begins with a wildcard
+    // can match `.', `..', or a broad set of dotfiles and climb to a parent
+    // directory. Treat them as dangerous regardless of which directory they are in.
+    if let Some(rest) = base.strip_prefix('.')
+        && (rest.starts_with('*') || rest.starts_with('?') || rest.starts_with('['))
+    {
+        return true;
+    }
+
+    let norm_dir = normalize_target(dir);
+    let is_root = norm_dir == "/"
+        || norm_dir == "\\"
+        || (norm_dir.len() == 3
+            && norm_dir.as_bytes()[0].is_ascii_alphabetic()
+            && norm_dir.as_bytes()[1] == b':'
+            && (norm_dir.as_bytes()[2] == b'\\' || norm_dir.as_bytes()[2] == b'/'));
+
+    let clean_dir = norm_dir.trim_end_matches(['/', '\\']);
+    let in_cwd = clean_dir.is_empty() || clean_dir == ".";
+    let in_home = !home.is_empty()
+        && clean_dir.to_lowercase()
+            == normalize_target(home)
+                .trim_end_matches(['/', '\\'])
+                .to_lowercase();
+
+    if (in_cwd || in_home || is_root)
+        && (base.starts_with('*') || base.starts_with('?') || base.starts_with('['))
+    {
+        return true;
+    }
+
+    false
 }
 
 fn normalize_target(s: &str) -> String {
@@ -1429,6 +1662,8 @@ mod tests {
             "rm -rf /home/user/docs/project",
             "rm -rf /tmp/*.log",
             "rm -rf ~/docs/project",
+            "rm -rf foo*",
+            "rm -rf .cache*",
             "xargs echo",
             "env -S 'echo hello'",
             "env VAR=1 echo hello",
@@ -1447,6 +1682,18 @@ mod tests {
             ("rm -rf ~/*", "Blocked rm -rf on a dangerous target"),
             ("rm -rf /.*", "Blocked rm -rf on a dangerous target"),
             ("rm -rf .*", "Blocked rm -rf on a dangerous target"),
+            ("rm -rf .?*", "Blocked rm -rf on a dangerous target"),
+            ("rm -rf .??*", "Blocked rm -rf on a dangerous target"),
+            ("rm -rf /tmp/.??*", "Blocked rm -rf on a dangerous target"),
+            ("rm -rf ~/.??*", "Blocked rm -rf on a dangerous target"),
+            ("rm -rf *", "Blocked rm -rf on a dangerous target"),
+            ("rm -rf *.log", "Blocked rm -rf on a dangerous target"),
+            ("rm -rf *foo", "Blocked rm -rf on a dangerous target"),
+            ("bash -c 'rm -rf *'", "Blocked rm -rf on a dangerous target"),
+            (
+                "sh -c \"rm -rf .??*\"",
+                "Blocked rm -rf on a dangerous target",
+            ),
             ("rm -rf .", "Blocked rm -rf on a dangerous target"),
             ("rm -rf ..", "Blocked rm -rf on a dangerous target"),
             ("rm -rf ../../", "Blocked rm -rf on a dangerous target"),
@@ -1741,5 +1988,73 @@ mod tests {
             parse_command(r#"{"toolInput":{"command":"ok"}}"#),
             Ok("ok".into())
         );
+    }
+
+    #[test]
+    fn sudo_requires_command() {
+        for cmd in &["sudo -s", "sudo -i", "sudo --login", "doas -s", "doas -i"] {
+            deny(cmd, "requires an explicit command");
+        }
+        for cmd in &[
+            "sudo --help",
+            "sudo -h",
+            "sudo --version",
+            "sudo -V",
+            "sudo -u root git status",
+        ] {
+            allow(cmd);
+        }
+    }
+
+    #[test]
+    fn sudo_chroot_and_edit_blocked() {
+        for cmd in &[
+            "sudo -R / rm -rf /",
+            "sudo -R/ rm -rf /",
+            "sudo --chroot=/ rm -rf /",
+            "sudo --chroot / rm -rf /",
+            "sudo -h localhost rm -rf /",
+        ] {
+            deny(cmd, "Blocked rm -rf on a dangerous target");
+        }
+        for cmd in &[
+            "sudo -e /etc/passwd",
+            "sudo --edit /etc/passwd",
+            "sudo --edit=/etc/passwd",
+            "doas -e /etc/passwd",
+        ] {
+            deny(cmd, "-e/--edit is not allowed");
+        }
+        allow("sudo -h");
+        allow("sudo -h localhost id");
+    }
+
+    #[test]
+    fn rm_no_preserve_root_blocked() {
+        for cmd in &[
+            "rm -r --no-preserve-root /",
+            "rm --no-preserve-root -r /",
+            "rm --no-preserve-root -rf /",
+            "rm -rf --no-preserve-root /",
+        ] {
+            deny(cmd, "Blocked rm -rf on a dangerous target");
+        }
+        // --preserve-root is the default; rm -rf / is still blocked by the guard.
+        deny(
+            "rm -rf --preserve-root /",
+            "Blocked rm -rf on a dangerous target",
+        );
+    }
+
+    #[test]
+    fn systemctl_option_values_and_destructive_verbs() {
+        deny("systemctl -H host reboot", "Blocked systemctl reboot");
+        deny("systemctl -Hhost reboot", "Blocked systemctl reboot");
+        deny("systemctl --host=host reboot", "Blocked systemctl reboot");
+        deny("systemctl --host host reboot", "Blocked systemctl reboot");
+        deny("systemctl -M machine reboot", "Blocked systemctl reboot");
+        deny("systemctl -Mmachine reboot", "Blocked systemctl reboot");
+        allow("systemctl -H host status ssh");
+        allow("systemctl --host=host status ssh");
     }
 }

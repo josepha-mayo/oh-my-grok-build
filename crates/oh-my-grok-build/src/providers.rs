@@ -19,6 +19,42 @@ const DEFAULT_VLLM_URL: &str = "http://localhost:8000/v1";
 const DEFAULT_LLAMA_CPP_URL: &str = "http://localhost:8080/v1";
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
+const LOCAL_PROVIDER_IDS: &[&str] = &[
+    "ollama",
+    "lmstudio",
+    "vllm",
+    "llama-cpp",
+    "tabby",
+    "jan",
+    "localai",
+    "llamafile",
+    "text-generation-webui",
+    "koboldcpp",
+    "mistral-rs",
+    "sglang",
+    "tensorrt-llm",
+    "mlc-llm",
+    "xinference",
+    "faraday",
+    "aichat",
+    "ava",
+    "exllamav2",
+    "ctranslate2",
+    "ctransformers",
+    "candle",
+    "triton",
+    "text-generation-inference",
+    "lorax",
+];
+
+pub(crate) fn is_local_provider_id(id: &str) -> bool {
+    LOCAL_PROVIDER_IDS
+        .iter()
+        .any(|prefix| *prefix == id || id.starts_with(&format!("{prefix}-")))
+        || id == "local"
+        || id.starts_with("local-")
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelListEntry {
     pub id: String,
@@ -96,14 +132,8 @@ pub fn load_omg_config() -> Result<OmgConfig> {
 }
 
 pub fn save_omg_config(config: &OmgConfig) -> Result<()> {
-    let dir = omg_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!("config.json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(config)?)?;
     let path = omg_config_path()?;
-    std::fs::rename(&tmp, &path)?;
-    restrict_env_file_permissions(&path)?;
-    Ok(())
+    write_file_atomic(&path, serde_json::to_string_pretty(config)?, true)
 }
 
 pub(crate) fn load_env_file() -> Result<HashMap<String, String>> {
@@ -248,14 +278,28 @@ fn format_env_value(value: &str) -> String {
     out
 }
 
-pub(crate) fn write_file_atomic(path: &std::path::Path, content: impl AsRef<[u8]>) -> Result<()> {
+pub(crate) fn write_file_atomic(
+    path: &std::path::Path,
+    content: impl AsRef<[u8]>,
+    restrict: bool,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, content.as_ref())?;
-    std::fs::rename(&tmp, path)?;
+    let write = || -> Result<()> {
+        std::fs::write(&tmp, content.as_ref())?;
+        if restrict {
+            restrict_omg_file_permissions(&tmp)?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -265,11 +309,10 @@ fn write_env_entries(entries: &[(String, String)]) -> Result<()> {
     for (k, v) in entries {
         content.push_str(&format!("{}={}\n", k, format_env_value(v)));
     }
-    write_file_atomic(&path, content)?;
-    restrict_env_file_permissions(&path)
+    write_file_atomic(&path, content, true)
 }
 
-pub(crate) fn restrict_env_file_permissions(path: &std::path::Path) -> Result<()> {
+pub(crate) fn restrict_omg_file_permissions(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -277,26 +320,62 @@ pub(crate) fn restrict_env_file_permissions(path: &std::path::Path) -> Result<()
     }
     #[cfg(windows)]
     {
-        let user = std::env::var("USERNAME").map_err(|_| {
-            anyhow::anyhow!("USERNAME env var not set; cannot restrict file permissions")
-        })?;
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/inheritance:r")
-            .status()?;
-        if !status.success() {
-            bail!("icacls /inheritance:r failed for {}", path.display());
-        }
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/grant:r")
-            .arg(format!("{user}:F"))
-            .status()?;
-        if !status.success() {
-            bail!("icacls /grant:r failed for {}", path.display());
-        }
+        windows_restrict_file_permissions(path)?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_restrict_file_permissions(path: &std::path::Path) -> Result<()> {
+    let user = windows_username()?;
+    if user.contains('"') || user.chars().any(|c| c.is_control()) {
+        bail!("Windows user name contains unsafe characters");
+    }
+    let grant = if user.contains(' ') {
+        format!("\"{user}\":F")
+    } else {
+        format!("{user}:F")
+    };
+
+    let run = |label: &str, extra: &[&str]| -> Result<()> {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .args(extra)
+            .arg("/Q")
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to run icacls {label}: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("icacls {label} failed for {}: {stderr}", path.display());
+        }
+        Ok(())
+    };
+
+    // Remove inherited and broad-group ACEs, then grant the current user full control.
+    run("inheritance", &["/inheritance:r"])?;
+    run(
+        "remove",
+        &["/remove", "*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545", "/C"],
+    )?;
+    run("grant", &["/grant:r", grant.as_str()])?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_username() -> Result<String> {
+    let out = std::process::Command::new("whoami")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(s.to_string());
+        }
+    }
+    std::env::var("USERNAME")
+        .map_err(|_| anyhow::anyhow!("could not determine Windows user (whoami/USERNAME missing)"))
 }
 
 pub(crate) fn env_var_name(provider_id: &str) -> String {
@@ -516,6 +595,9 @@ pub fn ensure_provider_configured(id: &str) -> Result<ProviderConfig> {
     let id = sanitize_provider_id(id);
     let mut cfg = load_omg_config()?;
     if let Some(p) = cfg.providers.get(&id).cloned() {
+        if p.model.trim().is_empty() {
+            bail!("provider '{id}' has no configured model; pass --model or discover local models");
+        }
         return Ok(p);
     }
     let provider = provider_template(&id).ok_or_else(|| {
@@ -547,141 +629,7 @@ pub fn remove_provider(id: &str) -> Result<()> {
 }
 
 pub(crate) fn provider_template(id: &str) -> Option<ProviderConfig> {
-    match id {
-        "openai" => Some(ProviderConfig {
-            id: "openai".into(),
-            name: "OpenAI".into(),
-            model: "gpt-4o".into(),
-            base_url: "https://api.openai.com/v1".into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: provider_env_keys(id, Some("OPENAI_API_KEY")),
-            extra_headers: None,
-            context_window: Some(128_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        "anthropic" => Some(ProviderConfig {
-            id: "anthropic".into(),
-            name: "Anthropic".into(),
-            model: "claude-3-5-sonnet-20241022".into(),
-            base_url: "https://api.anthropic.com/v1".into(),
-            api_backend: Some("messages".into()),
-            env_key: provider_env_keys(id, Some("ANTHROPIC_API_KEY")),
-            extra_headers: Some(HashMap::from([(
-                "anthropic-version".into(),
-                "2023-06-01".into(),
-            )])),
-            context_window: Some(200_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        "xai" => Some(ProviderConfig {
-            id: "xai".into(),
-            name: "xAI".into(),
-            model: "grok-4.5".into(),
-            base_url: "https://api.x.ai/v1".into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: provider_env_keys(id, Some("XAI_API_KEY")),
-            extra_headers: None,
-            context_window: Some(500_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        "openrouter" => Some(ProviderConfig {
-            id: "openrouter".into(),
-            name: "OpenRouter".into(),
-            model: "anthropic/claude-3.5-sonnet".into(),
-            base_url: "https://openrouter.ai/api/v1".into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: provider_env_keys(id, Some("OPENROUTER_API_KEY")),
-            extra_headers: Some(HashMap::from([
-                ("HTTP-Referer".into(), "https://oh-my-grok.build".into()),
-                ("X-Title".into(), "oh-my-grok-build".into()),
-            ])),
-            context_window: Some(200_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        "ollama" => Some(ProviderConfig {
-            id: "ollama".into(),
-            name: "Ollama (local)".into(),
-            model: "codellama".into(),
-            base_url: DEFAULT_OLLAMA_URL.into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: provider_env_keys(id, None),
-            extra_headers: None,
-            context_window: Some(128_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        "lmstudio" => Some(ProviderConfig {
-            id: "lmstudio".into(),
-            name: "LM Studio (local)".into(),
-            model: "local-model".into(),
-            base_url: DEFAULT_LMSTUDIO_URL.into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: provider_env_keys(id, Some("LMSTUDIO_API_KEY")),
-            extra_headers: None,
-            context_window: Some(128_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        "vllm" => Some(ProviderConfig {
-            id: "vllm".into(),
-            name: "vLLM".into(),
-            model: String::new(),
-            base_url: "http://localhost:8000/v1".into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: provider_env_keys(id, Some("OMGB_VLLM_API_KEY")),
-            extra_headers: None,
-            context_window: Some(128_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        "llama-cpp" => Some(ProviderConfig {
-            id: "llama-cpp".into(),
-            name: "llama.cpp server".into(),
-            model: String::new(),
-            base_url: "http://localhost:8080/v1".into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: provider_env_keys(id, Some("OMGB_LLAMA_CPP_API_KEY")),
-            extra_headers: None,
-            context_window: Some(128_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        "tabby" => Some(ProviderConfig {
-            id: "tabby".into(),
-            name: "TabbyAPI".into(),
-            model: String::new(),
-            base_url: "http://localhost:5000/v1".into(),
-            api_backend: Some("chat_completions".into()),
-            env_key: provider_env_keys(id, Some("OMGB_TABBY_API_KEY")),
-            extra_headers: None,
-            context_window: Some(128_000),
-            auto_compact_threshold_percent: Some(80),
-            temperature: None,
-            top_p: None,
-            max_completion_tokens: None,
-        }),
-        _ => catalog::provider_template(id),
-    }
+    catalog::provider_template(id)
 }
 
 pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
@@ -779,13 +727,11 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
             .as_deref()
             .unwrap_or("chat_completions");
         let extra = provider.extra_headers.clone().unwrap_or_default();
-        let allow_local = provider.id.starts_with("ollama")
-            || provider.id.starts_with("lmstudio")
-            || provider.id.starts_with("local-")
-            || is_url_host_loopback(&provider.base_url);
+        let allow_local =
+            is_local_provider_id(&provider.id) || is_url_host_loopback(&provider.base_url);
         let allow_private = is_url_host_private(&provider.base_url).await;
         // Reject insecure public HTTP before the provider is saved.
-        let _ = validate_url(&provider.base_url, allow_local, allow_private).await?;
+        validate_url(&provider.base_url, allow_local, allow_private).await?;
         let is_ollama = provider.id == "ollama" || is_ollama_url(&provider.base_url);
         let cw = fetch_model_context_window(
             &provider.base_url,
@@ -979,6 +925,7 @@ async fn discover_one(base_url: &str, name: &str) -> Option<(String, String, Vec
         &HashMap::new(),
         true,
         true,
+        Duration::from_secs(10),
     )
     .await?;
     if models.is_empty() {
@@ -1075,13 +1022,14 @@ fn extract_context_window(value: &serde_json::Value) -> Option<u64> {
         })
 }
 
-async fn fetch_model_list(
+pub(crate) async fn fetch_model_list(
     base_url: &str,
     api_key: Option<&str>,
     backend: &str,
     extra_headers: &HashMap<String, String>,
     allow_local: bool,
     allow_private: bool,
+    timeout: Duration,
 ) -> Option<Vec<ModelListEntry>> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let url = validate_url(&url, allow_local, allow_private).await.ok()?;
@@ -1095,9 +1043,7 @@ async fn fetch_model_list(
         }
     }
 
-    let text = http_get_text(&url, Some(&headers), Duration::from_secs(10))
-        .await
-        .ok()?;
+    let text = http_get_text(&url, Some(&headers), timeout).await.ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     Some(
         json.get("data")?
@@ -1156,6 +1102,7 @@ async fn fetch_model_context_window(
         extra_headers,
         allow_local,
         allow_private,
+        Duration::from_secs(10),
     )
     .await?;
     let entry = models.iter().find(|m| m.id == model);
@@ -1179,6 +1126,32 @@ async fn fetch_model_context_window(
         return extract_context_window(&json);
     }
     None
+}
+
+pub(crate) async fn is_provider_reachable(provider: &ProviderConfig) -> bool {
+    if provider.model.trim().is_empty() {
+        return false;
+    }
+    let api_key = resolve_api_key(provider).ok().flatten();
+    let backend = provider
+        .api_backend
+        .as_deref()
+        .unwrap_or("chat_completions");
+    let extra = provider.extra_headers.clone().unwrap_or_default();
+    let allow_local =
+        is_local_provider_id(&provider.id) || crate::net::is_url_host_loopback(&provider.base_url);
+    let allow_private = crate::net::is_url_host_private(&provider.base_url).await;
+    fetch_model_list(
+        &provider.base_url,
+        api_key.as_deref(),
+        backend,
+        &extra,
+        allow_local,
+        allow_private,
+        Duration::from_secs(2),
+    )
+    .await
+    .is_some_and(|v| !v.is_empty())
 }
 
 fn fallback_context_window(model: &str) -> Option<u64> {
@@ -1223,10 +1196,8 @@ pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
         }
     }
 
-    let allow_local = provider.id.starts_with("ollama")
-        || provider.id.starts_with("lmstudio")
-        || provider.id.starts_with("local-")
-        || is_url_host_loopback(&provider.base_url);
+    let allow_local =
+        is_local_provider_id(&provider.id) || is_url_host_loopback(&provider.base_url);
     let allow_private = is_url_host_private(&provider.base_url).await;
 
     if let Some(models) = fetch_model_list(
@@ -1236,6 +1207,7 @@ pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
         &headers,
         allow_local,
         allow_private,
+        Duration::from_secs(10),
     )
     .await
         && !models.is_empty()
@@ -1381,7 +1353,31 @@ mod tests {
             std::env::temp_dir().join(format!("omgb-providers-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         unsafe { std::env::set_var("OMGB_HOME", tmp.as_os_str()) };
-        let err = ensure_provider_configured("vllm").unwrap_err();
+
+        let provider = ProviderConfig {
+            id: "emptymodel".into(),
+            name: "Empty".into(),
+            model: String::new(),
+            base_url: "https://example.com/v1".into(),
+            api_backend: None,
+            env_key: None,
+            extra_headers: None,
+            context_window: None,
+            auto_compact_threshold_percent: None,
+            temperature: None,
+            top_p: None,
+            max_completion_tokens: None,
+        };
+        let cfg = OmgConfig {
+            default_model: None,
+            providers: [("emptymodel".into(), provider)]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            relay: None,
+        };
+        save_omg_config(&cfg).unwrap();
+
+        let err = ensure_provider_configured("emptymodel").unwrap_err();
         assert!(err.to_string().contains("no configured model"));
         unsafe { std::env::remove_var("OMGB_HOME") };
         let _ = std::fs::remove_dir_all(&tmp);

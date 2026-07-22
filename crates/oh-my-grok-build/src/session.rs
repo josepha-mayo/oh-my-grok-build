@@ -30,7 +30,24 @@ fn sessions_root() -> Result<PathBuf> {
     Ok(xai_grok_config::grok_home().join("sessions").join(encoded))
 }
 
+fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn validate_session_id(id: &str) -> Result<()> {
+    if !is_safe_session_id(id) {
+        bail!("invalid session id '{id}'");
+    }
+    Ok(())
+}
+
 fn session_dir(id: &str) -> Result<PathBuf> {
+    validate_session_id(id)?;
     Ok(sessions_root()?.join(id))
 }
 
@@ -127,6 +144,12 @@ async fn run_session_new(args: SessionNewArgs) -> Result<()> {
 }
 
 async fn run_session_resume(args: SessionResumeArgs) -> Result<()> {
+    if let Some(ref sid) = args.source_session_id {
+        validate_session_id(sid)?;
+    }
+    if let Some(ref sid) = args.target_session_id {
+        validate_session_id(sid)?;
+    }
     let resume = if args.continue_last {
         Some(String::new())
     } else {
@@ -156,6 +179,10 @@ async fn run_session_resume(args: SessionResumeArgs) -> Result<()> {
 }
 
 async fn run_session_fork(args: SessionForkArgs) -> Result<()> {
+    validate_session_id(&args.parent_session_id)?;
+    if let Some(ref sid) = args.new_session_id {
+        validate_session_id(sid)?;
+    }
     let session = SessionParams {
         resume: Some(args.parent_session_id),
         session_id: args.new_session_id,

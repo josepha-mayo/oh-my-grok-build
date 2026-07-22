@@ -6,6 +6,7 @@ use std::process::Stdio;
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 fn subagents_path() -> Result<PathBuf> {
@@ -49,9 +50,12 @@ fn append_record(record: &SubagentRecord) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(&path)?;
+    file.lock_exclusive()?;
     writeln!(file, "{line}")?;
-    crate::providers::restrict_env_file_permissions(&path)?;
+    drop(file);
+    crate::providers::restrict_omg_file_permissions(&path)?;
     Ok(())
 }
 

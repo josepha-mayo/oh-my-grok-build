@@ -15,7 +15,14 @@ pub async fn run_swarm_task_splitting(
 
     let subtasks = match fetch_subtasks(prompt, model.clone(), yolo, count).await {
         Ok(v) if !v.is_empty() => v,
-        Ok(_) | Err(_) => return run_swarm_ensemble(prompt, model, yolo, count).await,
+        Ok(_) => {
+            eprintln!("warning: task splitting returned no subtasks; falling back to ensemble");
+            return run_swarm_ensemble(prompt, model, yolo, count).await;
+        }
+        Err(e) => {
+            eprintln!("warning: task splitting failed ({e}); falling back to ensemble");
+            return run_swarm_ensemble(prompt, model, yolo, count).await;
+        }
     };
 
     let results = run_subtasks(&subtasks, model.clone(), yolo).await?;

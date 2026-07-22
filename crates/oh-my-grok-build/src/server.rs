@@ -473,8 +473,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
             std::fs::create_dir_all(&dir)?;
             let path = dir.join("serve.secret");
             let s = generate_secret();
-            std::fs::write(&path, &s)?;
-            crate::providers::restrict_env_file_permissions(&path)?;
+            crate::providers::write_file_atomic(&path, &s, true)?;
             (s, Some(path), false)
         }
     };

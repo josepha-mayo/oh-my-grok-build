@@ -62,9 +62,7 @@ fn save_notes(notes: &[MemoryNote]) -> Result<()> {
         content.push_str(&serde_json::to_string(note)?);
         content.push('\n');
     }
-    crate::providers::write_file_atomic(&path, content)?;
-    crate::providers::restrict_env_file_permissions(&path)?;
-    Ok(())
+    crate::providers::write_file_atomic(&path, content, true)
 }
 
 fn now() -> i64 {

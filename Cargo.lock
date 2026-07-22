@@ -6936,6 +6936,7 @@ dependencies = [
  "constant_time_eq",
  "croner",
  "dirs 5.0.1",
+ "dunce",
  "fs2",
  "futures",
  "gethostname",

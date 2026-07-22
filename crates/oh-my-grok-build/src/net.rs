@@ -90,6 +90,17 @@ fn is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4 == Ipv4Addr::new(169, 254, 169, 254)
+                || v4 == Ipv4Addr::new(168, 63, 129, 16)
+                || v4 == Ipv4Addr::new(100, 100, 100, 200)
+        }
+        IpAddr::V6(v6) => v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+    }
+}
+
 /// True when every resolved address is loopback or (when allowed) private.
 /// Used to reject plaintext http/ws to public destinations.
 fn all_addrs_loopback_or_private(addrs: &[SocketAddr], allow_private: bool) -> bool {
@@ -196,6 +207,9 @@ async fn resolve_host(
     }
     if !saw_addr {
         anyhow::bail!("host resolved to no addresses");
+    }
+    if addrs.iter().any(|a| is_cloud_metadata_ip(a.ip())) {
+        anyhow::bail!("host resolved to a cloud metadata IP");
     }
     Ok(addrs)
 }
@@ -461,6 +475,15 @@ mod tests {
     }
 
     #[test]
+    fn test_is_cloud_metadata_ip() {
+        assert!(is_cloud_metadata_ip("100.100.100.200".parse().unwrap()));
+        assert!(is_cloud_metadata_ip("168.63.129.16".parse().unwrap()));
+        assert!(is_cloud_metadata_ip("fd00:ec2::254".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip("192.168.1.1".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
     fn test_all_addrs_loopback_or_private() {
         let local = SocketAddr::new("127.0.0.1".parse().unwrap(), 80);
         let private = SocketAddr::new("192.168.1.1".parse().unwrap(), 80);
@@ -491,6 +514,22 @@ mod tests {
         assert_eq!(
             lookup_port(&Url::parse("http://example.com:8080").unwrap()),
             8080
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_blocks_cloud_metadata_ip() {
+        assert!(
+            resolve_host("100.100.100.200", 80, false, true)
+                .await
+                .is_err(),
+            "cloud metadata IP must be blocked even when private addresses are allowed"
+        );
+        assert!(
+            resolve_host("fd00:ec2::254", 80, false, true)
+                .await
+                .is_err(),
+            "cloud metadata IPv6 must be blocked even when private addresses are allowed"
         );
     }
 

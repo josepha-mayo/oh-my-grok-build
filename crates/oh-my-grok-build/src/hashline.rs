@@ -133,7 +133,7 @@ pub fn apply_patch(file: &Path, patch_text: &str) -> Result<()> {
     let norm_content = normalize_line_endings(&content);
     let new_content = apply_blocks(&norm_content, &blocks)?;
     let new_content = maybe_restore_crlf(&new_content, was_crlf);
-    crate::providers::write_file_atomic(file, new_content)
+    crate::providers::write_file_atomic(file, new_content, false)
         .with_context(|| format!("write {}", file.display()))?;
     Ok(())
 }

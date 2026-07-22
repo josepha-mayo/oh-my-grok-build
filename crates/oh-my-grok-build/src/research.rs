@@ -325,8 +325,7 @@ pub async fn run_research(
     if let Some(parent) = report_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&report_path, &report)?;
-    crate::providers::restrict_env_file_permissions(&report_path)?;
+    crate::providers::write_file_atomic(&report_path, &report, true)?;
     println!("wrote research report to {}", report_path.display());
 
     if let Some(model) = model {
@@ -339,8 +338,7 @@ pub async fn run_research(
         match exec_prompt(&model, &prompt, yolo).await {
             Ok(patch) => {
                 let patch_path = report_path.with_extension("patch");
-                std::fs::write(&patch_path, &patch)?;
-                crate::providers::restrict_env_file_permissions(&patch_path)?;
+                crate::providers::write_file_atomic(&patch_path, &patch, true)?;
                 println!("wrote patch to {}", patch_path.display());
             }
             Err(e) => {

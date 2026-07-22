@@ -9,10 +9,9 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 
-use crate::net::is_url_host_loopback;
 use crate::providers::{
     ProviderConfig, add_discovered_providers, discover_local_models, env_var_name,
-    is_valid_env_key, load_env_file, load_omg_config,
+    is_local_provider_id, is_provider_reachable, is_valid_env_key, load_env_file, load_omg_config,
 };
 
 /// Approximate cost index per 1M tokens (input+output average) for known
@@ -77,34 +76,6 @@ const COSTS: &[(&str, f64)] = &[
     ("lorax", 0.0),
 ];
 
-const LOCAL_IDS: &[&str] = &[
-    "ollama",
-    "lmstudio",
-    "vllm",
-    "llama-cpp",
-    "tabby",
-    "jan",
-    "localai",
-    "llamafile",
-    "text-generation-webui",
-    "koboldcpp",
-    "mistral-rs",
-    "sglang",
-    "tensorrt-llm",
-    "mlc-llm",
-    "xinference",
-    "faraday",
-    "aichat",
-    "ava",
-    "exllamav2",
-    "ctranslate2",
-    "ctransformers",
-    "candle",
-    "triton",
-    "text-generation-inference",
-    "lorax",
-];
-
 const FAST_IDS: &[&str] = &[
     "groq",
     "fireworks",
@@ -139,18 +110,10 @@ pub fn provider_cost(id: &str) -> f64 {
     if let Some((_, cost)) = COSTS.iter().find(|(k, _)| *k == id) {
         return *cost;
     }
-    if is_local_provider(id) {
+    if is_local_provider_id(id) {
         return 0.0;
     }
     5.0
-}
-
-fn is_local_provider(id: &str) -> bool {
-    LOCAL_IDS
-        .iter()
-        .any(|prefix| *prefix == id || id.starts_with(&format!("{prefix}-")))
-        || id == "local"
-        || id.starts_with("local-")
 }
 
 fn is_fast_provider(id: &str) -> bool {
@@ -186,25 +149,25 @@ fn task_contains_word(task: &str, word: &str) -> bool {
 }
 
 /// Returns the configured providers that are available: they have a non-empty
-/// `*_API_KEY` in `~/.omgb/.env` or the process environment (or their base URL
-/// points at a loopback/local endpoint for keyless local servers), and a usable
-/// model name. Also detects catalog templates whose canonical env key is present
-/// even when they have not been explicitly configured.
-pub fn available_providers() -> Result<Vec<String>> {
+/// `*_API_KEY` in `~/.omgb/.env` or the process environment, or (for loopback
+/// local servers) respond to a `/models` probe. Also detects catalog templates
+/// whose canonical env key is present even when they have not been explicitly
+/// configured.
+pub async fn available_providers() -> Result<Vec<String>> {
     let cfg = load_omg_config()?;
     let dotenv = load_env_file().unwrap_or_default();
 
     let mut ids = std::collections::HashSet::new();
 
     for provider in cfg.providers.values() {
-        if provider_is_available(provider, &dotenv, true) {
+        if provider_is_available(provider, &dotenv, true).await {
             ids.insert(provider.id.clone());
         }
     }
 
     for template in crate::providers::catalog::TEMPLATES {
         if let Some(provider) = crate::providers::provider_template(template.id)
-            && provider_is_available(&provider, &dotenv, false)
+            && provider_is_available(&provider, &dotenv, false).await
         {
             ids.insert(provider.id);
         }
@@ -216,7 +179,7 @@ pub fn available_providers() -> Result<Vec<String>> {
     Ok(ids)
 }
 
-fn provider_is_available(
+async fn provider_is_available(
     provider: &ProviderConfig,
     dotenv: &HashMap<String, String>,
     allow_loopback: bool,
@@ -224,8 +187,8 @@ fn provider_is_available(
     if provider.model.trim().is_empty() {
         return false;
     }
-    if allow_loopback && is_url_host_loopback(&provider.base_url) {
-        return true;
+    if allow_loopback && crate::net::is_url_host_loopback(&provider.base_url) {
+        return is_provider_reachable(provider).await;
     }
     let storage = env_var_name(&provider.id);
     let mut keys: Vec<&str> = provider
@@ -245,17 +208,10 @@ fn provider_is_available(
     })
 }
 
-/// Selects the cheapest available provider for `task`.
+/// Selects the cheapest available provider for `task` from an explicit list.
 ///
 /// Keyword hints (`code`, `local`, `fast`, `cheap`) are used only as tie-breakers
 /// after cost and key availability.
-pub fn select_provider(task: &str) -> Result<String> {
-    let available = available_providers()?;
-    select_provider_from(&available, task)
-}
-
-/// Same as [`select_provider`] but accepts an explicit available-provider list,
-/// making unit tests independent of the host environment.
 pub fn select_provider_from(available: &[String], task: &str) -> Result<String> {
     if available.is_empty() {
         bail!("no providers available (set *_API_KEY or use a loopback local server)");
@@ -267,7 +223,7 @@ pub fn select_provider_from(available: &[String], task: &str) -> Result<String> 
         .map(|id| {
             let cost = provider_cost(id);
             let mut tie = 0;
-            if task_contains_word(&task_lower, "local") && is_local_provider(id) {
+            if task_contains_word(&task_lower, "local") && is_local_provider_id(id) {
                 tie += 3;
             }
             if task_contains_word(&task_lower, "fast") && is_fast_provider(id) {
@@ -300,11 +256,11 @@ pub fn select_provider_from(available: &[String], task: &str) -> Result<String> 
 /// over keyed cloud providers when the task hints at local/cheap usage.
 pub async fn select_provider_or_fallback(prompt: &str) -> Result<String> {
     let task_lower = prompt.to_ascii_lowercase();
-    let discover_first = task_contains_word(&task_lower, "local")
-        || task_contains_word(&task_lower, "cheap")
-        || select_provider(prompt).is_err();
+    let local_hint =
+        task_contains_word(&task_lower, "local") || task_contains_word(&task_lower, "cheap");
 
-    if discover_first {
+    let mut available = available_providers().await?;
+    if local_hint || available.is_empty() {
         let args = crate::args::DiscoverArgs {
             ollama_url: None,
             lmstudio_url: None,
@@ -313,10 +269,15 @@ pub async fn select_provider_or_fallback(prompt: &str) -> Result<String> {
         let discovered = discover_local_models(&args).await?;
         if !discovered.is_empty() {
             add_discovered_providers(&discovered)?;
+            available = available_providers().await?;
         }
     }
 
-    select_provider(prompt)
+    if available.is_empty() {
+        bail!("no providers available (set *_API_KEY or use a loopback local server)");
+    }
+
+    select_provider_from(&available, prompt)
 }
 
 #[cfg(test)]
@@ -324,7 +285,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn with_temp_home(f: impl FnOnce(&std::path::Path)) {
+    #[allow(clippy::await_holding_lock)]
+    async fn with_temp_home<F>(f: F)
+    where
+        F: for<'a> FnOnce(
+            &'a std::path::Path,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+    {
         let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("omgb-moe-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -337,7 +304,7 @@ mod tests {
             unsafe { std::env::remove_var(k) };
         }
 
-        f(&tmp);
+        f(&tmp).await;
 
         for (k, v) in saved {
             unsafe { std::env::set_var(k, v) };
@@ -413,86 +380,121 @@ mod tests {
         assert!(select_provider_from(&[], "task").is_err());
     }
 
-    #[test]
-    fn test_available_providers_reads_env_and_config() {
+    #[tokio::test]
+    async fn test_available_providers_reads_env_and_config() {
         with_temp_home(|home| {
-            let provider = crate::providers::ProviderConfig {
-                id: "testprovider".into(),
-                name: "Test".into(),
-                model: "m".into(),
-                base_url: "http://localhost/v1".into(),
-                api_backend: None,
-                env_key: Some(vec!["OMGB_TESTPROVIDER_API_KEY".into()]),
-                extra_headers: None,
-                context_window: None,
-                auto_compact_threshold_percent: None,
-                temperature: None,
-                top_p: None,
-                max_completion_tokens: None,
-            };
-            let cfg = crate::providers::OmgConfig {
-                default_model: None,
-                providers: [("testprovider".into(), provider)]
-                    .into_iter()
-                    .collect::<HashMap<_, _>>(),
-                relay: None,
-            };
-            crate::providers::save_omg_config(&cfg).unwrap();
-            std::fs::write(home.join(".env"), "OMGB_TESTPROVIDER_API_KEY=secret\n").unwrap();
+            Box::pin(async move {
+                let provider = crate::providers::ProviderConfig {
+                    id: "testprovider".into(),
+                    name: "Test".into(),
+                    model: "m".into(),
+                    base_url: "https://example.com/v1".into(),
+                    api_backend: None,
+                    env_key: Some(vec!["OMGB_TESTPROVIDER_API_KEY".into()]),
+                    extra_headers: None,
+                    context_window: None,
+                    auto_compact_threshold_percent: None,
+                    temperature: None,
+                    top_p: None,
+                    max_completion_tokens: None,
+                };
+                let cfg = crate::providers::OmgConfig {
+                    default_model: None,
+                    providers: [("testprovider".into(), provider)]
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    relay: None,
+                };
+                crate::providers::save_omg_config(&cfg).unwrap();
+                std::fs::write(home.join(".env"), "OMGB_TESTPROVIDER_API_KEY=secret\n").unwrap();
 
-            assert_eq!(available_providers().unwrap(), vec!["testprovider"]);
-        });
+                assert_eq!(available_providers().await.unwrap(), vec!["testprovider"]);
+            })
+        })
+        .await;
     }
 
-    #[test]
-    fn test_available_providers_uses_default_env_key() {
+    #[tokio::test]
+    async fn test_available_providers_uses_default_env_key() {
         with_temp_home(|home| {
-            let provider = crate::providers::ProviderConfig {
-                id: "myprov".into(),
-                name: "My".into(),
-                model: "m".into(),
-                base_url: "http://localhost/v1".into(),
-                api_backend: None,
-                env_key: None,
-                extra_headers: None,
-                context_window: None,
-                auto_compact_threshold_percent: None,
-                temperature: None,
-                top_p: None,
-                max_completion_tokens: None,
-            };
-            let cfg = crate::providers::OmgConfig {
-                default_model: None,
-                providers: [("myprov".into(), provider)]
-                    .into_iter()
-                    .collect::<HashMap<_, _>>(),
-                relay: None,
-            };
-            crate::providers::save_omg_config(&cfg).unwrap();
-            std::fs::write(home.join(".env"), "OMGB_MYPROV_API_KEY=secret\n").unwrap();
+            Box::pin(async move {
+                let provider = crate::providers::ProviderConfig {
+                    id: "myprov".into(),
+                    name: "My".into(),
+                    model: "m".into(),
+                    base_url: "https://example.com/v1".into(),
+                    api_backend: None,
+                    env_key: None,
+                    extra_headers: None,
+                    context_window: None,
+                    auto_compact_threshold_percent: None,
+                    temperature: None,
+                    top_p: None,
+                    max_completion_tokens: None,
+                };
+                let cfg = crate::providers::OmgConfig {
+                    default_model: None,
+                    providers: [("myprov".into(), provider)]
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    relay: None,
+                };
+                crate::providers::save_omg_config(&cfg).unwrap();
+                std::fs::write(home.join(".env"), "OMGB_MYPROV_API_KEY=secret\n").unwrap();
 
-            assert_eq!(available_providers().unwrap(), vec!["myprov"]);
-        });
+                assert_eq!(available_providers().await.unwrap(), vec!["myprov"]);
+            })
+        })
+        .await;
     }
 
-    #[test]
-    fn test_available_providers_detects_catalog_keys() {
+    #[tokio::test]
+    async fn test_available_providers_detects_catalog_keys() {
         with_temp_home(|home| {
-            std::fs::write(home.join(".env"), "OPENAI_API_KEY=sk-secret\n").unwrap();
-            let providers = available_providers().unwrap();
-            assert!(providers.contains(&"openai".to_string()));
-        });
+            Box::pin(async move {
+                std::fs::write(home.join(".env"), "OPENAI_API_KEY=sk-secret\n").unwrap();
+                let providers = available_providers().await.unwrap();
+                assert!(providers.contains(&"openai".to_string()));
+            })
+        })
+        .await;
     }
 
-    #[test]
-    fn test_available_providers_skips_empty_model_templates() {
+    #[tokio::test]
+    async fn test_available_providers_skips_empty_model() {
         with_temp_home(|home| {
-            std::fs::write(home.join(".env"), "OMGB_VLLM_API_KEY=secret\n").unwrap();
-            let providers = available_providers().unwrap();
-            assert!(
-                !providers.contains(&"vllm".to_string()),
-                "vllm template has no model and should not be auto-routed"
-            );
-        });
+            Box::pin(async move {
+                let provider = crate::providers::ProviderConfig {
+                    id: "emptymodel".into(),
+                    name: "Empty".into(),
+                    model: String::new(),
+                    base_url: "https://example.com/v1".into(),
+                    api_backend: None,
+                    env_key: Some(vec!["OMGB_EMPTYMODEL_API_KEY".into()]),
+                    extra_headers: None,
+                    context_window: None,
+                    auto_compact_threshold_percent: None,
+                    temperature: None,
+                    top_p: None,
+                    max_completion_tokens: None,
+                };
+                let cfg = crate::providers::OmgConfig {
+                    default_model: None,
+                    providers: [("emptymodel".into(), provider)]
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    relay: None,
+                };
+                crate::providers::save_omg_config(&cfg).unwrap();
+                std::fs::write(home.join(".env"), "OMGB_EMPTYMODEL_API_KEY=secret\n").unwrap();
+
+                let providers = available_providers().await.unwrap();
+                assert!(
+                    !providers.contains(&"emptymodel".to_string()),
+                    "provider with empty model should not be auto-routed"
+                );
+            })
+        })
+        .await;
     }
 }

@@ -33,15 +33,7 @@ fn load_store() -> Result<TasteStore> {
 
 fn save_store(store: &TasteStore) -> Result<()> {
     let path = taste_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("taste path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(store)?)?;
-    std::fs::rename(&tmp, &path)?;
-    crate::providers::restrict_env_file_permissions(&path)?;
-    Ok(())
+    crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(store)?, true)
 }
 
 pub fn add_like(note: &str) -> Result<()> {

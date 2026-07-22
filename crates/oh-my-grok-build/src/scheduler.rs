@@ -105,19 +105,12 @@ fn load_jobs() -> Result<Vec<ScheduledJob>> {
 
 fn save_jobs(jobs: &[ScheduledJob]) -> Result<()> {
     let path = schedule_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("schedule path has no parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = path.with_extension(format!("jsonl.tmp.{}", std::process::id()));
-    let mut f = std::fs::File::create(&tmp)?;
+    let mut content = String::new();
     for job in jobs {
-        writeln!(f, "{}", serde_json::to_string(job)?)?;
+        content.push_str(&serde_json::to_string(job)?);
+        content.push('\n');
     }
-    drop(f);
-    std::fs::rename(&tmp, &path)?;
-    crate::providers::restrict_env_file_permissions(&path)?;
-    Ok(())
+    crate::providers::write_file_atomic(&path, content, true)
 }
 
 async fn with_jobs<F, R>(f: F) -> Result<R>
@@ -323,14 +316,18 @@ pub async fn spawn_daemon() -> Result<()> {
         .stderr(Stdio::null())
         .kill_on_drop(false);
     crate::spawn_detached(cmd)?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+
     let path = pid_path()?;
-    if let Ok(raw) = std::fs::read_to_string(&path)
-        && let Ok(pid) = raw.trim().parse::<u32>()
-        && crate::process_alive(pid)
-    {
-        println!("scheduler daemon started (pid {pid})");
-        return Ok(());
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(raw) = std::fs::read_to_string(&path)
+            && let Ok(pid) = raw.trim().parse::<u32>()
+            && crate::process_alive(pid)
+        {
+            println!("scheduler daemon started (pid {pid})");
+            return Ok(());
+        }
     }
     bail!("scheduler daemon failed to start")
 }

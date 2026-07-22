@@ -220,15 +220,7 @@ fn load_registry() -> Result<ConnectorRegistry> {
 
 fn save_registry(registry: &ConnectorRegistry) -> Result<()> {
     let path = registry_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("registry path has no parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(registry)?)?;
-    std::fs::rename(&tmp, &path)?;
-    crate::providers::restrict_env_file_permissions(&path)?;
-    Ok(())
+    crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(registry)?, true)
 }
 
 fn default_secret_env_key(r#type: &str) -> Option<&'static str> {

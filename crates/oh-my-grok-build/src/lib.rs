@@ -301,16 +301,64 @@ pub(crate) async fn kill_child_and_reap(
     let _ = child.wait().await;
 }
 
+fn exe_stem() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
 #[cfg(unix)]
 pub(crate) fn process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
+    if pid == 0 {
+        return false;
+    }
+    let pid_s = pid.to_string();
+    if !std::process::Command::new("kill")
+        .args(["-0", &pid_s])
         .status()
         .is_ok_and(|s| s.success())
+    {
+        return false;
+    }
+    let exe = exe_stem();
+    if exe.is_empty() {
+        return false;
+    }
+    if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let first = bytes.split(|b| *b == 0).next();
+        if let Some(arg) = first {
+            let arg = String::from_utf8_lossy(arg);
+            if let Some(name) = std::path::Path::new(arg.as_ref()).file_stem() {
+                let name = name.to_string_lossy().to_lowercase();
+                if name == exe {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-p", &pid_s, "-o", "comm="])
+        .output()
+    {
+        let comm = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_lowercase();
+        return comm.contains(&exe) || exe.contains(&comm);
+    }
+    false
 }
 
 #[cfg(windows)]
 pub(crate) fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let exe = exe_stem();
+    if exe.is_empty() {
+        return false;
+    }
     let Ok(output) = std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .output()
@@ -321,16 +369,23 @@ pub(crate) fn process_alive(pid: u32) -> bool {
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines().any(|line| {
         let mut parts = line.split("\",\"");
-        let Some(pid_field) = parts.nth(1) else {
+        let Some(image) = parts.next() else {
             return false;
         };
-        pid_field.trim_matches('"') == pid_s
+        let Some(pid_field) = parts.next() else {
+            return false;
+        };
+        let image_stem = std::path::Path::new(image.trim_matches('"'))
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        pid_field.trim_matches('"') == pid_s && image_stem == exe
     })
 }
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn process_alive(_pid: u32) -> bool {
-    true
+    false
 }
 
 async fn run_exec(args: ExecArgs) -> Result<()> {

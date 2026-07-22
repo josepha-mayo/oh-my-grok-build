@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use xai_grok_pager::headless::OutputFormat;
@@ -129,6 +131,7 @@ async fn run_exec(step: &ExecStep) -> Result<()> {
 }
 
 async fn run_shell(step: &ShellStep) -> Result<()> {
+    guard_shell_command(&step.command, &step.args).await?;
     let mut cmd = Command::new(&step.command);
     cmd.args(&step.args);
     let status = cmd.status().await?;
@@ -139,6 +142,75 @@ async fn run_shell(step: &ShellStep) -> Result<()> {
         }
     } else if !status.success() {
         bail!("shell exited with {}", status.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
+fn safe_shell_guard_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let name = if cfg!(windows) {
+        "safe-shell-guard.exe"
+    } else {
+        "safe-shell-guard"
+    };
+    if let Some(dir) = exe.parent() {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        let mut current = dir;
+        while let Some(parent) = current.parent() {
+            let candidate = parent.join("plugin").join("bin").join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            current = parent;
+        }
+    }
+    None
+}
+
+async fn guard_shell_command(command: &str, args: &[String]) -> Result<()> {
+    let guard = safe_shell_guard_path()
+        .ok_or_else(|| anyhow::anyhow!("safe-shell-guard binary not found; build it first"))?;
+    let mut parts = vec![
+        shlex::try_quote(command)
+            .map_err(|_| anyhow::anyhow!("command contains invalid shell characters"))?
+            .into_owned(),
+    ];
+    for a in args {
+        parts.push(
+            shlex::try_quote(a)
+                .map_err(|_| anyhow::anyhow!("argument contains invalid shell characters"))?
+                .into_owned(),
+        );
+    }
+    let payload = json!({ "toolInput": { "command": parts.join(" ") } }).to_string();
+    let mut child = Command::new(guard)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn safe-shell-guard")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("safe-shell-guard stdin not available")?;
+    stdin.write_all(payload.as_bytes()).await?;
+    stdin.shutdown().await?;
+    let out = child
+        .wait_with_output()
+        .await
+        .context("safe-shell-guard failed to run")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("safe-shell-guard output is not valid JSON: {e}"))?;
+    if parsed.get("decision").and_then(|v| v.as_str()) != Some("allow") {
+        let reason = parsed
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("blocked");
+        bail!("playbook shell step blocked by safe-shell-guard: {reason}");
     }
     Ok(())
 }

@@ -42,7 +42,7 @@ pub fn add_event(
         .open(&path)?;
     writeln!(file, "{line}")?;
     drop(file);
-    crate::providers::restrict_env_file_permissions(&path)?;
+    crate::providers::restrict_omg_file_permissions(&path)?;
     Ok(())
 }
 
