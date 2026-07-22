@@ -1,7 +1,8 @@
 //! GitHub PR helper for `omgb`.
 //!
-//! Wraps `gh` when available for status checks, drafting PRs, and merge-queue
-//! inspection.  Falls back to helpful diagnostics when `gh` is not installed.
+//! Wraps `gh` when available for status checks, creating PRs, drafting, and
+//! merge-queue inspection. Falls back to helpful diagnostics when `gh` is not
+//! installed.
 
 use std::process::Stdio;
 
@@ -13,8 +14,10 @@ use crate::args::{PrCommand, PrCreateArgs, PrStatusArgs};
 pub async fn run_pr(cmd: PrCommand) -> Result<()> {
     match cmd {
         PrCommand::Status(args) => run_status(&args).await,
-        PrCommand::CreateDraft(args) => run_create_draft(&args).await,
+        PrCommand::Create(args) => run_create(&args, args.draft).await,
+        PrCommand::CreateDraft(args) => run_create(&args, true).await,
         PrCommand::MergeQueue(args) => run_merge_queue(&args).await,
+        PrCommand::Checks(args) => run_checks(&args).await,
     }
 }
 
@@ -32,22 +35,55 @@ async fn run_status(args: &PrStatusArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_create_draft(args: &PrCreateArgs) -> Result<()> {
+async fn run_create(args: &PrCreateArgs, draft: bool) -> Result<()> {
     ensure_gh()?;
     let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "pr",
-        "create",
-        "--draft",
-        "--title",
-        &args.title,
-        "--body",
-        &args.body,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    cmd.arg("pr")
+        .arg("create")
+        .arg("--title")
+        .arg(&args.title)
+        .arg("--body")
+        .arg(&args.body);
+    if draft {
+        cmd.arg("--draft");
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     run_gh(cmd).await?;
+    Ok(())
+}
+
+async fn run_checks(args: &PrStatusArgs) -> Result<()> {
+    ensure_gh()?;
+    let branch = resolve_branch(&args.branch)?;
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(["pr", "checks", &branch, "--json", "name,state,link"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = run_gh(cmd).await?;
+    let checks: Vec<GhCheck> = serde_json::from_str(&out)
+        .with_context(|| format!("could not parse `gh pr checks` output for {branch}"))?;
+    if checks.is_empty() {
+        println!("No checks found for {branch}.");
+        return Ok(());
+    }
+    let mut failures = 0usize;
+    for c in &checks {
+        let icon = match c.state.as_str() {
+            "success" => "✓",
+            "failure" => "✗",
+            _ => "•",
+        };
+        println!("{} {}: {} ({})", icon, c.name, c.state, c.link);
+        if c.state == "failure" {
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        bail!("{failures} check(s) failed");
+    }
     Ok(())
 }
 
@@ -82,6 +118,13 @@ struct GhPrView {
     number: Option<u64>,
     title: Option<String>,
     is_draft: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhCheck {
+    name: String,
+    state: String,
+    link: String,
 }
 
 struct PrData {
@@ -184,9 +227,22 @@ async fn run_gh(mut cmd: tokio::process::Command) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn pr_state_normalization() {
-        // The actual view path is async/IO; unit-test the normalization logic indirectly
         assert_eq!("open", "open");
+    }
+
+    #[test]
+    fn parse_gh_checks_json() {
+        let raw = r#"[
+            {"name":"ci","state":"success","link":"https://example.com/ci"},
+            {"name":"lint","state":"failure","link":"https://example.com/lint"}
+        ]"#;
+        let checks: Vec<GhCheck> = serde_json::from_str(raw).unwrap();
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].state, "success");
+        assert_eq!(checks[1].state, "failure");
     }
 }

@@ -515,10 +515,14 @@ pub struct HashlineApplyArgs {
 pub enum PrCommand {
     /// Show PR status for the current (or specified) branch
     Status(PrStatusArgs),
-    /// Create a draft PR
+    /// Create a PR (use --draft to create as draft)
+    Create(PrCreateArgs),
+    /// Create a draft PR (deprecated; use `create --draft`)
     CreateDraft(PrCreateArgs),
     /// Check whether the branch's PR is in a merge queue
     MergeQueue(PrStatusArgs),
+    /// Show CI checks for the current (or specified) branch
+    Checks(PrStatusArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -533,6 +537,9 @@ pub struct PrCreateArgs {
     pub title: String,
     #[arg(short, long, default_value = "Generated with omgb")]
     pub body: String,
+    /// Create the PR as a draft
+    #[arg(long)]
+    pub draft: bool,
 }
 
 #[derive(Debug, Subcommand, Clone)]
