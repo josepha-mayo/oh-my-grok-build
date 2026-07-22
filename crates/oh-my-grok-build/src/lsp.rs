@@ -55,7 +55,7 @@ static LSP_SERVERS: &[(&str, Server)] = &[
     ),
 ];
 
-static DAP_ADAPTERS: &[(&str, &'static [&'static str])] = &[
+static DAP_ADAPTERS: &[(&str, &[&str])] = &[
     ("gdb", &["gdb", "--interpreter=mi"]),
     ("lldb-dap", &["lldb-dap"]),
     ("debugpy", &["python", "-m", "debugpy.adapter"]),

@@ -57,7 +57,7 @@ async fn install_plugin(args: &PluginInstallArgs) -> Result<()> {
     if dest.exists() {
         bail!("plugin {name} already installed; remove it first");
     }
-    std::fs::create_dir_all(&plugin_dir())?;
+    std::fs::create_dir_all(plugin_dir())?;
     if is_git_url(&args.source) {
         clone_plugin(&args.source, &dest).await?;
     } else {

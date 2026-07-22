@@ -86,15 +86,15 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | Feature | Status |
 | --- | --- |
 | Self-improving / auto skill creation from completed tasks | ⏳ |
-| LSP + DAP integration (semantic refactor, debugger attach) | ⏳ |
-| Hashline / safe token-efficient edits with mismatch rejection | ⏳ |
-| Persistent cross-session memory (SQLite/JSONL, hindsight, playbooks) | ⏳ |
-| Session branching / resuming / forking | ⏳ |
-| PR automation / GitHub agent | ⏳ |
-| Plugin / skill / hook marketplace and hot-loading | ⏳ |
+| LSP + DAP integration (semantic refactor, debugger attach) | 🚧 |
+| Hashline / safe token-efficient edits with mismatch rejection | ✅ |
+| Persistent cross-session memory (SQLite/JSONL, hindsight, playbooks) | ✅ |
+| Session branching / resuming / forking | ✅ |
+| PR automation / GitHub agent | 🚧 |
+| Plugin / skill / hook marketplace and hot-loading | 🚧 |
 | Headless / CI mode with deterministic playbooks | ⏳ |
-| Multi-model cost routing / benchmark-optimized scaffolding | ⏳ |
-| Local-first inference fallback (Ollama / LM Studio / vLLM) wired end-to-end | ⏳ |
+| Multi-model cost routing / benchmark-optimized scaffolding | ✅ |
+| Local-first inference fallback (Ollama / LM Studio / vLLM) wired end-to-end | 🚧 |
 
 ### Phase 3 — Production release
 
