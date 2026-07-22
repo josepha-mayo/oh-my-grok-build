@@ -580,6 +580,10 @@ pub enum PluginCommand {
     List,
     /// Install a plugin from a git URL or local directory
     Install(PluginInstallArgs),
+    /// Remove an installed plugin by name
+    Remove { name: String },
+    /// Refresh installed plugins from their git sources
+    Refresh(PluginRefreshArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -589,6 +593,18 @@ pub struct PluginInstallArgs {
     /// Optional plugin name (derived from URL if omitted)
     #[arg(short, long)]
     pub name: Option<String>,
+    /// Optional SHA to pin the remote plugin to
+    #[arg(long = "sha")]
+    pub require_sha: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct PluginRefreshArgs {
+    /// Plugin name to refresh (refresh all if omitted)
+    pub name: Option<String>,
+    /// Non-blocking refresh: do not wait for each source
+    #[arg(long)]
+    pub async_refresh: bool,
 }
 
 #[derive(Debug, Args, Clone)]

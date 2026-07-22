@@ -1,14 +1,19 @@
 //! Plugin marketplace commands for `omgb`.
 //!
 //! Installs plugins from git URLs or local directories into `~/.omgb/plugins`
-//! after validating a manifest and copying without following symlinks.
+//! after validating a manifest, stripping symlinks, and (for git sources)
+//! recording the source so it can be refreshed later. Remote clones are guarded
+//! by a hang timeout and optional SHA pinning.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::args::{PluginCommand, PluginInstallArgs};
+use crate::args::{PluginCommand, PluginInstallArgs, PluginRefreshArgs};
+
+const CLONE_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn plugin_dir() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join("plugins"))
@@ -46,12 +51,37 @@ fn validate_plugin_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SourceMeta {
+    source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha: Option<String>,
+}
+
+fn source_meta_path(dir: &Path) -> PathBuf {
+    dir.join(".omgb-source.json")
+}
+
+fn read_source_meta(dir: &Path) -> Result<Option<SourceMeta>> {
+    let path = source_meta_path(dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("{} is not valid JSON", path.display()))
+}
+
+fn write_source_meta(dir: &Path, meta: &SourceMeta) -> Result<()> {
+    let path = source_meta_path(dir);
+    let raw = serde_json::to_string_pretty(meta)?;
+    std::fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// Expand `~` at the start of a path string and resolve it against the
 /// current working directory when relative. Symlinks and paths that escape
 /// the current working directory are rejected to prevent local file reads.
 fn resolve_local_plugin_source(source: &str) -> Result<PathBuf> {
-    // Expand a leading `~` to the home directory, then canonicalize and require
-    // the resolved path to be under the current working directory.
     let expanded = if source.starts_with("~/") {
         dirs::home_dir()
             .map(|h| h.join(&source[2..]))
@@ -145,7 +175,21 @@ fn remove_symlinks_in_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn clone_plugin(url: &str, dest: &Path) -> Result<()> {
+fn base_git_cmd(tmp_home: &Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.stdin(Stdio::null())
+        .env("HOME", tmp_home)
+        .env("USERPROFILE", tmp_home)
+        .env("XDG_CONFIG_HOME", tmp_home)
+        .env("GIT_TEMPLATE_DIR", tmp_home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
+/// Clone `url` into `dest` (a temporary directory), optionally pinned to a SHA.
+/// The clone is guarded by `CLONE_TIMEOUT` to contain hung git sources.
+async fn clone_plugin(url: &str, dest: &Path, require_sha: Option<&str>) -> Result<()> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         bail!("only http(s) git URLs are supported for remote plugin installation");
     }
@@ -161,25 +205,17 @@ async fn clone_plugin(url: &str, dest: &Path) -> Result<()> {
     let tmp_home = std::env::temp_dir().join(format!("omgb-git-home-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp_home)?;
 
-    let status = tokio::process::Command::new("git")
-        .args(["clone", "--depth", "1", url])
-        .arg(&tmp)
-        .stdin(Stdio::null())
-        .env("HOME", &tmp_home)
-        .env("USERPROFILE", &tmp_home)
-        .env("XDG_CONFIG_HOME", &tmp_home)
-        .env("GIT_TEMPLATE_DIR", &tmp_home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-        .await
-        .context("spawn git")?;
+    let result = if let Some(sha) = require_sha {
+        clone_with_sha(url, &tmp, &tmp_home, sha).await
+    } else {
+        clone_shallow(url, &tmp, &tmp_home).await
+    };
 
     let _ = std::fs::remove_dir_all(&tmp_home);
 
-    if !status.success() {
+    if let Err(e) = result {
         let _ = std::fs::remove_dir_all(&tmp);
-        bail!("git clone failed");
+        return Err(e);
     }
 
     remove_symlinks_in_dir(&tmp).with_context(|| "failed to scrub symlinks from cloned plugin")?;
@@ -198,10 +234,76 @@ async fn clone_plugin(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn clone_shallow(url: &str, tmp: &Path, tmp_home: &Path) -> Result<()> {
+    let mut child = base_git_cmd(tmp_home)
+        .args(["clone", "--depth", "1", url])
+        .arg(tmp)
+        .spawn()
+        .context("spawn git clone")?;
+
+    match tokio::time::timeout(CLONE_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => bail!("git clone failed with exit code {status:?}"),
+        Ok(Err(e)) => bail!("git clone failed: {e}"),
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("git clone timed out after {}s", CLONE_TIMEOUT.as_secs());
+        }
+    }
+}
+
+async fn clone_with_sha(url: &str, tmp: &Path, tmp_home: &Path, sha: &str) -> Result<()> {
+    // Do a full clone so we can check out an arbitrary SHA. Plugins are small,
+    // and this avoids servers that do not support reachability SHA fetches.
+    let mut child = base_git_cmd(tmp_home)
+        .args(["clone", url])
+        .arg(tmp)
+        .spawn()
+        .context("spawn git clone")?;
+
+    match tokio::time::timeout(CLONE_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => bail!("git clone failed with exit code {status:?}"),
+        Ok(Err(e)) => bail!("git clone failed: {e}"),
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("git clone timed out after {}s", CLONE_TIMEOUT.as_secs());
+        }
+    }
+
+    let checkout_status = tokio::process::Command::new("git")
+        .args(["-C", &tmp.to_string_lossy(), "checkout", sha])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("spawn git checkout")?;
+    if !checkout_status.success() {
+        bail!("failed to checkout pinned SHA {sha}");
+    }
+
+    let actual = tokio::process::Command::new("git")
+        .args(["-C", &tmp.to_string_lossy(), "rev-parse", "HEAD"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .context("spawn git rev-parse")?;
+    let actual_sha = String::from_utf8_lossy(&actual.stdout).trim().to_string();
+    if actual_sha != sha {
+        bail!("checked out SHA {actual_sha} does not match required {sha}");
+    }
+    Ok(())
+}
+
 pub async fn run_plugin(cmd: PluginCommand) -> Result<()> {
     match cmd {
         PluginCommand::List => list_plugins().await,
         PluginCommand::Install(args) => install_plugin(&args).await,
+        PluginCommand::Remove { name } => remove_plugin(&name).await,
+        PluginCommand::Refresh(args) => refresh_plugins(&args).await,
     }
 }
 
@@ -226,7 +328,17 @@ async fn list_plugins() -> Result<()> {
             } else {
                 "plugin"
             };
-            println!("{} ({}) @ {}", name.to_string_lossy(), kind, path.display());
+            let meta = read_source_meta(&path).ok().flatten();
+            let pin = meta
+                .and_then(|m| m.sha)
+                .map(|s| format!(" @ {s:.12}"))
+                .unwrap_or_default();
+            println!(
+                "{} ({}) @ {}{pin}",
+                name.to_string_lossy(),
+                kind,
+                path.display()
+            );
         }
     }
     Ok(())
@@ -250,7 +362,7 @@ async fn install_plugin(args: &PluginInstallArgs) -> Result<()> {
     std::fs::create_dir_all(parent)?;
 
     if args.source.starts_with("http://") || args.source.starts_with("https://") {
-        clone_plugin(&args.source, &dest).await?;
+        clone_plugin(&args.source, &dest, args.require_sha.as_deref()).await?;
     } else if args.source.starts_with("ssh://")
         || args.source.starts_with("git://")
         || args.source.starts_with("git@")
@@ -270,7 +382,132 @@ async fn install_plugin(args: &PluginInstallArgs) -> Result<()> {
         }
     }
 
+    let meta = SourceMeta {
+        source: args.source.clone(),
+        sha: args.require_sha.clone(),
+    };
+    let _ = write_source_meta(&dest, &meta);
+
     println!("installed plugin {name} to {}", dest.display());
+    Ok(())
+}
+
+async fn remove_plugin(name: &str) -> Result<()> {
+    validate_name(name)?;
+    let dest = plugin_dir()?.join(name);
+    if !dest.exists() {
+        bail!("plugin '{name}' is not installed");
+    }
+    std::fs::remove_dir_all(&dest)?;
+    println!("removed plugin {name}");
+    Ok(())
+}
+
+async fn refresh_plugins(args: &PluginRefreshArgs) -> Result<()> {
+    let dir = plugin_dir()?;
+    let targets: Vec<(String, PathBuf)> = if let Some(name) = &args.name {
+        validate_name(name)?;
+        let p = dir.join(name);
+        if !p.exists() {
+            bail!("plugin '{name}' is not installed");
+        }
+        vec![(name.clone(), p)]
+    } else {
+        if !dir.exists() {
+            return Ok(());
+        }
+        std::fs::read_dir(&dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .collect()
+    };
+
+    if targets.is_empty() {
+        println!("no installed plugins to refresh");
+        return Ok(());
+    }
+
+    if args.async_refresh {
+        // Run all refreshes concurrently so no single hung source blocks the rest.
+        let futures: Vec<_> = targets
+            .into_iter()
+            .filter_map(|(name, path)| {
+                let meta = match read_source_meta(&path) {
+                    Ok(Some(m)) => m,
+                    Ok(None) => {
+                        eprintln!("warning: plugin {name} has no source metadata; skipping");
+                        return None;
+                    }
+                    Err(e) => {
+                        eprintln!("warning: plugin {name}: {e}; skipping");
+                        return None;
+                    }
+                };
+                if !meta.source.starts_with("http://") && !meta.source.starts_with("https://") {
+                    eprintln!("warning: plugin {name} source is not remote; skipping");
+                    return None;
+                }
+                Some(tokio::spawn(async move {
+                    (
+                        name.clone(),
+                        refresh_one(&name, &path, &meta.source, meta.sha.as_deref()).await,
+                    )
+                }))
+            })
+            .collect();
+        for handle in futures {
+            match handle.await {
+                Ok((name, Ok(()))) => println!("refreshed plugin {name}"),
+                Ok((_, Err(e))) => eprintln!("refresh failed: {e}"),
+                Err(e) => eprintln!("refresh task panicked: {e}"),
+            }
+        }
+        return Ok(());
+    }
+
+    for (name, path) in targets {
+        let meta = match read_source_meta(&path)? {
+            Some(m) => m,
+            None => {
+                eprintln!("warning: plugin {name} has no source metadata; skipping");
+                continue;
+            }
+        };
+        if !meta.source.starts_with("http://") && !meta.source.starts_with("https://") {
+            eprintln!("warning: plugin {name} source is not remote; skipping");
+            continue;
+        }
+        match refresh_one(&name, &path, &meta.source, meta.sha.as_deref()).await {
+            Ok(()) => println!("refreshed plugin {name}"),
+            Err(e) => eprintln!("refresh failed for {name}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_one(name: &str, path: &Path, source: &str, sha: Option<&str>) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".refresh-{name}-{}", uuid::Uuid::new_v4()));
+
+    clone_plugin(source, &tmp, sha).await?;
+
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!("failed to remove old plugin {name}: {e}");
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!("failed to move refreshed plugin {name}: {e}");
+    }
+
+    let meta = SourceMeta {
+        source: source.into(),
+        sha: sha.map(|s| s.into()),
+    };
+    let _ = write_source_meta(path, &meta);
     Ok(())
 }
 
@@ -392,6 +629,7 @@ mod tests {
             let args = PluginInstallArgs {
                 source: source.to_string(),
                 name: Some("test".into()),
+                require_sha: None,
             };
             assert!(
                 install_plugin(&args).await.is_err(),
