@@ -132,6 +132,7 @@ pub async fn run_command_hook(
         } else {
             spec.source_dir.join(command)
         };
+        let command_path = resolve_hook_executable(&command_path).unwrap_or(command_path);
         if !command_path.exists() {
             let elapsed = start.elapsed();
             return (
@@ -540,6 +541,41 @@ pub fn resolve_command_path(spec: &HookSpec) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Try to find an executable for `path`, accounting for Windows `PATHEXT`.
+///
+/// This lets hook commands like `../bin/safe-shell-guard` resolve to
+/// `../bin/safe-shell-guard.exe` on Windows without requiring the hook JSON to
+/// be platform-specific.
+fn resolve_hook_executable(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if path.exists() {
+        return Some(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        if path.extension().is_some() {
+            return None;
+        }
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| {
+            String::from(".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC")
+        });
+        for ext in std::env::split_paths(&pathext) {
+            let ext = ext
+                .to_string_lossy()
+                .trim()
+                .trim_start_matches('.')
+                .to_lowercase();
+            if ext.is_empty() {
+                continue;
+            }
+            let candidate = path.with_extension(&ext);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +901,7 @@ mod tests {
     /// Now the env-var pre-spawn check refuses with a clear reason when
     /// the var is unset (and the dispatcher fail-opens, so the tool call
     /// itself is not blocked).
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_env_var_interpolation_runs_via_shell() {
         let tmp = tempfile::tempdir().unwrap();
@@ -918,6 +955,7 @@ mod tests {
     /// it on the spawned child so shell expansion via the `sh -c` branch
     /// resolves correctly; otherwise such hooks fail to find the
     /// command.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_claude_project_dir_is_exported() {
         let tmp = tempfile::tempdir().unwrap();

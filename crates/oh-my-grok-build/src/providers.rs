@@ -15,6 +15,8 @@ pub mod catalog;
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LMSTUDIO_URL: &str = "http://localhost:1234/v1";
+const DEFAULT_VLLM_URL: &str = "http://localhost:8000/v1";
+const DEFAULT_LLAMA_CPP_URL: &str = "http://localhost:8080/v1";
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
 #[derive(Debug, Clone)]
@@ -966,40 +968,39 @@ fn save_grok_config_table(table: &toml::map::Map<String, toml::Value>) -> Result
     Ok(())
 }
 
+async fn discover_one(base_url: &str, name: &str) -> Option<(String, String, Vec<ModelListEntry>)> {
+    let models = fetch_model_list(
+        base_url,
+        None,
+        "chat_completions",
+        &HashMap::new(),
+        true,
+        true,
+    )
+    .await?;
+    if models.is_empty() {
+        return None;
+    }
+    Some((name.into(), base_url.into(), models))
+}
+
 pub async fn discover_local_models(
     args: &DiscoverArgs,
 ) -> Result<Vec<(String, String, Vec<ModelListEntry>)>> {
-    let mut out = Vec::new();
     let ollama = args.ollama_url.as_deref().unwrap_or(DEFAULT_OLLAMA_URL);
     let lmstudio = args.lmstudio_url.as_deref().unwrap_or(DEFAULT_LMSTUDIO_URL);
 
-    if let Some(models) = fetch_model_list(
-        ollama,
-        None,
-        "chat_completions",
-        &HashMap::new(),
-        true,
-        true,
-    )
-    .await
-        && !models.is_empty()
-    {
-        out.push(("ollama".into(), ollama.into(), models));
-    }
-    if let Some(models) = fetch_model_list(
-        lmstudio,
-        None,
-        "chat_completions",
-        &HashMap::new(),
-        true,
-        true,
-    )
-    .await
-        && !models.is_empty()
-    {
-        out.push(("lmstudio".into(), lmstudio.into(), models));
-    }
-    Ok(out)
+    let (ollama, lmstudio, vllm, llama_cpp) = tokio::join!(
+        discover_one(ollama, "ollama"),
+        discover_one(lmstudio, "lmstudio"),
+        discover_one(DEFAULT_VLLM_URL, "vllm"),
+        discover_one(DEFAULT_LLAMA_CPP_URL, "llama-cpp"),
+    );
+
+    Ok([ollama, lmstudio, vllm, llama_cpp]
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 pub fn add_discovered_providers(

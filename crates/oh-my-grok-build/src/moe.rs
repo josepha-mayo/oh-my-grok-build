@@ -289,26 +289,30 @@ pub fn select_provider_from(available: &[String], task: &str) -> Result<String> 
     Ok(scored[0].0.clone())
 }
 
-/// Like [`select_provider`], but if no provider is configured it attempts to
-/// auto-discover a local model server (Ollama / LM Studio) and add it before
-/// choosing.
+/// Like [`select_provider`], but falls back to auto-discovering local model
+/// servers (Ollama, LM Studio, vLLM, llama.cpp) when no keyed cloud provider is
+/// available or when the task explicitly hints at local/cheap usage. Discovered
+/// local providers are added to the config so `select_provider` can prefer them
+/// over keyed cloud providers when the task hints at local/cheap usage.
 pub async fn select_provider_or_fallback(prompt: &str) -> Result<String> {
-    match select_provider(prompt) {
-        Ok(id) => Ok(id),
-        Err(_) => {
-            let args = crate::args::DiscoverArgs {
-                ollama_url: None,
-                lmstudio_url: None,
-                add: false,
-            };
-            let discovered = discover_local_models(&args).await?;
-            if discovered.is_empty() {
-                bail!("no providers available and no local servers found");
-            }
+    let task_lower = prompt.to_ascii_lowercase();
+    let discover_first = task_contains_word(&task_lower, "local")
+        || task_contains_word(&task_lower, "cheap")
+        || select_provider(prompt).is_err();
+
+    if discover_first {
+        let args = crate::args::DiscoverArgs {
+            ollama_url: None,
+            lmstudio_url: None,
+            add: false,
+        };
+        let discovered = discover_local_models(&args).await?;
+        if !discovered.is_empty() {
             add_discovered_providers(&discovered)?;
-            select_provider(prompt)
         }
     }
+
+    select_provider(prompt)
 }
 
 #[cfg(test)]

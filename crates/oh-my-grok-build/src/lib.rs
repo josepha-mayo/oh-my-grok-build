@@ -928,6 +928,18 @@ async fn run_team(args: TeamArgs) -> Result<()> {
     if !git.success() {
         bail!("team mode requires a git repository");
     }
+    if !git_worktree_status().await?.0 {
+        bail!("git working tree is not clean; commit or stash changes before running `omgb team`");
+    }
+    let main_exists = Command::new("git")
+        .args(["rev-parse", "--verify", "main"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    if !main_exists.success() {
+        bail!("team mode requires a `main` branch");
+    }
 
     let mut tasks = Vec::new();
     for i in 0..args.agents {
@@ -1010,6 +1022,7 @@ async fn create_worktree(path: &PathBuf) -> Result<String> {
     let out = Command::new("git")
         .args(["worktree", "add", "-b", &branch, "-q"])
         .arg(path)
+        .arg("main")
         .output()
         .await?;
     if !out.status.success() {
@@ -1077,6 +1090,19 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
     }
 
     let main_dir = git_repo_root().await?;
+    let (clean, _) = git_worktree_status().await?;
+    if !clean {
+        bail!("main working tree is not clean; commit or stash changes before merging team output");
+    }
+    let checkout = Command::new("git")
+        .current_dir(&main_dir)
+        .args(["checkout", "main"])
+        .status()
+        .await?;
+    if !checkout.success() {
+        bail!("failed to checkout `main` branch for team merge");
+    }
+
     let merge_msg = format!("Merge omgb team agent {branch}");
     let merge = Command::new("git")
         .current_dir(&main_dir)

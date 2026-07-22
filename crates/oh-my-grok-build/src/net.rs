@@ -218,6 +218,13 @@ pub async fn validate_url(
     validate_host_name(&host)?;
     let port = lookup_port(&url);
     let addrs = resolve_host(&host, port, allow_local, allow_private).await?;
+    // When the caller asked to allow private/LAN hosts, require that *every*
+    // resolved address is loopback or private. Otherwise a hostname that
+    // resolves to both a public and a private address (DNS rebinding) could
+    // be used to reach the private endpoint over an HTTPS connection.
+    if allow_private && !all_addrs_loopback_or_private(&addrs, true) {
+        anyhow::bail!("host resolved to a non-private/non-loopback address");
+    }
     if url.scheme() == "http" && !all_addrs_loopback_or_private(&addrs, allow_private) {
         anyhow::bail!("insecure HTTP to a public host; use https");
     }
@@ -248,9 +255,12 @@ pub async fn is_url_host_private(raw: &str) -> bool {
         return false;
     }
     let port = lookup_port(&url);
+    // A host is considered private only when *all* resolved addresses are
+    // private (RFC1918/ULA). Loopback is handled separately by
+    // `is_url_host_loopback`/`allow_local`.
     resolve_host(&host, port, true, true)
         .await
-        .is_ok_and(|addrs| addrs.iter().any(|a| is_private_ip(a.ip())))
+        .is_ok_and(|addrs| !addrs.is_empty() && addrs.iter().all(|a| is_private_ip(a.ip())))
 }
 
 /// Open a WebSocket/WebSocket-over-TLS connection to `raw`, validating the
@@ -277,6 +287,11 @@ pub async fn connect_ws_url(
     let addrs = resolve_host(&host, port, true, allow_private).await?;
     if scheme == "ws" && !all_addrs_loopback_or_private(&addrs, allow_private) {
         anyhow::bail!("insecure WebSocket to a public host; use wss");
+    }
+    // Same DNS-rebinding defense as `validate_url`: when private hosts are
+    // allowed, every resolved address must be loopback or private.
+    if allow_private && !all_addrs_loopback_or_private(&addrs, true) {
+        anyhow::bail!("host resolved to a non-private/non-loopback address");
     }
 
     let display_host = if host

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "../bin/safe-shell-guard ",
+            "command": "../bin/safe-shell-guard",
             "timeout": 5
           }
         ]
