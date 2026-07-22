@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::DateTime;
 use serde::Deserialize;
 
@@ -179,13 +179,35 @@ async fn run_session_resume(args: SessionResumeArgs) -> Result<()> {
 }
 
 async fn run_session_fork(args: SessionForkArgs) -> Result<()> {
-    validate_session_id(&args.parent_session_id)?;
-    if let Some(ref sid) = args.new_session_id {
-        validate_session_id(sid)?;
+    let parent = args.parent_session_id;
+    validate_session_id(&parent)?;
+    let parent_dir = session_dir(&parent)?;
+    if !parent_dir.exists() {
+        bail!("parent session '{}' does not exist", parent);
     }
+
+    let new_id = match args.new_session_id {
+        Some(id) => {
+            validate_session_id(&id)?;
+            id
+        }
+        None => {
+            let id = format!("{parent}-fork-{}", uuid::Uuid::new_v4());
+            validate_session_id(&id)?;
+            id
+        }
+    };
+    let new_dir = session_dir(&new_id)?;
+    if new_dir.exists() {
+        bail!("session '{new_id}' already exists");
+    }
+    std::fs::create_dir_all(&new_dir)?;
+    copy_compaction_checkpoints(&parent_dir, &new_dir)
+        .with_context(|| "failed to copy compaction checkpoints")?;
+
     let session = SessionParams {
-        resume: Some(args.parent_session_id),
-        session_id: args.new_session_id,
+        resume: Some(parent),
+        session_id: Some(new_id),
         fork_session: true,
         continue_last: false,
     };
@@ -204,6 +226,36 @@ async fn run_session_fork(args: SessionForkArgs) -> Result<()> {
         args.memory,
     )
     .await
+}
+
+fn copy_compaction_checkpoints(src: &Path, dst: &Path) -> Result<()> {
+    let src_ckpt = src.join("compaction_checkpoints");
+    if !src_ckpt.exists() {
+        return Ok(());
+    }
+    let meta = std::fs::symlink_metadata(&src_ckpt)
+        .with_context(|| format!("metadata for {}", src_ckpt.display()))?;
+    if !meta.is_dir() {
+        bail!("{} is not a directory", src_ckpt.display());
+    }
+    let dst_ckpt = dst.join("compaction_checkpoints");
+    std::fs::create_dir_all(&dst_ckpt)?;
+    for entry in std::fs::read_dir(&src_ckpt)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("metadata for {}", path.display()))?;
+        if meta.is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            copy_compaction_checkpoints(&path, &dst_ckpt.join(entry.file_name()))?;
+        } else if meta.is_file() {
+            std::fs::copy(&path, dst_ckpt.join(entry.file_name()))
+                .with_context(|| format!("copy {} to {}", path.display(), dst_ckpt.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
