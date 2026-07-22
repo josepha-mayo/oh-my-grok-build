@@ -233,17 +233,17 @@ fn save_registry(registry: &ConnectorRegistry) -> Result<()> {
 
 fn default_secret_env_key(r#type: &str) -> Option<&'static str> {
     match r#type {
-        // OpenAI Codex CLI uses OPENAI_API_KEY by default (other providers
-        // are configured in ~/.codex/config.toml).
+        // OpenAI Codex CLI uses OPENAI_API_KEY by default.
         "codex" => Some("OPENAI_API_KEY"),
-        // Claude Code prioritizes ANTHROPIC_API_KEY over subscription auth.
+        // Claude Code uses ANTHROPIC_API_KEY.
         "claude" => Some("ANTHROPIC_API_KEY"),
-        // Hermes Agent reads provider keys from ~/.hermes/.env; OpenRouter is
-        // the documented default/recommended provider.
+        // Hermes Agent's documented default/recommended provider is OpenRouter.
         "hermes" => Some("OPENROUTER_API_KEY"),
-        // OpenCode, Pi, and OMP are multi-provider wrappers with no single
-        // canonical key. Users should pass --secret-env-key or set the
-        // provider-specific env var before invoking the child.
+        // OpenCode picks Anthropic before OpenAI when both are present, so
+        // ANTHROPIC_API_KEY is the most useful default to pass through.
+        "opencode" => Some("ANTHROPIC_API_KEY"),
+        // Pi and OMP are multi-provider wrappers; users should pass
+        // --secret-env-key or set the provider-specific env var.
         _ => None,
     }
 }
@@ -252,8 +252,10 @@ fn default_command(r#type: &str) -> Option<String> {
     match r#type {
         "codex" => Some("codex exec --json {prompt}".into()),
         "opencode" => Some("opencode run {prompt}".into()),
-        "claude" => Some("claude {prompt}".into()),
-        "hermes" => Some("hermes {prompt}".into()),
+        // Claude Code only runs a prompt non-interactively with --print.
+        "claude" => Some("claude --print {prompt}".into()),
+        // Hermes one-shot mode (-z) outputs only the final response.
+        "hermes" => Some("hermes -z {prompt}".into()),
         "pi" => Some("pi {prompt}".into()),
         "omp" => Some("omp {prompt}".into()),
         _ => None,
@@ -496,7 +498,10 @@ mod tests {
         assert_eq!(default_secret_env_key("codex"), Some("OPENAI_API_KEY"));
         assert_eq!(default_secret_env_key("claude"), Some("ANTHROPIC_API_KEY"));
         assert_eq!(default_secret_env_key("hermes"), Some("OPENROUTER_API_KEY"));
-        assert_eq!(default_secret_env_key("opencode"), None);
+        assert_eq!(
+            default_secret_env_key("opencode"),
+            Some("ANTHROPIC_API_KEY")
+        );
         assert_eq!(default_secret_env_key("pi"), None);
         assert_eq!(default_secret_env_key("omp"), None);
     }

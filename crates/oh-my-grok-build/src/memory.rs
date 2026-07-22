@@ -5,7 +5,6 @@
 //! it works without embedding providers or a build dependency on sqlite-vec.
 
 use std::collections::HashMap;
-use std::io::Write;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -14,21 +13,12 @@ use crate::args::MemoryCommand;
 
 const MEMORY_FILE: &str = "memory.jsonl";
 
-pub(crate) fn omgb_home() -> std::path::PathBuf {
-    if let Ok(v) = std::env::var("OMGB_HOME") {
-        return std::path::PathBuf::from(v);
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".omgb")
-}
-
-fn memory_path() -> std::path::PathBuf {
-    omgb_home().join(MEMORY_FILE)
+fn memory_path() -> Result<std::path::PathBuf> {
+    Ok(crate::providers::omg_dir()?.join(MEMORY_FILE))
 }
 
 fn ensure_store() -> Result<()> {
-    let dir = omgb_home();
+    let dir = crate::providers::omg_dir()?;
     if !dir.exists() {
         std::fs::create_dir_all(&dir)?;
     }
@@ -51,7 +41,7 @@ pub struct MemoryNote {
 
 fn load_notes() -> Result<Vec<MemoryNote>> {
     ensure_store()?;
-    let path = memory_path();
+    let path = memory_path()?;
     if path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
         return Ok(Vec::new());
     }
@@ -66,10 +56,14 @@ fn load_notes() -> Result<Vec<MemoryNote>> {
 
 fn save_notes(notes: &[MemoryNote]) -> Result<()> {
     ensure_store()?;
-    let mut file = std::fs::File::create(memory_path())?;
+    let path = memory_path()?;
+    let mut content = String::new();
     for note in notes {
-        writeln!(file, "{}", serde_json::to_string(note)?)?;
+        content.push_str(&serde_json::to_string(note)?);
+        content.push('\n');
     }
+    crate::providers::write_file_atomic(&path, content)?;
+    crate::providers::restrict_env_file_permissions(&path)?;
     Ok(())
 }
 

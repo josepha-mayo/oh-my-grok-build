@@ -20,6 +20,7 @@ mod marketplace;
 mod memory;
 mod moe;
 mod net;
+mod playbook;
 mod pr;
 mod providers;
 mod research;
@@ -41,11 +42,11 @@ fn desktop_control_allowed() -> bool {
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
-/// Loads valid `*_API_KEY` entries from `~/.omgb/.env` into the process
-/// environment, including keys referenced by configured providers/connectors
-/// plus any valid `*_API_KEY` entries already present in the file. This lets
-/// catalog-based MoE routing discover keys before a provider has been persisted
-/// to config.
+/// Loads `*_API_KEY` entries from `~/.omgb/.env` into the process environment,
+/// but only for keys referenced by configured providers, connectors, or known
+/// catalog templates (plus `OMGB_API_KEY`). This limits the secrets visible to
+/// child processes while still letting upstream Grok Build resolve `env_key`
+/// references.
 ///
 /// This is a bridge to the upstream Grok Build harness, which reads provider
 /// secrets from the process environment via `env_key`. It is called only before
@@ -123,6 +124,7 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Lsp(args) => lsp::run_lsp(args).await,
         OmgbCommand::Dap(args) => lsp::run_dap(args).await,
         OmgbCommand::Plugin(args) => marketplace::run_plugin(args).await,
+        OmgbCommand::Playbook(args) => playbook::run_playbook(&args).await,
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
         OmgbCommand::Harness(args) => run_harness(args).await,
         OmgbCommand::Serve(args) => server::serve(&args).await,
@@ -652,7 +654,7 @@ async fn git_author() -> Result<(String, String)> {
     Ok((name, email))
 }
 
-async fn git_commit_all(
+pub(crate) async fn git_commit_all(
     message: &str,
     include_untracked: bool,
     extra_path: Option<&std::path::Path>,

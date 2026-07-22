@@ -1,13 +1,14 @@
-//! LSP / DAP integration stubs for `omgb`.
+//! LSP / DAP integration for `omgb`.
 //!
-//! Provides commands to list known language servers and debug adapters and to
-//! start them.  Full semantic refactoring and debugger attach are left as Phase
-//! 3 work built on top of these JSON-RPC stdio lifecycles.
+//! Lists known language servers and debug adapters and starts them as stdio
+//! relays.  Full semantic refactoring and debugger attach are left as Phase 3
+//! work built on top of these JSON-RPC stdio lifecycles.
 
 use std::collections::HashMap;
 use std::process::Stdio;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use tokio::io;
 
 use crate::args::{DapCommand, LspCommand, LspStartArgs};
 
@@ -101,6 +102,35 @@ pub async fn run_dap(cmd: DapCommand) -> Result<()> {
     Ok(())
 }
 
+async fn relay_stdio(mut child: tokio::process::Child) -> Result<()> {
+    let mut stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    let mut child_stdin = child.stdin.take().context("no stdin")?;
+    let mut child_stdout = child.stdout.take().context("no stdout")?;
+    let mut child_stderr = child.stderr.take().context("no stderr")?;
+
+    let stdin_to_child = tokio::spawn(async move {
+        let _ = io::copy(&mut stdin, &mut child_stdin).await;
+    });
+    let stdout_to_term = tokio::spawn(async move {
+        let _ = io::copy(&mut child_stdout, &mut stdout).await;
+    });
+    let stderr_to_term = tokio::spawn(async move {
+        let _ = io::copy(&mut child_stderr, &mut stderr).await;
+    });
+
+    let status = child.wait().await.context("wait for server")?;
+    stdin_to_child.abort();
+    stdout_to_term.abort();
+    stderr_to_term.abort();
+
+    if !status.success() {
+        bail!("server exited with {}", status.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
 async fn start_lsp(args: &LspStartArgs) -> Result<()> {
     let map = server_map();
     let server = map
@@ -120,19 +150,16 @@ async fn start_lsp(args: &LspStartArgs) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .current_dir(&args.cwd);
     let child = cmd.spawn().with_context(|| "spawn LSP server")?;
-    let pid = child.id().unwrap_or(0);
     println!(
         "started {} for {} (pid {})",
         args.server,
         languages.join(", "),
-        pid
+        child.id().unwrap_or(0)
     );
-    // Leave the server running; the user can attach later.  On Windows this
-    // drops our handles but the child keeps running because we do not wait.
-    let _ = child;
-    Ok(())
+    relay_stdio(child).await
 }
 
 async fn start_adapter(adapter: &str, extra: &[String]) -> Result<()> {
@@ -145,12 +172,15 @@ async fn start_adapter(adapter: &str, extra: &[String]) -> Result<()> {
         .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| "spawn debug adapter")?;
-    let pid = child.id().unwrap_or(0);
-    println!("started DAP adapter {adapter} (pid {pid})");
-    let _ = child;
-    Ok(())
+    println!(
+        "started DAP adapter {adapter} (pid {})",
+        child.id().unwrap_or(0)
+    );
+    relay_stdio(child).await
 }
 
 #[cfg(test)]

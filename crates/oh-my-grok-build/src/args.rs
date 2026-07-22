@@ -83,6 +83,8 @@ pub enum OmgbCommand {
     /// Browse and install plugins from the marketplace
     #[command(subcommand)]
     Plugin(PluginCommand),
+    /// Run a deterministic CI playbook
+    Playbook(PlaybookArgs),
     /// Computer use prompt
     Use(UseArgs),
     /// Browser use prompt
@@ -744,4 +746,13 @@ pub struct UndoArgs {
     /// Hard reset, discarding working tree changes
     #[arg(long)]
     pub hard: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct PlaybookArgs {
+    /// Playbook file (TOML or JSON)
+    pub file: PathBuf,
+    /// Print the steps without running them
+    #[arg(long)]
+    pub dry_run: bool,
 }

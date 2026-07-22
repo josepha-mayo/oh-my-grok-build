@@ -109,21 +109,40 @@ fn apply_blocks(content: &str, blocks: &[Block]) -> Result<String> {
     Ok(out)
 }
 
+fn normalize_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+fn maybe_restore_crlf(content: &str, was_crlf: bool) -> String {
+    if was_crlf {
+        content.replace('\n', "\r\n")
+    } else {
+        content.to_string()
+    }
+}
+
 pub fn apply_patch(file: &Path, patch_text: &str) -> Result<()> {
-    let blocks = parse_patch(patch_text)?;
+    let patch_norm = normalize_line_endings(patch_text);
+    let blocks = parse_patch(&patch_norm)?;
     if blocks.is_empty() {
         bail!("no hashline blocks found in patch");
     }
     let content =
         std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let new_content = apply_blocks(&content, &blocks)?;
-    std::fs::write(file, new_content).with_context(|| format!("write {}", file.display()))?;
+    let was_crlf = content.contains("\r\n");
+    let norm_content = normalize_line_endings(&content);
+    let new_content = apply_blocks(&norm_content, &blocks)?;
+    let new_content = maybe_restore_crlf(&new_content, was_crlf);
+    crate::providers::write_file_atomic(file, new_content)
+        .with_context(|| format!("write {}", file.display()))?;
     Ok(())
 }
 
 pub fn verify_patch(file: &Path, patch_text: &str) -> Result<()> {
-    let blocks = parse_patch(patch_text)?;
+    let patch_norm = normalize_line_endings(patch_text);
+    let blocks = parse_patch(&patch_norm)?;
     let content = std::fs::read_to_string(file)?;
+    let norm_content = normalize_line_endings(&content);
     for b in blocks {
         let actual = short_hash(&b.old_text);
         if actual != b.expected_hash {
@@ -132,7 +151,7 @@ pub fn verify_patch(file: &Path, patch_text: &str) -> Result<()> {
                 b.expected_hash
             );
         }
-        if find_unique_position(&content, &b.old_text).is_none() {
+        if find_unique_position(&norm_content, &b.old_text).is_none() {
             bail!("hashline anchor not found or ambiguous in file");
         }
     }
@@ -224,6 +243,20 @@ mod tests {
         std::fs::write(&file, "foo\nbar\nbar\nbaz\n").unwrap();
         let patch = make_patch("bar", "qux");
         assert!(apply_patch(&file, &patch).is_err());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn apply_crlf_patch_preserves_line_endings() {
+        let tmp = std::env::temp_dir().join(format!("hashline-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("test.txt");
+        std::fs::write(&file, "foo\r\nbar\r\nbaz\r\n").unwrap();
+        let mut patch = make_patch("bar", "qux");
+        patch = patch.replace('\n', "\r\n");
+        apply_patch(&file, &patch).unwrap();
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "foo\r\nqux\r\nbaz\r\n");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

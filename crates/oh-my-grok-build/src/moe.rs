@@ -37,11 +37,14 @@ const COSTS: &[(&str, f64)] = &[
     ("perplexity", 1.0),  // sonar: $1.00 / $1.00
     ("ai21", 0.3),        // jamba-1.5-mini: $0.20 in / $0.40 out
     ("deepinfra", 0.61),  // DeepSeek-V3: $0.32 in / $0.89 out
-    // Coding-assistant / harness-style providers.
-    ("opencode", 4.0),      // defaults to cloud-backed providers
-    ("hermes", 1.0),        // Together-hosted open models
-    ("pi", 5.0),            // Inflection Pi (approximate)
-    ("github-models", 6.0), // Azure-hosted OpenAI models
+    // Coding-assistant / harness-style providers. These are wrappers that
+    // forward to other providers, so their cost is an approximate midpoint
+    // of the cloud providers they can reach.
+    ("opencode", 5.0),      // multi-provider wrapper; defaults to Anthropic/OpenAI
+    ("hermes", 5.0),        // OpenRouter-recommended multi-provider wrapper
+    ("pi", 5.0),            // oh-my-pi multi-provider wrapper
+    ("omp", 5.0),           // oh-my-pi multi-provider wrapper
+    ("github-models", 5.0), // Azure-hosted OpenAI models; free tier + paid
     ("nvidia", 1.5),        // NIM Llama endpoints (approximate)
     ("sambanova", 0.8),     // Llama endpoints (approximate)
     ("lepton", 2.0),        // approximate
@@ -114,9 +117,12 @@ const FAST_IDS: &[&str] = &[
     "cohere",
 ];
 
-const CODE_HINTS: &[&str] = &[
-    "code",
-    "codellama",
+const CODE_IDS: &[&str] = &[
+    "codex",
+    "claude-code",
+    "opencode",
+    "openai",
+    "anthropic",
     "deepseek",
     "qwen",
     "mistral",
@@ -124,6 +130,9 @@ const CODE_HINTS: &[&str] = &[
     "claude",
     "gemini",
     "groq",
+    "fireworks",
+    "together",
+    "cohere",
 ];
 
 pub fn provider_cost(id: &str) -> f64 {
@@ -140,17 +149,21 @@ fn is_local_provider(id: &str) -> bool {
     LOCAL_IDS
         .iter()
         .any(|prefix| *prefix == id || id.starts_with(&format!("{prefix}-")))
+        || id == "local"
         || id.starts_with("local-")
-        || id.contains("local")
 }
 
 fn is_fast_provider(id: &str) -> bool {
-    FAST_IDS.contains(&id)
+    FAST_IDS
+        .iter()
+        .any(|k| *k == id || id.starts_with(&format!("{k}-")))
 }
 
 fn is_code_provider(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
-    CODE_HINTS.iter().any(|h| lower.contains(h))
+    CODE_IDS
+        .iter()
+        .any(|k| *k == lower || lower.starts_with(&format!("{k}-")))
 }
 
 /// Returns true when `word` appears in `task` as a whole word.
@@ -347,7 +360,9 @@ mod tests {
     fn test_provider_cost_cloud_harness_not_local() {
         assert!((provider_cost("codex") - 3.75).abs() < 1e-9);
         assert!((provider_cost("claude-code") - 9.0).abs() < 1e-9);
-        assert!((provider_cost("hermes") - 1.0).abs() < 1e-9);
+        assert!((provider_cost("hermes") - 5.0).abs() < 1e-9);
+        assert!((provider_cost("opencode") - 5.0).abs() < 1e-9);
+        assert!((provider_cost("pi") - 5.0).abs() < 1e-9);
     }
 
     #[test]

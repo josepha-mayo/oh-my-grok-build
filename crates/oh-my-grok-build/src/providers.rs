@@ -115,18 +115,26 @@ pub(crate) fn load_env_file() -> Result<HashMap<String, String>> {
 }
 
 /// Returns the set of `*_API_KEY` environment variable names that should be
-/// loaded into the process environment at startup. Includes keys referenced by
-/// configured providers/connectors plus any valid `*_API_KEY` entries already
-/// present in `~/.omgb/.env`, so catalog-based MoE routing can find keys that
-/// have not yet been persisted into a provider config.
+/// loaded into the process environment at startup. Only keys referenced by a
+/// configured provider, connector, or known catalog template are loaded, and
+/// only when a non-empty value is present in `~/.omgb/.env`. This limits the
+/// secrets exposed to child processes while still letting catalog-based MoE
+/// routing discover keys before a provider is persisted to config.
 pub(crate) fn env_keys_to_load() -> HashSet<String> {
     let mut keys = HashSet::new();
+    let mut collect = |p: &ProviderConfig| {
+        for k in valid_env_keys(p) {
+            keys.insert(k);
+        }
+    };
+
     if let Ok(cfg) = load_omg_config() {
         for p in cfg.providers.values() {
-            for k in valid_env_keys(p) {
-                keys.insert(k);
-            }
+            collect(p);
         }
+    }
+    for t in catalog::TEMPLATES {
+        collect(&t.to_provider_config());
     }
     if let Ok(dir) = omg_dir() {
         let connectors_path = dir.join("connectors.json");
@@ -147,11 +155,13 @@ pub(crate) fn env_keys_to_load() -> HashSet<String> {
             }
         }
     }
+
+    let referenced: HashSet<String> = keys.clone();
     if let Ok(path) = omg_env_path()
         && let Ok(raw) = std::fs::read_to_string(&path)
     {
         for (k, _) in parse_env_entries(&raw) {
-            if is_valid_env_key(&k) {
+            if is_valid_env_key(&k) && referenced.contains(&k) {
                 keys.insert(k);
             }
         }
@@ -236,17 +246,24 @@ fn format_env_value(value: &str) -> String {
     out
 }
 
+pub(crate) fn write_file_atomic(path: &std::path::Path, content: impl AsRef<[u8]>) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, content.as_ref())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn write_env_entries(entries: &[(String, String)]) -> Result<()> {
     let path = omg_env_path()?;
-    let dir = omg_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let mut content = String::new();
     for (k, v) in entries {
         content.push_str(&format!("{}={}\n", k, format_env_value(v)));
     }
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, &path)?;
+    write_file_atomic(&path, content)?;
     restrict_env_file_permissions(&path)
 }
 

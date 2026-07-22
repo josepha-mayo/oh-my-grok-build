@@ -80,7 +80,7 @@ omgb connect ws://127.0.0.1:9999
 - Provider API keys are written to `~/.omgb/.env` with `0600` permissions on Unix.
 - Outgoing HTTP requests are pinned to resolved public IPs and redirects are disabled to mitigate SSRF.
 - `omgb use` and `omgb browser` require explicit desktop-control gating.
-- Shell commands passed through Grok's `run_terminal_cmd` are validated by `plugin/bin/safe-shell-guard.js`.
+- Shell commands passed through Grok's `run_terminal_cmd` are validated by `plugin/bin/safe-shell-guard`.
 
 ## Development
 
@@ -88,7 +88,6 @@ omgb connect ws://127.0.0.1:9999
 cargo fmt --check -p oh-my-grok-build
 cargo clippy -p oh-my-grok-build
 cargo test -p oh-my-grok-build
-node --test plugin/bin/safe-shell-guard.test.js
 ```
 
 A release workflow in `.github/workflows/release.yml` builds `omgb` for Linux, macOS, and Windows on pushed `v*` tags.
