@@ -74,6 +74,15 @@ pub enum OmgbCommand {
     /// GitHub PR status / draft / merge-queue helpers
     #[command(subcommand)]
     Pr(PrCommand),
+    /// List or start LSP language servers
+    #[command(subcommand)]
+    Lsp(LspCommand),
+    /// List or start DAP debug adapters
+    #[command(subcommand)]
+    Dap(DapCommand),
+    /// Browse and install plugins from the marketplace
+    #[command(subcommand)]
+    Plugin(PluginCommand),
     /// Computer use prompt
     Use(UseArgs),
     /// Browser use prompt
@@ -522,6 +531,55 @@ pub struct PrCreateArgs {
     pub title: String,
     #[arg(short, long, default_value = "Generated with omgb")]
     pub body: String,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum LspCommand {
+    /// List known LSP servers
+    List,
+    /// Start an LSP server in the workspace
+    Start(LspStartArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct LspStartArgs {
+    pub server: String,
+    #[arg(short, long, default_value = ".")]
+    pub cwd: std::path::PathBuf,
+    #[arg(short, long, value_delimiter = ',')]
+    pub languages: Vec<String>,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum DapCommand {
+    /// List known debug adapters
+    List,
+    /// Start a debug adapter
+    Start(DapStartArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct DapStartArgs {
+    pub adapter: String,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub extra: Vec<String>,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum PluginCommand {
+    /// List installed plugins
+    List,
+    /// Install a plugin from a git URL or local directory
+    Install(PluginInstallArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct PluginInstallArgs {
+    /// Git URL or local directory path to the plugin
+    pub source: String,
+    /// Optional plugin name (derived from URL if omitted)
+    #[arg(short, long)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]

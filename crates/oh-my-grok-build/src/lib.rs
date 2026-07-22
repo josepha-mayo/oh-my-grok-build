@@ -15,6 +15,8 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 mod args;
 mod harness;
 mod hashline;
+mod lsp;
+mod marketplace;
 mod memory;
 mod moe;
 mod net;
@@ -115,6 +117,9 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Memory(args) => memory::run_memory(args),
         OmgbCommand::Hashline(args) => hashline::run_hashline(args),
         OmgbCommand::Pr(args) => pr::run_pr(args).await,
+        OmgbCommand::Lsp(args) => lsp::run_lsp(args).await,
+        OmgbCommand::Dap(args) => lsp::run_dap(args).await,
+        OmgbCommand::Plugin(args) => marketplace::run_plugin(args).await,
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
         OmgbCommand::Harness(args) => run_harness(args).await,
         OmgbCommand::Serve(args) => server::serve(&args).await,

@@ -14,7 +14,7 @@ use crate::args::MemoryCommand;
 
 const MEMORY_FILE: &str = "memory.jsonl";
 
-fn omgb_home() -> std::path::PathBuf {
+pub(crate) fn omgb_home() -> std::path::PathBuf {
     if let Ok(v) = std::env::var("OMGB_HOME") {
         return std::path::PathBuf::from(v);
     }
