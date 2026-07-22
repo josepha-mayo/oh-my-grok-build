@@ -32,6 +32,7 @@ quick-xml = { workspace = true }
 qrcode = { workspace = true }
 scraper = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+which = { workspace = true }
 xai-crash-handler = { path = "../codegen/xai-crash-handler" }
 xai-grok-config = { path = "../codegen/xai-grok-config" }
 xai-grok-pager = { path = "../codegen/xai-grok-pager" }

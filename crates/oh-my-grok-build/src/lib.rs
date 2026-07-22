@@ -18,6 +18,7 @@ mod hashline;
 mod memory;
 mod moe;
 mod net;
+mod pr;
 mod providers;
 mod research;
 mod scheduler;
@@ -113,6 +114,7 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Session(args) => session::run_session(args).await,
         OmgbCommand::Memory(args) => memory::run_memory(args),
         OmgbCommand::Hashline(args) => hashline::run_hashline(args),
+        OmgbCommand::Pr(args) => pr::run_pr(args).await,
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
         OmgbCommand::Harness(args) => run_harness(args).await,
         OmgbCommand::Serve(args) => server::serve(&args).await,
@@ -528,7 +530,7 @@ pub(crate) async fn run_single_turn_with(
     let full_prompt = format!("{}{}", prompt, taste::taste_preamble());
     let model = if let Some(m) = model {
         Some(m)
-    } else if let Ok(id) = moe::select_provider(prompt) {
+    } else if let Ok(id) = moe::select_provider_or_fallback(prompt).await {
         providers::ensure_provider_configured(&id)?;
         Some(format!("omgb-{id}"))
     } else {

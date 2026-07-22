@@ -11,7 +11,8 @@ use anyhow::{Result, bail};
 
 use crate::net::is_url_host_loopback;
 use crate::providers::{
-    ProviderConfig, env_var_name, is_valid_env_key, load_env_file, load_omg_config,
+    ProviderConfig, add_discovered_providers, discover_local_models, env_var_name,
+    is_valid_env_key, load_env_file, load_omg_config,
 };
 
 /// Approximate cost index per 1M tokens (input+output average) for known
@@ -273,6 +274,28 @@ pub fn select_provider_from(available: &[String], task: &str) -> Result<String> 
     });
 
     Ok(scored[0].0.clone())
+}
+
+/// Like [`select_provider`], but if no provider is configured it attempts to
+/// auto-discover a local model server (Ollama / LM Studio) and add it before
+/// choosing.
+pub async fn select_provider_or_fallback(prompt: &str) -> Result<String> {
+    match select_provider(prompt) {
+        Ok(id) => Ok(id),
+        Err(_) => {
+            let args = crate::args::DiscoverArgs {
+                ollama_url: None,
+                lmstudio_url: None,
+                add: false,
+            };
+            let discovered = discover_local_models(&args).await?;
+            if discovered.is_empty() {
+                bail!("no providers available and no local servers found");
+            }
+            add_discovered_providers(&discovered)?;
+            select_provider(prompt)
+        }
+    }
 }
 
 #[cfg(test)]

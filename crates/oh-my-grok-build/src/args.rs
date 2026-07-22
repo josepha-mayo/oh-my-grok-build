@@ -71,6 +71,9 @@ pub enum OmgbCommand {
     /// Apply hashline-anchored, token-efficient file patches
     #[command(subcommand)]
     Hashline(HashlineCommand),
+    /// GitHub PR status / draft / merge-queue helpers
+    #[command(subcommand)]
+    Pr(PrCommand),
     /// Computer use prompt
     Use(UseArgs),
     /// Browser use prompt
@@ -495,6 +498,30 @@ pub struct HashlineApplyArgs {
     /// Patch file path, or `-` to read from stdin
     #[arg(short, long, default_value = "-")]
     pub patch: String,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum PrCommand {
+    /// Show PR status for the current (or specified) branch
+    Status(PrStatusArgs),
+    /// Create a draft PR
+    CreateDraft(PrCreateArgs),
+    /// Check whether the branch's PR is in a merge queue
+    MergeQueue(PrStatusArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct PrStatusArgs {
+    #[arg(short, long)]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct PrCreateArgs {
+    #[arg(short, long)]
+    pub title: String,
+    #[arg(short, long, default_value = "Generated with omgb")]
+    pub body: String,
 }
 
 #[derive(Debug, Args, Clone)]
