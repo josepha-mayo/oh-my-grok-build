@@ -14,6 +14,7 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 
 mod args;
 mod harness;
+mod memory;
 mod moe;
 mod net;
 mod providers;
@@ -109,6 +110,7 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
                 .await
         }
         OmgbCommand::Session(args) => session::run_session(args).await,
+        OmgbCommand::Memory(args) => memory::run_memory(args),
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
         OmgbCommand::Harness(args) => run_harness(args).await,
         OmgbCommand::Serve(args) => server::serve(&args).await,
@@ -412,6 +414,7 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
         None,
         None,
         &args.session,
+        args.memory,
     )
     .await?;
     if args.commit || args.commit_untracked {
@@ -449,6 +452,7 @@ async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
         None,
         None,
         &args.session,
+        args.memory,
     )
     .await
 }
@@ -472,6 +476,7 @@ async fn run_use(args: UseArgs) -> Result<()> {
         None,
         None,
         &SessionParams::default(),
+        false,
     )
     .await
 }
@@ -500,6 +505,7 @@ async fn run_browser(args: BrowserArgs) -> Result<()> {
         Some("browser-use".to_string()),
         None,
         &SessionParams::default(),
+        false,
     )
     .await
 }
@@ -515,6 +521,7 @@ pub(crate) async fn run_single_turn_with(
     agent: Option<String>,
     cwd: Option<PathBuf>,
     session: &SessionParams,
+    memory: bool,
 ) -> Result<()> {
     let full_prompt = format!("{}{}", prompt, taste::taste_preamble());
     let model = if let Some(m) = model {
@@ -522,6 +529,11 @@ pub(crate) async fn run_single_turn_with(
     } else if let Ok(id) = moe::select_provider(prompt) {
         providers::ensure_provider_configured(&id)?;
         Some(format!("omgb-{id}"))
+    } else {
+        None
+    };
+    let rules = if memory {
+        crate::memory::recall_for_prompt(prompt, 5).ok()
     } else {
         None
     };
@@ -534,7 +546,7 @@ pub(crate) async fn run_single_turn_with(
         output_format,
         json_schema: None,
         model,
-        rules: None,
+        rules,
         system_prompt_override: None,
         continue_last_session: session.continue_last,
         fork_session: session.fork_session,
@@ -756,6 +768,7 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
             None,
             None,
             &args.session,
+            args.memory,
         )
         .await?;
 
@@ -927,6 +940,7 @@ async fn run_team(args: TeamArgs) -> Result<()> {
                 None,
                 Some(worktree.clone()),
                 &SessionParams::default(),
+                false,
             )
             .await?;
             Ok::<_, anyhow::Error>((worktree, branch))

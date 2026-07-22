@@ -121,6 +121,7 @@ async fn run_session_new(args: SessionNewArgs) -> Result<()> {
         None,
         None,
         &session,
+        args.memory,
     )
     .await
 }
@@ -149,6 +150,7 @@ async fn run_session_resume(args: SessionResumeArgs) -> Result<()> {
         None,
         None,
         &session,
+        args.memory,
     )
     .await
 }
@@ -172,6 +174,7 @@ async fn run_session_fork(args: SessionForkArgs) -> Result<()> {
         None,
         None,
         &session,
+        args.memory,
     )
     .await
 }

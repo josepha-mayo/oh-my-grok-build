@@ -65,6 +65,9 @@ pub enum OmgbCommand {
     /// List, resume, or fork persistent sessions
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Remember, recall, or manage persistent cross-session memory
+    #[command(subcommand)]
+    Memory(MemoryCommand),
     /// Computer use prompt
     Use(UseArgs),
     /// Browser use prompt
@@ -122,6 +125,9 @@ pub struct ExecArgs {
     pub commit_untracked: bool,
     #[command(flatten)]
     pub session: SessionParams,
+    /// Inject relevant cross-session memory into the prompt
+    #[arg(long)]
+    pub memory: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -142,6 +148,9 @@ pub struct LoopArgs {
     pub commit_untracked: bool,
     #[command(flatten)]
     pub session: SessionParams,
+    /// Inject relevant cross-session memory into the prompt
+    #[arg(long)]
+    pub memory: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -156,6 +165,9 @@ pub struct AutonomousArgs {
     pub yolo: bool,
     #[command(flatten)]
     pub session: SessionParams,
+    /// Inject relevant cross-session memory into the prompt
+    #[arg(long)]
+    pub memory: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -384,6 +396,9 @@ pub struct SessionResumeArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub yolo: bool,
+    /// Inject relevant cross-session memory into the prompt
+    #[arg(long)]
+    pub memory: bool,
     #[arg(long = "continue", short = 'c')]
     pub continue_last: bool,
     #[arg(long = "fork-session")]
@@ -406,6 +421,9 @@ pub struct SessionForkArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub yolo: bool,
+    /// Inject relevant cross-session memory into the prompt
+    #[arg(long)]
+    pub memory: bool,
     /// Optional follow-up prompt.
     pub prompt: Option<String>,
 }
@@ -418,8 +436,46 @@ pub struct SessionNewArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub yolo: bool,
+    /// Inject relevant cross-session memory into the prompt
+    #[arg(long)]
+    pub memory: bool,
     /// Initial prompt.
     pub prompt: String,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum MemoryCommand {
+    /// Store a note in persistent memory
+    Remember(MemoryRememberArgs),
+    /// Search memory by keyword
+    Recall(MemoryRecallArgs),
+    /// List recent memory notes
+    List(MemoryListArgs),
+    /// Deduplicate near-duplicate notes
+    Compact,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct MemoryRememberArgs {
+    /// The note to remember
+    pub content: String,
+    #[arg(short, long, value_delimiter = ',')]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct MemoryRecallArgs {
+    pub query: String,
+    #[arg(short, long, default_value = "5")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct MemoryListArgs {
+    #[arg(short, long)]
+    pub tag: Option<String>,
+    #[arg(short, long, default_value = "20")]
+    pub limit: usize,
 }
 
 #[derive(Debug, Args, Clone)]
