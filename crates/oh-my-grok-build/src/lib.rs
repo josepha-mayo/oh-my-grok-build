@@ -24,6 +24,7 @@ mod moe;
 mod net;
 mod playbook;
 mod pr;
+mod prompt_guard;
 mod providers;
 mod research;
 mod scheduler;
@@ -753,7 +754,7 @@ pub(crate) async fn run_single_turn_with(
                     Some(data),
                 );
                 maybe_auto_create_skill(tool_calls).await;
-                if yolo && let Some(ref sid) = effective_session_id {
+                if let Some(ref sid) = effective_session_id {
                     let cwd = cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -794,9 +795,15 @@ pub(crate) async fn run_single_turn_with(
     last_result
 }
 
+const TURN_SENTINEL_NAME: &str = "__omgb_turn__";
+
+fn is_turn_sentinel(call: &xai_grok_shell::sampling::ToolCall) -> bool {
+    call.name == TURN_SENTINEL_NAME
+}
+
 fn count_chat_tool_calls(session_id: &str, cwd: &std::path::Path) -> usize {
     load_chat_tool_calls(session_id, cwd)
-        .map(|v| v.len())
+        .map(|v| v.iter().filter(|c| !is_turn_sentinel(c)).count())
         .unwrap_or(0)
 }
 
@@ -804,6 +811,7 @@ fn record_session_approvals(session_id: &str, cwd: &std::path::Path) {
     if let Some(calls) = load_chat_tool_calls(session_id, cwd) {
         let tuples: Vec<_> = calls
             .into_iter()
+            .filter(|c| !is_turn_sentinel(c))
             .map(|c| (c.name, c.arguments.to_string()))
             .collect();
         let _ = crate::approvals::record_tool_calls(&tuples);
@@ -817,6 +825,7 @@ async fn record_taste_from_success(prompt: &str) {
     if let Ok(diff) = git_diff_text().await
         && !diff.trim().is_empty()
     {
+        let diff = crate::prompt_guard::limit_storage(&diff, 4096);
         let _ = crate::taste::taste_accept(prompt, &diff, vec!["auto".into()]);
     }
 }
@@ -833,6 +842,7 @@ fn record_taste_from_failure(prompt: &str, errors: &[String]) {
         .collect::<Vec<_>>()
         .join("; ");
     if !output.is_empty() {
+        let output = crate::prompt_guard::limit_storage(&output, 1024);
         let _ = crate::taste::taste_reject(prompt, &output, vec!["auto".into()]);
     }
 }
@@ -841,7 +851,7 @@ fn load_chat_tool_calls(
     session_id: &str,
     cwd: &std::path::Path,
 ) -> Option<Vec<xai_grok_shell::sampling::ToolCall>> {
-    use xai_grok_shell::sampling::{AssistantItem, ConversationItem};
+    use xai_grok_shell::sampling::{AssistantItem, ConversationItem, ToolCall};
 
     let sessions_cwd = xai_grok_shell::util::grok_home::sessions_cwd_dir(&cwd.to_string_lossy());
     let path = sessions_cwd.join(session_id).join("chat_history.jsonl");
@@ -857,6 +867,13 @@ fn load_chat_tool_calls(
             serde_json::from_str::<ConversationItem>(line)
         {
             calls.extend(tool_calls);
+            // Sentinel so a following assistant turn breaks a tool-call streak.
+            let id = uuid::Uuid::new_v4().to_string();
+            calls.push(ToolCall {
+                id: id.clone().into(),
+                name: TURN_SENTINEL_NAME.into(),
+                arguments: id.into(),
+            });
         }
     }
     Some(calls)

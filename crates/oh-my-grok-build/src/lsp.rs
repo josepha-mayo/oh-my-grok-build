@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -175,7 +176,11 @@ impl JsonRpcClient {
         let id = self.next_id;
         self.next_id += 1;
         self.write(&lsp_request_payload(id, method, params)).await?;
-        self.wait_lsp_response(id).await
+        match tokio::time::timeout(Duration::from_secs(30), self.wait_lsp_response(id)).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(e)) => Err(e),
+            Err(_) => bail!("LSP request '{method}' timed out after 30s"),
+        }
     }
 
     async fn lsp_notify(&mut self, method: &str, params: serde_json::Value) -> Result<()> {
@@ -191,7 +196,16 @@ impl JsonRpcClient {
         self.next_id += 1;
         self.write(&dap_request_payload(seq, command, arguments))
             .await?;
-        self.wait_dap_response(seq, command).await
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.wait_dap_response(seq, command),
+        )
+        .await
+        {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(e)) => Err(e),
+            Err(_) => bail!("DAP request '{command}' timed out after 30s"),
+        }
     }
 
     async fn write(&mut self, msg: &serde_json::Value) -> Result<()> {
@@ -436,6 +450,10 @@ pub async fn dap_attach(program: &Path, pid: u32, extra_args: &[String]) -> Resu
     });
     for arg in extra_args {
         if let Some((k, v)) = arg.split_once('=')
+            && !k.is_empty()
+            && !v.is_empty()
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
             && let Some(obj) = attach_args.as_object_mut()
         {
             obj.insert(k.to_string(), json!(v));

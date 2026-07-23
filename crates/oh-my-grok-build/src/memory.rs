@@ -5,8 +5,10 @@
 //! it works without embedding providers or a build dependency on sqlite-vec.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::args::MemoryCommand;
@@ -14,8 +16,37 @@ use crate::args::MemoryCommand;
 const MEMORY_FILE: &str = "memory.jsonl";
 const ONE_SHOT_FILE: &str = "one_shot_journal.jsonl";
 
-fn memory_path() -> Result<std::path::PathBuf> {
+fn memory_path() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join(MEMORY_FILE))
+}
+
+fn one_shot_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join(ONE_SHOT_FILE))
+}
+
+fn lock_for(path: &Path) -> PathBuf {
+    path.with_extension("jsonl.lock")
+}
+
+fn with_file_lock<R>(path: &Path, exclusive: bool, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    let lock = lock_for(path);
+    if let Some(parent) = lock.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock)?;
+    if exclusive {
+        file.lock_exclusive()?;
+    } else {
+        file.lock_shared()?;
+    }
+    let result = f();
+    let _ = file.unlock();
+    result
 }
 
 fn ensure_store() -> Result<()> {
@@ -76,10 +107,6 @@ fn save_notes(notes: &[MemoryNote]) -> Result<()> {
     crate::providers::write_file_atomic(&path, content, true)
 }
 
-fn one_shot_path() -> Result<std::path::PathBuf> {
-    Ok(crate::providers::omg_dir()?.join(ONE_SHOT_FILE))
-}
-
 fn load_one_shots() -> Result<Vec<OneShotNote>> {
     let path = one_shot_path()?;
     if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
@@ -131,41 +158,50 @@ fn score_one_shot(note: &OneShotNote, terms: &[String]) -> usize {
 }
 
 pub fn remember(content: &str, tags: &[String]) -> Result<MemoryNote> {
-    let mut notes = load_notes()?;
-    let note = MemoryNote {
-        id: uuid::Uuid::new_v4().to_string(),
-        created_at: now(),
-        tags: tags.to_vec(),
-        content: content.to_string(),
-        access_count: 0,
-    };
-    notes.push(note.clone());
-    save_notes(&notes)?;
-    Ok(note)
+    let path = memory_path()?;
+    with_file_lock(&path, true, || {
+        let mut notes = load_notes()?;
+        let note = MemoryNote {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: now(),
+            tags: tags.to_vec(),
+            content: content.to_string(),
+            access_count: 0,
+        };
+        notes.push(note.clone());
+        save_notes(&notes)?;
+        Ok(note)
+    })
 }
 
 pub fn remember_one_shot(topic: &str, detail: &str) -> Result<OneShotNote> {
-    let mut notes = load_one_shots()?;
-    let note = OneShotNote {
-        id: uuid::Uuid::new_v4().to_string(),
-        created_at: now(),
-        topic: topic.to_string(),
-        detail: detail.to_string(),
-        seen: false,
-    };
-    notes.push(note.clone());
-    save_one_shots(&notes)?;
-    Ok(note)
+    let path = one_shot_path()?;
+    with_file_lock(&path, true, || {
+        let mut notes = load_one_shots()?;
+        let note = OneShotNote {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: now(),
+            topic: topic.to_string(),
+            detail: detail.to_string(),
+            seen: false,
+        };
+        notes.push(note.clone());
+        save_one_shots(&notes)?;
+        Ok(note)
+    })
 }
 
 pub fn list(tag: Option<&str>, limit: usize) -> Result<Vec<MemoryNote>> {
-    let mut notes = load_notes()?;
-    notes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(notes
-        .into_iter()
-        .filter(|n| tag.is_none_or(|t| n.tags.iter().any(|x| x == t)))
-        .take(limit)
-        .collect())
+    let path = memory_path()?;
+    with_file_lock(&path, false, || {
+        let mut notes = load_notes()?;
+        notes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(notes
+            .into_iter()
+            .filter(|n| tag.is_none_or(|t| n.tags.iter().any(|x| x == t)))
+            .take(limit)
+            .collect())
+    })
 }
 
 pub fn recall(query: &str, limit: usize) -> Result<Vec<MemoryNote>> {
@@ -173,51 +209,57 @@ pub fn recall(query: &str, limit: usize) -> Result<Vec<MemoryNote>> {
     if terms.is_empty() {
         return list(None, limit);
     }
-    let notes = load_notes()?;
-    let mut scored: Vec<(usize, MemoryNote)> = notes
-        .into_iter()
-        .filter_map(|n| {
-            let score = score_note(&n, &terms);
-            if score > 0 { Some((score, n)) } else { None }
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.1.created_at.cmp(&a.1.created_at))
-    });
-    Ok(scored.into_iter().map(|(_, n)| n).take(limit).collect())
+    let path = memory_path()?;
+    with_file_lock(&path, false, || {
+        let notes = load_notes()?;
+        let mut scored: Vec<(usize, MemoryNote)> = notes
+            .into_iter()
+            .filter_map(|n| {
+                let score = score_note(&n, &terms);
+                if score > 0 { Some((score, n)) } else { None }
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.created_at.cmp(&a.1.created_at))
+        });
+        Ok(scored.into_iter().map(|(_, n)| n).take(limit).collect())
+    })
 }
 
 pub fn recall_one_shot(topic: &str, n: usize) -> Result<Vec<OneShotNote>> {
-    let mut notes = load_one_shots()?;
-    let terms = tokenize(topic);
-    let empty = terms.is_empty();
-    let mut candidates: Vec<(usize, i64, usize)> = notes
-        .iter()
-        .enumerate()
-        .filter(|(_, note)| !note.seen)
-        .map(|(i, note)| {
-            let score = if empty {
-                0
-            } else {
-                score_one_shot(note, &terms)
-            };
-            (score, note.created_at, i)
-        })
-        .filter(|(score, _, _)| empty || *score > 0)
-        .collect();
-    candidates.sort_by(|a, b| b.cmp(a));
-    let selected: Vec<usize> = candidates.into_iter().take(n).map(|(_, _, i)| i).collect();
-    if selected.is_empty() {
-        return Ok(Vec::new());
-    }
-    for &i in &selected {
-        notes[i].seen = true;
-    }
-    let returned: Vec<OneShotNote> = selected.iter().map(|&i| notes[i].clone()).collect();
-    notes.retain(|note| !note.seen);
-    save_one_shots(&notes)?;
-    Ok(returned)
+    let path = one_shot_path()?;
+    with_file_lock(&path, true, || {
+        let mut notes = load_one_shots()?;
+        let terms = tokenize(topic);
+        let empty = terms.is_empty();
+        let mut candidates: Vec<(usize, i64, usize)> = notes
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| !note.seen)
+            .map(|(i, note)| {
+                let score = if empty {
+                    0
+                } else {
+                    score_one_shot(note, &terms)
+                };
+                (score, note.created_at, i)
+            })
+            .filter(|(score, _, _)| empty || *score > 0)
+            .collect();
+        candidates.sort_by(|a, b| b.cmp(a));
+        let selected: Vec<usize> = candidates.into_iter().take(n).map(|(_, _, i)| i).collect();
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        for &i in &selected {
+            notes[i].seen = true;
+        }
+        let returned: Vec<OneShotNote> = selected.iter().map(|&i| notes[i].clone()).collect();
+        notes.retain(|note| !note.seen);
+        save_one_shots(&notes)?;
+        Ok(returned)
+    })
 }
 
 #[allow(dead_code)]
@@ -263,33 +305,36 @@ pub fn recall_for_prompt_with_one_shot(
 }
 
 pub fn compact() -> Result<usize> {
-    let mut notes = load_notes()?;
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut duplicates: Vec<(usize, usize)> = Vec::new();
-    for (i, n) in notes.iter().enumerate() {
-        let key = n.content.trim().to_lowercase();
-        if let Some(prev) = seen.get(&key).copied() {
-            duplicates.push((prev, i));
-        } else {
-            seen.insert(key, i);
+    let path = memory_path()?;
+    with_file_lock(&path, true, || {
+        let mut notes = load_notes()?;
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut duplicates: Vec<(usize, usize)> = Vec::new();
+        for (i, n) in notes.iter().enumerate() {
+            let key = n.content.trim().to_lowercase();
+            if let Some(prev) = seen.get(&key).copied() {
+                duplicates.push((prev, i));
+            } else {
+                seen.insert(key, i);
+            }
         }
-    }
-    for (keep, dup) in duplicates {
-        let merged = {
-            let mut t = notes[keep].tags.clone();
-            t.extend(notes[dup].tags.clone());
-            t.sort();
-            t.dedup();
-            t
-        };
-        notes[keep].tags = merged;
-        notes[keep].created_at = notes[keep].created_at.max(notes[dup].created_at);
-        notes[dup].content.clear();
-    }
-    let before = notes.len();
-    notes.retain(|n| !n.content.is_empty());
-    save_notes(&notes)?;
-    Ok(before - notes.len())
+        for (keep, dup) in duplicates {
+            let merged = {
+                let mut t = notes[keep].tags.clone();
+                t.extend(notes[dup].tags.clone());
+                t.sort();
+                t.dedup();
+                t
+            };
+            notes[keep].tags = merged;
+            notes[keep].created_at = notes[keep].created_at.max(notes[dup].created_at);
+            notes[dup].content.clear();
+        }
+        let before = notes.len();
+        notes.retain(|n| !n.content.is_empty());
+        save_notes(&notes)?;
+        Ok(before - notes.len())
+    })
 }
 
 pub fn run_memory(cmd: MemoryCommand) -> Result<()> {

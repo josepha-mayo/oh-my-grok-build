@@ -97,10 +97,10 @@ fn extract_pattern(tool: &str, args: &str) -> Option<String> {
     let value: serde_json::Value =
         serde_json::from_str(args).unwrap_or(serde_json::Value::String(args.to_string()));
     match tool {
-        "Bash" | "Monitor" => value.get("command").and_then(|v| v.as_str()).map(|s| {
-            let cmd = s.trim();
-            format!("{}:*", cmd)
-        }),
+        "Bash" | "Monitor" => value
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
         "Read" | "Edit" => value
             .get("file_path")
             .or_else(|| value.get("path"))
@@ -164,18 +164,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bash_pattern_uses_command_with_colon_wildcard() {
+    fn bash_pattern_uses_exact_command() {
         assert_eq!(
             extract_pattern("Bash", r#"{"command":"rm -rf /"}"#),
-            Some("rm -rf /:*".into())
+            Some("rm -rf /".into())
         );
         assert_eq!(
             extract_pattern("Bash", r#"{"command":"git status"}"#),
-            Some("git status:*".into())
+            Some("git status".into())
         );
         assert_eq!(
             extract_pattern("Bash", r#"{"command":"rm"}"#),
-            Some("rm:*".into())
+            Some("rm".into())
         );
     }
 
@@ -205,7 +205,7 @@ mod tests {
         let approvals = vec![
             Approval {
                 tool: "Bash".into(),
-                pattern: "rm -rf /:*".into(),
+                pattern: "rm -rf /".into(),
                 expires_at: None,
             },
             Approval {
@@ -215,7 +215,7 @@ mod tests {
             },
         ];
         let rules = to_allow_rules(&approvals);
-        assert!(rules.contains(&"Bash(rm -rf /:*)".into()));
+        assert!(rules.contains(&"Bash(rm -rf /)".into()));
         assert!(rules.contains(&"Read(src/main.rs)".into()));
     }
 

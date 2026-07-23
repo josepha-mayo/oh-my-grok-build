@@ -1,10 +1,12 @@
 //! Auto skill creation and retrieval for `omgb`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::prompt_guard;
 use crate::timeline::TimelineEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -147,13 +149,24 @@ pub fn list_skills() -> Result<Vec<Skill>> {
     Ok(skills)
 }
 
+fn path_components(path: &str) -> Vec<String> {
+    path.split(['/', '\\'])
+        .map(|s| s.to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn trigger_matches(cwd: &str, trigger: &str) -> bool {
     if trigger.is_empty() {
         return true;
     }
-    let cwd = cwd.replace('\\', "/").to_lowercase();
-    let trigger = trigger.replace('\\', "/").to_lowercase();
-    cwd.contains(&trigger)
+    let cwd = path_components(cwd);
+    let trigger = path_components(trigger);
+    if trigger.len() == 1 {
+        cwd.iter().any(|c| c == &trigger[0])
+    } else {
+        cwd.windows(trigger.len()).any(|w| w == trigger.as_slice())
+    }
 }
 
 /// Return a markdown string of skills whose trigger matches the current directory.
@@ -165,25 +178,29 @@ pub fn skill_preamble() -> String {
         Ok(s) => s,
         Err(_) => return String::new(),
     };
-    let relevant: Vec<_> = skills
+    let mut relevant = Vec::new();
+    for s in skills
         .into_iter()
         .filter(|s| trigger_matches(&cwd, &s.trigger))
-        .map(|s| {
-            let path = &s.path;
-            let body = if path.exists() {
-                if let Ok(text) = std::fs::read_to_string(path) {
-                    split_frontmatter(&text)
-                        .map(|(_, b)| b.to_string())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-            format!("# {}\n\n{}", s.name, body.trim())
-        })
-        .collect();
+    {
+        let Some(name) = prompt_guard::sanitize_inline(&s.name, 120) else {
+            continue;
+        };
+        let body = if s.path.exists() {
+            std::fs::read_to_string(&s.path)
+                .ok()
+                .and_then(|text| split_frontmatter(&text).map(|(_, b)| b.to_string()))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let Some(body) = prompt_guard::sanitize_skill_body(&body, 2000) else {
+            continue;
+        };
+        if !body.is_empty() {
+            relevant.push(format!("# {name}\n\n{body}"));
+        }
+    }
     if relevant.is_empty() {
         String::new()
     } else {
@@ -245,16 +262,12 @@ fn run_has_success(run: &[TimelineEvent]) -> bool {
 fn summarize_run(run: &[TimelineEvent]) -> String {
     run.iter()
         .map(|e| {
-            let mut line = format!(
+            format!(
                 "{} [{}] {}",
                 e.timestamp.to_rfc3339(),
                 e.category,
                 e.message
-            );
-            if let Some(data) = &e.data {
-                line.push_str(&format!(" | {data}"));
-            }
-            line
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -291,7 +304,11 @@ async fn llm_generate(prompt: &str) -> Result<String> {
         .env_remove("OMGB_AUTO_SKILL")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let out = cmd.output().await?;
+    let out = match tokio::time::timeout(Duration::from_secs(120), cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => bail!("skill generation subprocess failed: {e}"),
+        Err(_) => bail!("skill generation timed out after 120s"),
+    };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("skill generation failed: {stderr}");

@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 const IS_WINDOWS: bool = cfg!(windows);
 
@@ -534,17 +535,102 @@ fn has_unsafe_env_assignment(token: &Token) -> Option<String> {
     })
 }
 
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn omg_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".omgb"))
+}
+
+fn normalize_folders<'a>(iter: impl Iterator<Item = &'a str>) -> Vec<String> {
+    iter.map(|s| {
+        let mut s = s.replace('\\', "/").trim_end_matches('/').to_string();
+        if !s.is_empty() && !s.ends_with('/') {
+            s.push('/');
+        }
+        s.to_lowercase()
+    })
+    .filter(|s| {
+        !s.is_empty()
+            && (s.starts_with('/')
+                || (IS_WINDOWS && s.len() > 2 && s.as_bytes().get(1) == Some(&b':')))
+    })
+    .collect()
+}
+
+fn trusted_folders() -> Vec<String> {
+    if let Ok(raw) = std::env::var("OMGB_TRUSTED_FOLDERS") {
+        return normalize_folders(raw.split(';'));
+    }
+    let path = omg_dir().map(|d| d.join("trusted_folders.json"));
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    normalize_folders(arr.iter().filter_map(|v| v.as_str()))
+}
+
+fn current_dir() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn normalize_path(cwd: &str, p: &str) -> Option<String> {
+    let p = p.replace('\\', "/");
+    let joined = if p.starts_with('/')
+        || (IS_WINDOWS && p.len() > 1 && p.as_bytes().get(1) == Some(&b':'))
+    {
+        PathBuf::from(&p)
+    } else {
+        PathBuf::from(cwd).join(&p)
+    };
+    let normalized: PathBuf = joined.components().collect();
+    let mut s = normalized.to_string_lossy().replace('\\', "/");
+    if !s.ends_with('/') {
+        s.push('/');
+    }
+    Some(s.to_lowercase())
+}
+
+fn is_path_trusted(cwd: &str, p: &str, trusted: &[String]) -> bool {
+    let Some(normalized) = normalize_path(cwd, p) else {
+        return false;
+    };
+    trusted.iter().any(|t| normalized.starts_with(t))
+}
+
 fn is_project_hook_command(cmd: &str) -> bool {
-    HOOK_DIR_MARKERS.iter().any(|m| cmd.contains(m))
+    let norm = cmd.replace('\\', "/");
+    HOOK_DIR_MARKERS.iter().any(|m| norm.contains(m))
 }
 
-fn check_source(_tokens: &[Token], _i: usize) -> Decision {
-    // Sourcing any shell script can execute arbitrary code; block unconditionally.
-    Decision::Deny("Blocked sourced script".into())
+fn check_source(tokens: &[Token], i: usize) -> Decision {
+    let Some(token) = tokens.get(i + 1) else {
+        return Decision::Deny("Blocked sourced script (no path)".into());
+    };
+    if is_path_trusted(&current_dir(), &token.value, &trusted_folders()) {
+        Decision::Allow
+    } else {
+        Decision::Deny("Blocked sourced script (not under a trusted folder)".into())
+    }
 }
 
-fn check_project_hook(_cmd: &str) -> Decision {
-    Decision::Deny("Blocked project hook".into())
+fn check_project_hook(cmd: &str) -> Decision {
+    if is_path_trusted(&current_dir(), cmd, &trusted_folders()) {
+        Decision::Allow
+    } else {
+        Decision::Deny("Blocked project hook (not under a trusted folder)".into())
+    }
 }
 
 fn is_git_alias_value(v: &str) -> bool {
@@ -2407,5 +2493,36 @@ mod tests {
         deny(".grok/hooks/pre-commit", "Blocked project hook");
         deny(".omgb/hooks/build", "Blocked project hook");
         deny("/etc/.grok/hooks/evil", "Blocked project hook");
+    }
+
+    #[test]
+    fn trusted_project_hooks_allowed() {
+        let trusted = vec!["c:/projects/".to_string()];
+        let cwd = "c:\\projects";
+        assert!(is_path_trusted(
+            cwd,
+            "c:\\projects\\.grok\\hooks\\pre-commit",
+            &trusted
+        ));
+        assert!(!is_path_trusted(
+            cwd,
+            "c:\\other\\.grok\\hooks\\pre-commit",
+            &trusted
+        ));
+    }
+
+    #[test]
+    fn trusted_sourced_scripts_allowed() {
+        let trusted = vec!["/home/user/projects/".to_string()];
+        assert!(is_path_trusted(
+            "/home/user/projects",
+            "/home/user/projects/run.sh",
+            &trusted
+        ));
+        assert!(!is_path_trusted(
+            "/home/user/projects",
+            "/tmp/run.sh",
+            &trusted
+        ));
     }
 }

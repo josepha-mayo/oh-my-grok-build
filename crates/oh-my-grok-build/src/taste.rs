@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+
+use crate::prompt_guard;
 
 fn taste_path() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join("taste.json"))
@@ -42,7 +45,32 @@ pub struct TasteEdit {
     pub tags: Vec<String>,
 }
 
-fn load_store() -> Result<TasteStore> {
+fn taste_lock_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("taste.json.lock"))
+}
+
+fn with_store_lock<R>(exclusive: bool, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    let lock = taste_lock_path()?;
+    if let Some(parent) = lock.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock)?;
+    if exclusive {
+        file.lock_exclusive()?;
+    } else {
+        file.lock_shared()?;
+    }
+    let result = f();
+    let _ = file.unlock();
+    result
+}
+
+fn load_store_raw() -> Result<TasteStore> {
     let path = taste_path()?;
     if !path.exists() {
         return Ok(TasteStore::default());
@@ -51,7 +79,7 @@ fn load_store() -> Result<TasteStore> {
     serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
-fn save_store(store: &TasteStore) -> Result<()> {
+fn save_store_raw(store: &TasteStore) -> Result<()> {
     let path = taste_path()?;
     crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(store)?, true)
 }
@@ -71,69 +99,70 @@ fn topic_from_prompt(prompt: &str) -> String {
     }
 }
 
-fn snippet(text: &str) -> String {
-    if text.len() <= 80 {
-        text.into()
-    } else {
-        let end = text.char_indices().nth(77).map(|(i, _)| i).unwrap_or(77);
-        format!("{}...", &text[..end])
-    }
-}
-
 pub fn add_like(note: &str) -> Result<()> {
-    let mut store = load_store()?;
-    store.likes.push(TasteNote {
-        timestamp: Utc::now(),
-        note: note.to_string(),
-    });
-    save_store(&store)
+    with_store_lock(true, || {
+        let mut store = load_store_raw()?;
+        store.likes.push(TasteNote {
+            timestamp: Utc::now(),
+            note: prompt_guard::limit_storage(note, 1000),
+        });
+        save_store_raw(&store)
+    })
 }
 
 pub fn add_dislike(note: &str) -> Result<()> {
-    let mut store = load_store()?;
-    store.dislikes.push(TasteNote {
-        timestamp: Utc::now(),
-        note: note.to_string(),
-    });
-    save_store(&store)
+    with_store_lock(true, || {
+        let mut store = load_store_raw()?;
+        store.dislikes.push(TasteNote {
+            timestamp: Utc::now(),
+            note: prompt_guard::limit_storage(note, 1000),
+        });
+        save_store_raw(&store)
+    })
 }
 
 pub fn taste_accept(prompt: &str, output: &str, tags: Vec<String>) -> Result<()> {
-    let mut store = load_store()?;
-    store.accepted.push(TasteOutput {
-        timestamp: Utc::now(),
-        topic: topic_from_prompt(prompt),
-        output: output.to_string(),
-        tags,
-    });
-    save_store(&store)
+    with_store_lock(true, || {
+        let mut store = load_store_raw()?;
+        store.accepted.push(TasteOutput {
+            timestamp: Utc::now(),
+            topic: topic_from_prompt(prompt),
+            output: prompt_guard::limit_storage(output, 4096),
+            tags,
+        });
+        save_store_raw(&store)
+    })
 }
 
 pub fn taste_reject(prompt: &str, output: &str, tags: Vec<String>) -> Result<()> {
-    let mut store = load_store()?;
-    store.rejected.push(TasteOutput {
-        timestamp: Utc::now(),
-        topic: topic_from_prompt(prompt),
-        output: output.to_string(),
-        tags,
-    });
-    save_store(&store)
+    with_store_lock(true, || {
+        let mut store = load_store_raw()?;
+        store.rejected.push(TasteOutput {
+            timestamp: Utc::now(),
+            topic: topic_from_prompt(prompt),
+            output: prompt_guard::limit_storage(output, 4096),
+            tags,
+        });
+        save_store_raw(&store)
+    })
 }
 
 pub fn taste_edit(prompt: &str, before: &str, after: &str, tags: Vec<String>) -> Result<()> {
-    let mut store = load_store()?;
-    store.edited.push(TasteEdit {
-        timestamp: Utc::now(),
-        topic: topic_from_prompt(prompt),
-        before: before.to_string(),
-        after: after.to_string(),
-        tags,
-    });
-    save_store(&store)
+    with_store_lock(true, || {
+        let mut store = load_store_raw()?;
+        store.edited.push(TasteEdit {
+            timestamp: Utc::now(),
+            topic: topic_from_prompt(prompt),
+            before: prompt_guard::limit_storage(before, 2048),
+            after: prompt_guard::limit_storage(after, 2048),
+            tags,
+        });
+        save_store_raw(&store)
+    })
 }
 
 pub fn list_taste() -> Result<()> {
-    let store = load_store()?;
+    let store = with_store_lock(false, load_store_raw)?;
     if store.likes.is_empty()
         && store.dislikes.is_empty()
         && store.accepted.is_empty()
@@ -195,24 +224,39 @@ fn build_style_rules(store: &TasteStore) -> Vec<String> {
     let mut rules = Vec::new();
 
     for n in store.likes.iter().rev().take(5) {
-        rules.push(format!("Prefer {}", n.note));
+        if let Some(note) = prompt_guard::sanitize_inline(&n.note, 200) {
+            rules.push(format!("Prefer {note}"));
+        }
     }
     for n in store.dislikes.iter().rev().take(5) {
-        rules.push(format!("Avoid {}", n.note));
+        if let Some(note) = prompt_guard::sanitize_inline(&n.note, 200) {
+            rules.push(format!("Avoid {note}"));
+        }
     }
     for e in store.accepted.iter().rev().take(5) {
-        rules.push(format!("Always do {}: {}", e.topic, snippet(&e.output)));
+        if let (Some(topic), Some(output)) = (
+            prompt_guard::sanitize_inline(&e.topic, 80),
+            prompt_guard::sanitize_inline(&e.output, 80),
+        ) {
+            rules.push(format!("Always do {topic}: {output}"));
+        }
     }
     for e in store.rejected.iter().rev().take(5) {
-        rules.push(format!("Avoid {}: {}", e.topic, snippet(&e.output)));
+        if let (Some(topic), Some(output)) = (
+            prompt_guard::sanitize_inline(&e.topic, 80),
+            prompt_guard::sanitize_inline(&e.output, 80),
+        ) {
+            rules.push(format!("Avoid {topic}: {output}"));
+        }
     }
     for e in store.edited.iter().rev().take(5) {
-        rules.push(format!(
-            "Prefer {} over {} for {}",
-            snippet(&e.after),
-            snippet(&e.before),
-            e.topic
-        ));
+        if let (Some(after), Some(before), Some(topic)) = (
+            prompt_guard::sanitize_inline(&e.after, 80),
+            prompt_guard::sanitize_inline(&e.before, 80),
+            prompt_guard::sanitize_inline(&e.topic, 80),
+        ) {
+            rules.push(format!("Prefer {after} over {before} for {topic}"));
+        }
     }
 
     rules
@@ -220,7 +264,7 @@ fn build_style_rules(store: &TasteStore) -> Vec<String> {
 
 /// Returns a short prompt preamble derived from stored preferences.
 pub fn taste_preamble() -> String {
-    let Ok(store) = load_store() else {
+    let Ok(store) = with_store_lock(false, load_store_raw) else {
         return String::new();
     };
     let rules = build_style_rules(&store);

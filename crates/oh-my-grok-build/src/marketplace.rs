@@ -550,16 +550,22 @@ async fn refresh_one(name: &str, path: &Path, source: &str, sha: Option<&str>) -
     let parent = path.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(".refresh-{name}-{}", uuid::Uuid::new_v4()));
+    let backup = parent.join(format!(".backup-{name}-{}", uuid::Uuid::new_v4()));
 
     clone_plugin(source, &tmp, sha).await?;
 
-    if let Err(e) = std::fs::remove_dir_all(path) {
+    if let Err(e) = std::fs::rename(path, &backup) {
         let _ = std::fs::remove_dir_all(&tmp);
-        bail!("failed to remove old plugin {name}: {e}");
+        bail!("failed to backup old plugin {name}: {e}");
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::rename(&backup, path);
         let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&backup);
         bail!("failed to move refreshed plugin {name}: {e}");
+    }
+    if let Err(e) = std::fs::remove_dir_all(&backup) {
+        eprintln!("warning: failed to remove old plugin backup {name}: {e}");
     }
 
     let meta = SourceMeta {
