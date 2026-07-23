@@ -128,7 +128,43 @@ const UNSAFE_ENV_KEYS: &[&str] = &[
 
 const HOOK_DIR_MARKERS: &[&str] = &[".grok/hooks", ".omgb/hooks"];
 
-const GIT_DANGEROUS_SUBCOMMANDS: &[&str] = &["clean", "reset", "submodule", "filter-repo"];
+const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "branch",
+    "checkout",
+    "clone",
+    "commit",
+    "config",
+    "diff",
+    "fetch",
+    "init",
+    "log",
+    "merge",
+    "mv",
+    "pull",
+    "push",
+    "rebase",
+    "remote",
+    "reset",
+    "restore",
+    "rev-parse",
+    "rm",
+    "show",
+    "stash",
+    "status",
+    "switch",
+    "tag",
+    "worktree",
+];
+
+const GIT_GLOBAL_OPTS_WITH_VALUES: &[&str] = &[
+    "-C",
+    "--work-tree",
+    "--git-dir",
+    "--namespace",
+    "--super-prefix",
+    "--exec-path",
+];
 
 const NORMALIZABLE_STEMS: &[&str] = &[
     "python",
@@ -511,27 +547,132 @@ fn check_project_hook(_cmd: &str) -> Decision {
     Decision::Deny("Blocked project hook".into())
 }
 
+fn is_git_alias_value(v: &str) -> bool {
+    v.starts_with('!') || (v.contains('!') && v.contains("alias."))
+}
+
 fn check_git(tokens: &[Token], start: usize) -> Decision {
-    for token in tokens.iter().skip(start + 1) {
-        if token.quoted.is_some() {
+    let mut i = start + 1;
+    let mut skip_value = false;
+
+    // Scan global options/flags until we reach the subcommand.
+    while i < tokens.len() {
+        if skip_value {
+            i += 1;
+            skip_value = false;
             continue;
         }
+        let token = &tokens[i];
         let v = &token.value;
+
         if v.starts_with("--config") || v == "-c" {
             return Decision::Deny("git -c/--config can run arbitrary commands".into());
         }
-        if v.contains('!') {
+        if is_git_alias_value(v) {
             return Decision::Deny("git aliases with '!' execute arbitrary commands".into());
         }
-        if GIT_DANGEROUS_SUBCOMMANDS.contains(&v.as_str()) {
-            return Decision::Deny(format!("Blocked dangerous git subcommand: {v}"));
+
+        // Skip global options that take a value (e.g. -C src).
+        if GIT_GLOBAL_OPTS_WITH_VALUES.contains(&v.as_str()) {
+            skip_value = true;
+            i += 1;
+            continue;
         }
+        if let Some((name, _)) = v.split_once('=')
+            && GIT_GLOBAL_OPTS_WITH_VALUES.contains(&name)
+        {
+            i += 1;
+            continue;
+        }
+
+        if v.starts_with('-') {
+            i += 1;
+            continue;
+        }
+
+        // First non-option token is the subcommand; it must be on the allowlist.
+        if !GIT_ALLOWED_SUBCOMMANDS.contains(&v.as_str()) {
+            return Decision::Deny(format!("Blocked git subcommand: {v}"));
+        }
+
+        // Scan the remainder of the command for dangerous options/aliases.
+        let sub = v.as_str();
+        i += 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            let u = &t.value;
+            if t.quoted.is_some() {
+                if is_git_alias_value(u) {
+                    return Decision::Deny(
+                        "git aliases with '!' execute arbitrary commands".into(),
+                    );
+                }
+                i += 1;
+                continue;
+            }
+            if u.starts_with("--config") || u == "-c" {
+                return Decision::Deny("git -c/--config can run arbitrary commands".into());
+            }
+            if is_git_alias_value(u) {
+                return Decision::Deny("git aliases with '!' execute arbitrary commands".into());
+            }
+            if sub == "rebase" && (u == "-x" || u == "--exec" || u.starts_with("--exec=")) {
+                return Decision::Deny("git rebase --exec runs arbitrary commands".into());
+            }
+            if sub == "rebase" && (u == "-i" || u == "--interactive") {
+                return Decision::Deny("git rebase -i requires an interactive terminal".into());
+            }
+            i += 1;
+        }
+        return Decision::Allow;
     }
     Decision::Allow
 }
 
 fn has_bare_tilde(token: &Token) -> bool {
     token.quoted.is_none() && token.value.contains('~')
+}
+
+fn is_valid_env_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn check_export_like(tokens: &[Token], i: usize, base: &str) -> Option<Decision> {
+    const EXPORT_LIKE: &[&str] = &[
+        "export", "setenv", "declare", "typeset", "local", "readonly",
+    ];
+    if !EXPORT_LIKE.contains(&base) {
+        return None;
+    }
+    let mut saw_first = false;
+    for t in tokens.iter().skip(i + 1) {
+        let v = &t.value;
+        if v.starts_with('-') || v.starts_with('+') {
+            continue;
+        }
+        // setenv takes exactly one variable name; the rest are values.
+        if base == "setenv" && saw_first {
+            continue;
+        }
+        saw_first = true;
+        if let Some(key) = assignment_key(v) {
+            if is_valid_env_identifier(key) && is_unsafe_env_key(key) {
+                return Some(Decision::Deny(format!(
+                    "Blocked unsafe environment variable: {key}"
+                )));
+            }
+        } else if is_valid_env_identifier(v) && is_unsafe_env_key(v) {
+            return Some(Decision::Deny(format!(
+                "Blocked unsafe environment variable: {v}"
+            )));
+        }
+    }
+    None
 }
 
 fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
@@ -548,108 +689,119 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
     if i >= tokens.len() {
         return Decision::Allow;
     }
-    match skip_prefix(tokens, i) {
-        PrefixOutcome::Stop(decision) => decision,
-        PrefixOutcome::Continue(idx) => {
-            i = idx;
-            if i >= tokens.len() {
-                return Decision::Allow;
-            }
-            let cmd_token = &tokens[i];
-            let base = get_base_name(&cmd_token.value);
-
-            if base == "git" {
-                return check_git(tokens, i);
-            }
-
-            if is_project_hook_command(&cmd_token.value) {
-                return check_project_hook(&cmd_token.value);
-            }
-
-            if base == "source" || base == "." {
-                return check_source(tokens, i);
-            }
-
-            if base != "rm" && base != "cd" {
-                for token in tokens.iter().skip(i) {
-                    if has_bare_tilde(token) {
-                        return Decision::Deny("Blocked tilde expansion outside quotes".into());
-                    }
+    // Resolve chained prefixes such as `nice env rm -rf /` or `builtin bash -c ...`.
+    loop {
+        match skip_prefix(tokens, i) {
+            PrefixOutcome::Stop(decision) => return decision,
+            PrefixOutcome::Continue(idx) => {
+                if idx == i {
+                    break;
                 }
-            }
-
-            let compact: String = cmd_token.value.split_whitespace().collect();
-            if compact.contains(":(){:|:&};") {
-                return Decision::Deny("Blocked fork bomb".into());
-            }
-
-            if UNANALYZABLE_COMMANDS.contains(&base.as_str()) {
-                return Decision::Deny(format!("Blocked unanalyzable command: {}", base));
-            }
-            if DANGEROUS_COMMANDS.contains(&base.as_str()) {
-                return Decision::Deny(format!(
-                    "Blocked potentially destructive command: {}",
-                    base
-                ));
-            }
-
-            let exec_or_script_ext = win_exec_ext(&cmd_token.value)
-                .and_then(|ext| {
-                    if SCRIPT_EXTS.contains(&ext) {
-                        Some(ext)
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| script_ext(&cmd_token.value));
-            if exec_or_script_ext.is_some() {
-                return Decision::Deny(format!(
-                    "Blocked unanalyzable script file: {}",
-                    cmd_token.value
-                ));
-            }
-
-            if base == "dd" {
-                let argv: Vec<&str> = tokens[i..].iter().map(|t| t.value.as_str()).collect();
-                if argv.iter().any(|a| a.to_lowercase().contains("of=/dev/")) {
-                    return Decision::Deny("Blocked dd writing to a raw device".into());
+                if idx >= tokens.len() {
+                    return Decision::Allow;
                 }
-                return Decision::Allow;
+                i = idx;
             }
-            if base == "rm" {
-                return check_rm(tokens, i);
-            }
-            if base == "find" {
-                return check_find(tokens, i);
-            }
-            if base == "del" || base == "erase" {
-                let argv: Vec<&str> = tokens[i..].iter().map(|t| t.value.as_str()).collect();
-                if argv.iter().any(|a| {
-                    a.len() >= 2
-                        && a.starts_with('/')
-                        && a.chars().nth(1).is_some_and(|c| "fFsSqQaA".contains(c))
-                }) {
-                    return Decision::Deny("Blocked destructive Windows delete".into());
-                }
-                return Decision::Allow;
-            }
-            if base == "rd" || base == "rmdir" {
-                let argv: Vec<&str> = tokens[i..].iter().map(|t| t.value.as_str()).collect();
-                if argv.iter().any(|a| {
-                    a.len() >= 2
-                        && a.starts_with('/')
-                        && a.chars().nth(1).is_some_and(|c| "sSqQ".contains(c))
-                }) {
-                    return Decision::Deny("Blocked destructive Windows rd/rmdir".into());
-                }
-                return Decision::Allow;
-            }
-            if base == "systemctl" {
-                return check_systemctl(tokens, i);
-            }
-            Decision::Allow
         }
     }
+    if i >= tokens.len() {
+        return Decision::Allow;
+    }
+    let cmd_token = &tokens[i];
+    let base = get_base_name(&cmd_token.value);
+
+    if base == "git" {
+        return check_git(tokens, i);
+    }
+
+    if is_project_hook_command(&cmd_token.value) {
+        return check_project_hook(&cmd_token.value);
+    }
+
+    if base == "source" || base == "." {
+        return check_source(tokens, i);
+    }
+
+    if base != "rm" && base != "cd" {
+        for token in tokens.iter().skip(i) {
+            if has_bare_tilde(token) {
+                return Decision::Deny("Blocked tilde expansion outside quotes".into());
+            }
+        }
+    }
+
+    let compact: String = cmd_token.value.split_whitespace().collect();
+    if compact.contains(":(){:|:&};") {
+        return Decision::Deny("Blocked fork bomb".into());
+    }
+
+    if UNANALYZABLE_COMMANDS.contains(&base.as_str()) {
+        return Decision::Deny(format!("Blocked unanalyzable command: {}", base));
+    }
+    if DANGEROUS_COMMANDS.contains(&base.as_str()) {
+        return Decision::Deny(format!("Blocked potentially destructive command: {}", base));
+    }
+
+    let exec_or_script_ext = win_exec_ext(&cmd_token.value)
+        .and_then(|ext| {
+            if SCRIPT_EXTS.contains(&ext) {
+                Some(ext)
+            } else {
+                None
+            }
+        })
+        .or_else(|| script_ext(&cmd_token.value));
+    if exec_or_script_ext.is_some() {
+        return Decision::Deny(format!(
+            "Blocked unanalyzable script file: {}",
+            cmd_token.value
+        ));
+    }
+
+    if base == "dd" {
+        let argv: Vec<&str> = tokens[i..].iter().map(|t| t.value.as_str()).collect();
+        if argv.iter().any(|a| a.to_lowercase().contains("of=/dev/")) {
+            return Decision::Deny("Blocked dd writing to a raw device".into());
+        }
+        return Decision::Allow;
+    }
+    if base == "rm" {
+        return check_rm(tokens, i);
+    }
+    if base == "find" {
+        return check_find(tokens, i);
+    }
+    if base == "del" || base == "erase" {
+        let argv: Vec<&str> = tokens[i..].iter().map(|t| t.value.as_str()).collect();
+        if argv.iter().any(|a| {
+            a.len() >= 2
+                && a.starts_with('/')
+                && a.chars().nth(1).is_some_and(|c| "fFsSqQaA".contains(c))
+        }) {
+            return Decision::Deny("Blocked destructive Windows delete".into());
+        }
+        return Decision::Allow;
+    }
+    if base == "rd" || base == "rmdir" {
+        let argv: Vec<&str> = tokens[i..].iter().map(|t| t.value.as_str()).collect();
+        if argv.iter().any(|a| {
+            a.len() >= 2
+                && a.starts_with('/')
+                && a.chars().nth(1).is_some_and(|c| "sSqQ".contains(c))
+        }) {
+            return Decision::Deny("Blocked destructive Windows rd/rmdir".into());
+        }
+        return Decision::Allow;
+    }
+    if base == "systemctl" {
+        return check_systemctl(tokens, i);
+    }
+
+    if let Some(decision) = check_export_like(tokens, i, &base) {
+        return decision;
+    }
+
+    Decision::Allow
 }
 
 fn skip_prefix(tokens: &[Token], i: usize) -> PrefixOutcome {
@@ -2155,7 +2307,20 @@ mod tests {
     fn git_allowlist_matches_prefix() {
         allow("git status");
         allow("git -C src log --oneline");
-        allow("git commit -m \"hello\"");
+        allow("git commit -m \"hello!\"");
+        allow("git log --oneline");
+    }
+
+    #[test]
+    fn git_allowlist_blocks_unlisted_and_dangerous() {
+        deny("git clean -fd", "Blocked git subcommand");
+        deny("git submodule update", "Blocked git subcommand");
+        deny("git filter-repo", "Blocked git subcommand");
+        deny("git -c advice.detachedHead=false status", "git -c/--config");
+        deny("git rebase -x 'rm -rf /'", "git rebase --exec");
+        deny("git rebase -i", "git rebase -i");
+        deny("git config alias.foo '!rm'", "git aliases");
+        deny("git '!rm'", "git aliases");
     }
 
     #[test]
@@ -2175,6 +2340,52 @@ mod tests {
         }
         for cmd in &["FOO=bar echo ok", "env FOO=bar echo ok"] {
             allow(cmd);
+        }
+    }
+
+    #[test]
+    fn export_like_builtins_block_unsafe_env() {
+        for cmd in &[
+            "export LD_PRELOAD=evil.so",
+            "export 'LD_PRELOAD=evil.so'",
+            "export LD_PRELOAD",
+            "setenv LD_PRELOAD evil.so",
+            "declare -x LD_PRELOAD=evil.so",
+            "typeset LD_PRELOAD=evil.so",
+            "local LD_PRELOAD=evil.so",
+            "readonly LD_PRELOAD=evil.so",
+            "builtin export LD_PRELOAD=evil.so",
+            "nice export LD_PRELOAD=evil.so",
+            "env export LD_PRELOAD=evil.so",
+        ] {
+            deny(cmd, "Blocked unsafe environment variable: LD_PRELOAD");
+        }
+        for cmd in &[
+            "export PATH=/usr/bin",
+            "export FOO=bar",
+            "export 'FOO=bar'",
+            "setenv FOO bar",
+            "declare FOO=bar",
+        ] {
+            allow(cmd);
+        }
+    }
+
+    #[test]
+    fn stacked_prefixes_resolve_and_block() {
+        for cmd in &[
+            "nice env rm -rf /",
+            "nohup env rm -rf /",
+            "env rm -rf /",
+            "command env rm -rf /",
+            "builtin command rm -rf /",
+            "builtin bash -c 'rm -rf /'",
+            "nice bash -c 'rm -rf /'",
+            "timeout 5 env rm -rf /",
+            "stdbuf -oL env rm -rf /",
+            "sudo env rm -rf /",
+        ] {
+            deny(cmd, "Blocked rm -rf on a dangerous target");
         }
     }
 

@@ -6,14 +6,16 @@
 //! by a hang timeout and optional SHA pinning.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tokio::io::AsyncReadExt;
 
 use crate::args::{PluginCommand, PluginInstallArgs, PluginRefreshArgs};
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(120);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn plugin_dir() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join("plugins"))
@@ -187,6 +189,52 @@ fn base_git_cmd(tmp_home: &Path) -> tokio::process::Command {
     cmd
 }
 
+/// Run a git command with a hard timeout. stdout/stderr are captured so we can
+/// surface meaningful errors without blocking on pipe back-pressure.
+async fn run_git(tmp_home: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
+    let mut child = base_git_cmd(tmp_home)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn git")?;
+
+    let mut stdout = child.stdout.take().context("no stdout")?;
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let out_handle = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s).await;
+        s
+    });
+    let err_handle = tokio::spawn(async move {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s).await;
+        s
+    });
+
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            let (out, err) = tokio::join!(out_handle, err_handle);
+            Ok(Output {
+                status,
+                stdout: out.unwrap_or_default().into_bytes(),
+                stderr: err.unwrap_or_default().into_bytes(),
+            })
+        }
+        Ok(Err(e)) => {
+            out_handle.abort();
+            err_handle.abort();
+            bail!("git command failed: {e}")
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            out_handle.abort();
+            err_handle.abort();
+            bail!("git command timed out after {}s", timeout.as_secs());
+        }
+    }
+}
+
 /// Clone `url` into `dest` (a temporary directory), optionally pinned to a SHA.
 /// The clone is guarded by `CLONE_TIMEOUT` to contain hung git sources.
 async fn clone_plugin(url: &str, dest: &Path, require_sha: Option<&str>) -> Result<()> {
@@ -235,21 +283,18 @@ async fn clone_plugin(url: &str, dest: &Path, require_sha: Option<&str>) -> Resu
 }
 
 async fn clone_shallow(url: &str, tmp: &Path, tmp_home: &Path) -> Result<()> {
-    let mut child = base_git_cmd(tmp_home)
-        .args(["clone", "--depth", "1", url])
-        .arg(tmp)
-        .spawn()
-        .context("spawn git clone")?;
-
-    match tokio::time::timeout(CLONE_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => bail!("git clone failed with exit code {status:?}"),
-        Ok(Err(e)) => bail!("git clone failed: {e}"),
-        Err(_) => {
-            let _ = child.kill().await;
-            bail!("git clone timed out after {}s", CLONE_TIMEOUT.as_secs());
-        }
+    let tmp_str = tmp.to_string_lossy();
+    let output = run_git(
+        tmp_home,
+        &["clone", "--depth", "1", url, &tmp_str],
+        CLONE_TIMEOUT,
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git clone failed: {stderr}");
     }
+    Ok(())
 }
 
 fn validate_sha(sha: &str) -> Result<()> {
@@ -272,45 +317,36 @@ fn validate_sha(sha: &str) -> Result<()> {
 async fn clone_with_sha(url: &str, tmp: &Path, tmp_home: &Path, sha: &str) -> Result<()> {
     validate_sha(sha)?;
     let want = sha.trim().to_lowercase();
+    let tmp_str = tmp.to_string_lossy();
 
     // Do a full clone so we can check out an arbitrary SHA. Plugins are small,
     // and this avoids servers that do not support reachability SHA fetches.
-    let mut child = base_git_cmd(tmp_home)
-        .args(["clone", url])
-        .arg(tmp)
-        .spawn()
-        .context("spawn git clone")?;
-
-    match tokio::time::timeout(CLONE_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) => bail!("git clone failed with exit code {status:?}"),
-        Ok(Err(e)) => bail!("git clone failed: {e}"),
-        Err(_) => {
-            let _ = child.kill().await;
-            bail!("git clone timed out after {}s", CLONE_TIMEOUT.as_secs());
-        }
+    let clone = run_git(tmp_home, &["clone", url, &tmp_str], CLONE_TIMEOUT).await?;
+    if !clone.status.success() {
+        let stderr = String::from_utf8_lossy(&clone.stderr);
+        bail!("git clone failed: {stderr}");
     }
 
-    let checkout_status = tokio::process::Command::new("git")
-        .args(["-C", &tmp.to_string_lossy(), "checkout", sha])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .context("spawn git checkout")?;
-    if !checkout_status.success() {
-        bail!("failed to checkout pinned SHA {sha}");
+    let checkout = run_git(
+        tmp_home,
+        &["-C", &tmp_str, "checkout", sha],
+        GIT_COMMAND_TIMEOUT,
+    )
+    .await?;
+    if !checkout.status.success() {
+        let stderr = String::from_utf8_lossy(&checkout.stderr);
+        bail!("git checkout failed: {stderr}");
     }
 
-    let actual = tokio::process::Command::new("git")
-        .args(["-C", &tmp.to_string_lossy(), "rev-parse", "HEAD"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .context("spawn git rev-parse")?;
+    let actual = run_git(
+        tmp_home,
+        &["-C", &tmp_str, "rev-parse", "HEAD"],
+        GIT_COMMAND_TIMEOUT,
+    )
+    .await?;
+    if !actual.status.success() {
+        bail!("git rev-parse failed");
+    }
     let actual_sha = String::from_utf8_lossy(&actual.stdout)
         .trim()
         .to_lowercase();

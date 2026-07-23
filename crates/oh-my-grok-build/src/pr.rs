@@ -347,7 +347,10 @@ pub async fn pr_check_failures(branch: &str) -> Result<Vec<String>> {
         .with_context(|| format!("could not parse `gh pr checks` output for {branch}"))?;
     Ok(checks
         .into_iter()
-        .filter(|c| c.state == "failure")
+        .filter(|c| {
+            let state = c.state.to_lowercase();
+            state == "failure" || state == "error"
+        })
         .map(|c| c.name)
         .collect())
 }

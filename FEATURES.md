@@ -92,7 +92,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | Session branching / resuming / forking | ✅ |
 | PR automation / GitHub agent | ✅ |
 | Plugin / skill / hook marketplace | ✅ |
-| Plugin / skill / hook marketplace hot-loading | 🚧 |
+| Plugin / skill / hook marketplace hot-loading | ⏳ |
 | Headless / CI mode with deterministic playbooks | ✅ |
 | Multi-model cost routing / benchmark-optimized scaffolding | ✅ |
 | Local-first inference fallback (Ollama / LM Studio / vLLM) wired end-to-end | ✅ |

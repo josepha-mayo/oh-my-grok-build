@@ -1,6 +1,6 @@
 //! Auto skill creation and retrieval for `omgb`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,8 @@ pub struct Skill {
     pub steps: Vec<String>,
     pub pitfalls: Vec<String>,
     pub verification: Vec<String>,
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 fn skills_dir() -> Result<PathBuf> {
@@ -87,23 +89,59 @@ pub fn write_skill(skill: &Skill) -> Result<()> {
     crate::providers::write_file_atomic(&path, format_skill_markdown(skill)?, true)
 }
 
-/// List all persisted skills.
-pub fn list_skills() -> Result<Vec<Skill>> {
-    let dir = skills_dir()?;
-    if !dir.exists() {
-        return Ok(Vec::new());
+fn plugin_skills_dirs() -> Vec<PathBuf> {
+    let plugins_dir = crate::providers::omg_dir().ok().map(|d| d.join("plugins"));
+    let Some(plugins_dir) = plugins_dir else {
+        return Vec::new();
+    };
+    if !plugins_dir.is_dir() {
+        return Vec::new();
     }
-    let mut skills = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+    let mut dirs = Vec::new();
+    for entry in std::fs::read_dir(&plugins_dir).into_iter().flatten() {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.is_dir() {
+            let skills = path.join("skills");
+            if skills.is_dir() {
+                dirs.push(skills);
+            }
+        }
+    }
+    dirs
+}
+
+fn collect_skills_in_dir(dir: &Path, skills: &mut Vec<Skill>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "md") {
-            let text = std::fs::read_to_string(&path)?;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             match parse_skill_markdown(&text) {
-                Ok(skill) => skills.push(skill),
+                Ok(mut skill) => {
+                    skill.path = path;
+                    skills.push(skill);
+                }
                 Err(e) => eprintln!("warning: skipping invalid skill {}: {e}", path.display()),
             }
         }
+    }
+}
+
+/// List all persisted skills, including skills hot-loaded from installed plugins.
+pub fn list_skills() -> Result<Vec<Skill>> {
+    let mut skills = Vec::new();
+    if let Ok(dir) = skills_dir() {
+        collect_skills_in_dir(&dir, &mut skills);
+    }
+    for dir in plugin_skills_dirs() {
+        collect_skills_in_dir(&dir, &mut skills);
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(skills)
@@ -131,18 +169,15 @@ pub fn skill_preamble() -> String {
         .into_iter()
         .filter(|s| trigger_matches(&cwd, &s.trigger))
         .map(|s| {
-            let path = skills_dir()
-                .ok()
-                .and_then(|d| {
-                    d.join(format!("{}.md", safe_filename(&s.name)))
-                        .exists()
-                        .then(|| d.join(format!("{}.md", safe_filename(&s.name))))
-                })
-                .unwrap_or_default();
-            let body = if let Ok(text) = std::fs::read_to_string(&path) {
-                split_frontmatter(&text)
-                    .map(|(_, b)| b.to_string())
-                    .unwrap_or_default()
+            let path = &s.path;
+            let body = if path.exists() {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    split_frontmatter(&text)
+                        .map(|(_, b)| b.to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             };
@@ -190,7 +225,12 @@ fn run_has_errors(run: &[TimelineEvent]) -> bool {
     run.iter().any(|e| {
         e.category == "error"
             || e.category == "failure"
-            || e.data.as_ref().is_some_and(|d| d.get("error").is_some())
+            || e.data.as_ref().is_some_and(|d| {
+                d.get("error").is_some()
+                    || d.get("errors")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|a| !a.is_empty())
+            })
     })
 }
 
@@ -326,6 +366,7 @@ mod tests {
             steps: vec!["Run cargo clippy".into(), "Fix warnings".into()],
             pitfalls: vec!["Do not break tests".into()],
             verification: vec!["cargo test passes".into()],
+            path: PathBuf::new(),
         };
         let md = format_skill_markdown(&skill).unwrap();
         let parsed = parse_skill_markdown(&md).unwrap();

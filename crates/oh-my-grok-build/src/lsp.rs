@@ -276,6 +276,23 @@ impl JsonRpcClient {
     }
 }
 
+fn workspace_edit_has_uri(edit: &serde_json::Value, uri: &str) -> bool {
+    if let Some(changes) = edit.get("changes").and_then(|c| c.as_object())
+        && changes.contains_key(uri)
+    {
+        return true;
+    }
+    if let Some(docs) = edit.get("documentChanges").and_then(|d| d.as_array()) {
+        return docs.iter().any(|d| {
+            d.get("textDocument")
+                .and_then(|t| t.get("uri"))
+                .and_then(|u| u.as_str())
+                == Some(uri)
+        });
+    }
+    false
+}
+
 pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> Result<()> {
     if old_name.is_empty() || new_name.is_empty() {
         bail!("old_name and new_name must not be empty");
@@ -322,6 +339,21 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
     client.lsp_notify("initialized", json!({})).await?;
 
     let content = tokio::fs::read_to_string(&abs).await?;
+    let language_id = server.languages.first().copied().unwrap_or("");
+    client
+        .lsp_notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": content,
+                }
+            }),
+        )
+        .await?;
+
     let (line, character) = find_position(&content, old_name)
         .with_context(|| format!("symbol {old_name} not found in {}", file_path.display()))?;
 
@@ -336,11 +368,15 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
         )
         .await?;
 
-    let end_char = character + old_name.chars().count() as u64;
-    let edit = rename_resp.get("result").cloned().unwrap_or_else(|| {
+    let result = rename_resp.get("result");
+    let result_has_edits = result.is_some_and(|r| workspace_edit_has_uri(r, &uri));
+    let edit = if result_has_edits {
+        result.cloned().unwrap()
+    } else {
+        let end_char = character + old_name.chars().count() as u64;
         json!({
             "changes": {
-                uri: [{
+                (uri): [{
                     "range": {
                         "start": {"line": line, "character": character},
                         "end": {"line": line, "character": end_char}
@@ -349,24 +385,9 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
                 }]
             }
         })
-    });
+    };
 
-    let applied = client
-        .lsp_request(
-            "workspace/applyEdit",
-            json!({"label": "omgb refactor", "edit": edit}),
-        )
-        .await
-        .ok()
-        .and_then(|v| {
-            v.get("result")
-                .and_then(|r| r.get("applied"))
-                .and_then(|a| a.as_bool())
-        })
-        .unwrap_or(false);
-    if !applied {
-        apply_workspace_edit(&edit).await?;
-    }
+    apply_workspace_edit(&edit).await?;
     Ok(())
 }
 
@@ -544,11 +565,23 @@ async fn start_adapter(adapter: &str, extra: &[String]) -> Result<()> {
     relay_stdio(child).await
 }
 
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
 fn find_position(content: &str, old_name: &str) -> Result<(u64, u64)> {
     for (line_num, line) in content.lines().enumerate() {
-        if let Some(pos) = line.find(old_name) {
-            let char_pos = line[..pos].chars().count();
-            return Ok((line_num as u64, char_pos as u64));
+        let mut start = 0;
+        while let Some(pos) = line[start..].find(old_name) {
+            let pos = start + pos;
+            let end = pos + old_name.len();
+            let prev = line[..pos].chars().last();
+            let next = line[end..].chars().next();
+            if !prev.is_some_and(is_word_char) && !next.is_some_and(is_word_char) {
+                let char_pos = line[..pos].chars().count();
+                return Ok((line_num as u64, char_pos as u64));
+            }
+            start = end;
         }
     }
     bail!("symbol not found")
@@ -602,41 +635,68 @@ fn url_to_path(uri: &str) -> Result<std::path::PathBuf> {
         .map_err(|_| anyhow::anyhow!("URI is not a file path: {uri}"))
 }
 
-async fn apply_workspace_edit(edit: &serde_json::Value) -> Result<()> {
-    let changes = edit.get("changes").context("missing workspace changes")?;
-    let changes = changes
-        .as_object()
-        .context("workspace changes must be an object")?;
-    for (uri, edits_value) in changes {
-        let path = url_to_path(uri)?;
-        let edits = edits_value
-            .as_array()
-            .context("edits must be an array")?
-            .iter()
-            .map(|e| {
-                let range = e.get("range").context("edit missing range")?;
-                let start = parse_position(range.get("start").context("start")?)?;
-                let end = parse_position(range.get("end").context("end")?)?;
-                let new_text = e
-                    .get("newText")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Ok((start, end, new_text))
-            })
-            .collect::<Result<Vec<_>>>()?;
+async fn apply_text_edits_to_path(uri: &str, edits_value: &serde_json::Value) -> Result<()> {
+    let path = url_to_path(uri)?;
+    let mut edits = edits_value
+        .as_array()
+        .context("edits must be an array")?
+        .iter()
+        .map(|e| {
+            let range = e.get("range").context("edit missing range")?;
+            let start = parse_position(range.get("start").context("start")?)?;
+            let end = parse_position(range.get("end").context("end")?)?;
+            let new_text = e
+                .get("newText")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok((start, end, new_text))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-        let mut text = tokio::fs::read_to_string(&path).await?;
-        let mut edits = edits;
-        edits.sort_by(|a, b| b.0.cmp(&a.0));
-        for (start, end, new_text) in edits {
-            let start_idx = position_to_byte(&text, start)?;
-            let end_idx = position_to_byte(&text, end)?;
-            text.replace_range(start_idx..end_idx, &new_text);
-        }
-        tokio::fs::write(&path, text.as_bytes()).await?;
+    let mut text = tokio::fs::read_to_string(&path).await?;
+    edits.sort_by(|a, b| b.0.cmp(&a.0));
+    for (start, end, new_text) in edits {
+        let start_idx = position_to_byte(&text, start)?;
+        let end_idx = position_to_byte(&text, end)?;
+        text.replace_range(start_idx..end_idx, &new_text);
     }
+    tokio::fs::write(&path, text.as_bytes()).await?;
     Ok(())
+}
+
+async fn apply_workspace_edit(edit: &serde_json::Value) -> Result<()> {
+    if let Some(changes) = edit.get("changes") {
+        let changes = changes
+            .as_object()
+            .context("workspace changes must be an object")?;
+        for (uri, edits_value) in changes {
+            apply_text_edits_to_path(uri, edits_value).await?;
+        }
+        return Ok(());
+    }
+
+    if let Some(document_changes) = edit.get("documentChanges") {
+        let document_changes = document_changes
+            .as_array()
+            .context("documentChanges must be an array")?;
+        for change in document_changes {
+            if let Some(text_document) = change.get("textDocument") {
+                let uri = text_document
+                    .get("uri")
+                    .and_then(|u| u.as_str())
+                    .context("missing textDocument uri")?;
+                if let Some(edits) = change.get("edits") {
+                    apply_text_edits_to_path(uri, edits).await?;
+                }
+            } else if change.get("kind").is_some() {
+                bail!("workspace file operations are not supported in refactor");
+            }
+        }
+        return Ok(());
+    }
+
+    bail!("workspace edit has neither changes nor documentChanges")
 }
 
 #[cfg(test)]
@@ -696,23 +756,16 @@ mod tests {
     }
 
     #[test]
-    fn lsp_apply_edit_payload_well_formed() {
-        let msg = lsp_request_payload(
-            3,
-            "workspace/applyEdit",
+    fn lsp_did_open_payload_well_formed() {
+        let msg = lsp_notification_payload(
+            "textDocument/didOpen",
             json!({
-                "label": "omgb refactor",
-                "edit": {
-                    "changes": {
-                        "file:///tmp/main.rs": [{
-                            "range": {
-                                "start": {"line": 0, "character": 4},
-                                "end": {"line": 0, "character": 7},
-                            },
-                            "newText": "baz",
-                        }]
-                    }
-                },
+                "textDocument": {
+                    "uri": "file:///tmp/main.rs",
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn foo() {}",
+                }
             }),
         );
         let bytes = encode_message(&msg).unwrap();
@@ -720,8 +773,8 @@ mod tests {
         let header_end = text.find("\r\n\r\n").unwrap();
         let body = &text[header_end + 4..];
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed["method"], "workspace/applyEdit");
-        assert!(parsed["params"]["edit"]["changes"].is_object());
+        assert_eq!(parsed["method"], "textDocument/didOpen");
+        assert_eq!(parsed["params"]["textDocument"]["languageId"], "rust");
     }
 
     #[test]
@@ -763,9 +816,14 @@ mod tests {
 
     #[test]
     fn find_position_finds_symbol() {
-        let text = "fn foo() {}\nlet x = foo;";
+        let text = "fn foo() {}\nlet x = foo;\nlet foobar = 1;";
         let (line, character) = find_position(text, "foo").unwrap();
         assert_eq!(line, 0);
         assert_eq!(character, 3);
+    }
+
+    #[test]
+    fn find_position_respects_word_boundaries() {
+        assert!(find_position("let foobar = 1;", "foo").is_err());
     }
 }

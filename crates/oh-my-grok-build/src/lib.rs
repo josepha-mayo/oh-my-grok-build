@@ -12,6 +12,7 @@ use xai_grok_pager::app::{PagerArgs, run as pager_run};
 use xai_grok_pager::headless::{HeadlessOptions, HeadlessPrompt, OutputFormat, run_single_turn};
 use xai_grok_shell::agent::config::Config as AgentConfig;
 
+mod approvals;
 mod args;
 mod doctor;
 mod harness;
@@ -706,7 +707,16 @@ pub(crate) async fn run_single_turn_with(
     let overrides = crate::tool_overrides::load_tool_overrides()?;
     crate::tool_overrides::apply_tool_overrides_to_headless_options(&overrides, &mut options);
 
+    if options.permission_mode_flag.as_deref() == Some("auto")
+        && let Ok(approvals) = crate::approvals::load_approvals(chrono::Utc::now())
+    {
+        options
+            .allow_rules
+            .extend(crate::approvals::to_allow_rules(&approvals));
+    }
+
     let mut last_result: Result<()> = Ok(());
+    let mut errors: Vec<String> = Vec::new();
     for m in &candidates {
         let provider_id = m.strip_prefix("omgb-").unwrap_or(m);
         if let Err(e) = providers::ensure_provider_configured(provider_id) {
@@ -721,10 +731,17 @@ pub(crate) async fn run_single_turn_with(
                     let cwd = cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    if has_repeated_tool_call(sid, &cwd, 16) {
+                        bail!("anti-loop: same tool call repeated 16 times in a row");
+                    }
                     count_chat_tool_calls(sid, &cwd)
                 } else {
                     0
                 };
+                let mut data = serde_json::json!({"tool_calls": tool_calls, "success": true});
+                if !errors.is_empty() {
+                    data["errors"] = serde_json::json!(errors);
+                }
                 let _ = timeline::add_event(
                     "exec",
                     prompt
@@ -732,13 +749,20 @@ pub(crate) async fn run_single_turn_with(
                         .take(8)
                         .collect::<Vec<_>>()
                         .join(" "),
-                    Some(serde_json::json!({"tool_calls": tool_calls, "success": true})),
+                    Some(data),
                 );
                 maybe_auto_create_skill(tool_calls).await;
+                if yolo && let Some(ref sid) = effective_session_id {
+                    let cwd = cwd
+                        .clone()
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    record_session_approvals(sid, &cwd);
+                }
                 return Ok(());
             }
             Err(e) => {
                 eprintln!("warning: model '{m}' failed: {e}");
+                errors.push(e.to_string());
                 last_result = Err(e);
             }
         }
@@ -749,6 +773,10 @@ pub(crate) async fn run_single_turn_with(
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let tool_calls = count_chat_tool_calls(sid, &cwd);
+        let mut data = serde_json::json!({"tool_calls": tool_calls, "success": false});
+        if !errors.is_empty() {
+            data["errors"] = serde_json::json!(errors);
+        }
         let _ = timeline::add_event(
             "exec",
             prompt
@@ -756,7 +784,7 @@ pub(crate) async fn run_single_turn_with(
                 .take(8)
                 .collect::<Vec<_>>()
                 .join(" "),
-            Some(serde_json::json!({"tool_calls": tool_calls, "success": false})),
+            Some(data),
         );
     }
 
@@ -767,6 +795,16 @@ fn count_chat_tool_calls(session_id: &str, cwd: &std::path::Path) -> usize {
     load_chat_tool_calls(session_id, cwd)
         .map(|v| v.len())
         .unwrap_or(0)
+}
+
+fn record_session_approvals(session_id: &str, cwd: &std::path::Path) {
+    if let Some(calls) = load_chat_tool_calls(session_id, cwd) {
+        let tuples: Vec<_> = calls
+            .into_iter()
+            .map(|c| (c.name, c.arguments.to_string()))
+            .collect();
+        let _ = crate::approvals::record_tool_calls(&tuples);
+    }
 }
 
 fn load_chat_tool_calls(
