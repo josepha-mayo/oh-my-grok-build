@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const IS_WINDOWS: bool = cfg!(windows);
 
@@ -642,43 +642,76 @@ fn current_dir() -> String {
         .unwrap_or_default()
 }
 
-fn joined_path(cwd: &str, p: &str) -> Option<PathBuf> {
-    let p = p.replace('\\', "/");
-    if p.is_empty() {
-        return None;
+fn is_absolute_path(p: &str) -> bool {
+    if p.starts_with('/') {
+        return true;
     }
-    if p.starts_with('/') || (IS_WINDOWS && p.len() > 1 && p.as_bytes().get(1) == Some(&b':')) {
-        Some(PathBuf::from(&p))
-    } else {
-        Some(PathBuf::from(cwd).join(&p))
-    }
+    IS_WINDOWS && p.len() > 2 && p.as_bytes().get(1) == Some(&b':')
 }
 
-fn normalize_path(cwd: &str, p: &str) -> Option<String> {
-    let joined = joined_path(cwd, p)?;
-    let resolved = dunce::simplified(&joined).to_path_buf();
-    let mut s = resolved.to_string_lossy().replace('\\', "/");
-    if !s.ends_with('/') {
-        s.push('/');
+/// Return true if any prefix of `path` (including the final component) is a
+/// symbolic link, excluding the leading components that match `base`.
+fn has_symlink_in_tail(base: &Path, path: &Path) -> bool {
+    let base = dunce::simplified(base).to_path_buf();
+    let path = dunce::simplified(path).to_path_buf();
+
+    let base_comps: Vec<_> = base.components().collect();
+    let path_comps: Vec<_> = path.components().collect();
+
+    let mut common = 0;
+    while common < base_comps.len()
+        && common < path_comps.len()
+        && base_comps[common] == path_comps[common]
+    {
+        common += 1;
     }
-    Some(s.to_lowercase())
+    // If the path diverges from the base before reaching its end, the
+    // requested file is outside the base; check every component.
+    let skip = if common < base_comps.len() { 0 } else { common };
+
+    let mut prefix = PathBuf::new();
+    for (i, comp) in path_comps.iter().enumerate() {
+        prefix.push(comp.as_os_str());
+        if i < skip {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&prefix) {
+            if meta.is_symlink() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_path_trusted(cwd: &str, p: &str, trusted: &[String]) -> bool {
-    let Some(normalized) = normalize_path(cwd, p) else {
-        return false;
+    let canonical_cwd = match dunce::canonicalize(cwd) {
+        Ok(p) => p,
+        Err(_) => dunce::simplified(PathBuf::from(cwd)).to_path_buf(),
     };
-    if !trusted.iter().any(|t| normalized.starts_with(t)) {
+    let joined: PathBuf = if is_absolute_path(p) {
+        PathBuf::from(p)
+    } else {
+        canonical_cwd.join(p)
+    };
+
+    // Resolve symlinks when the path already exists; otherwise fall back to
+    // the simplified path and rely on the per-component symlink check below.
+    let real = match dunce::canonicalize(&joined) {
+        Ok(p) => p,
+        Err(_) => dunce::simplified(&joined).to_path_buf(),
+    };
+
+    let mut real_norm = real.to_string_lossy().replace('\\', "/").to_lowercase();
+    if !real_norm.ends_with('/') {
+        real_norm.push('/');
+    }
+    if !trusted.iter().any(|t| real_norm.starts_with(t)) {
         return false;
     }
-    // If the path is a symlink, deny it: the symlink target can be swapped
-    // between our check and the shell's execution, creating a TOCTOU window.
-    if let Some(joined) = joined_path(cwd, p) {
-        if let Ok(meta) = std::fs::symlink_metadata(&joined) {
-            if meta.file_type().is_symlink() {
-                return false;
-            }
-        }
+
+    if has_symlink_in_tail(&canonical_cwd, &joined) {
+        return false;
     }
     true
 }
@@ -711,7 +744,7 @@ fn is_shell_source_ext(path: &str) -> bool {
     let lower = path.to_lowercase();
     if let Some(idx) = lower.rfind('.') {
         let ext = &lower[idx + 1..];
-        return ALLOWED.iter().any(|a| *a == ext);
+        return ALLOWED.contains(&ext);
     }
     true
 }
@@ -1467,7 +1500,11 @@ fn parse_interpreter(tokens: &[Token], i: usize, flag: &str) -> PrefixOutcome {
                     "Interpreter missing command string".into(),
                 ));
             }
-            return PrefixOutcome::Stop(evaluate(&tokens[j + 1].value));
+            let cmd = &tokens[j + 1];
+            if cmd.quoted.is_some() || j + 2 >= tokens.len() {
+                return PrefixOutcome::Stop(evaluate(&cmd.value));
+            }
+            return PrefixOutcome::Stop(evaluate_tokens(tokens, j + 1));
         }
         if v == "--" {
             return PrefixOutcome::Stop(Decision::Deny(

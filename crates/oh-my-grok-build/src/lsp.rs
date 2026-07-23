@@ -16,6 +16,8 @@ use url::Url;
 
 use crate::args::{DapCommand, LspCommand, LspStartArgs};
 
+const MAX_JSONRPC_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
 #[derive(Clone)]
 struct Server {
     languages: &'static [&'static str],
@@ -281,6 +283,9 @@ impl JsonRpcClient {
             }
         }
         let len = len.context("missing Content-Length header")?;
+        if len > MAX_JSONRPC_MESSAGE_SIZE {
+            bail!("JSON-RPC message size {len} exceeds {MAX_JSONRPC_MESSAGE_SIZE}");
+        }
         let mut body = vec![0u8; len];
         self.stdout
             .read_exact(&mut body)
@@ -390,7 +395,7 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
     let edit = if result_has_edits {
         result.cloned().unwrap()
     } else {
-        let end_char = character + old_name.chars().count() as u64;
+        let end_char = character + utf16_len(old_name);
         json!({
             "changes": {
                 (uri): [{
@@ -594,6 +599,10 @@ fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+fn utf16_len(s: &str) -> u64 {
+    s.chars().map(|c| c.len_utf16() as u64).sum()
+}
+
 fn find_position(content: &str, old_name: &str) -> Result<(u64, u64)> {
     for (line_num, line) in content.lines().enumerate() {
         let mut start = 0;
@@ -603,8 +612,7 @@ fn find_position(content: &str, old_name: &str) -> Result<(u64, u64)> {
             let prev = line[..pos].chars().last();
             let next = line[end..].chars().next();
             if !prev.is_some_and(is_word_char) && !next.is_some_and(is_word_char) {
-                let char_pos = line[..pos].chars().count();
-                return Ok((line_num as u64, char_pos as u64));
+                return Ok((line_num as u64, utf16_len(&line[..pos])));
             }
             start = end;
         }
@@ -632,23 +640,23 @@ fn parse_position(v: &serde_json::Value) -> Result<Position> {
 
 fn position_to_byte(text: &str, pos: Position) -> Result<usize> {
     let mut line_idx = 0usize;
-    let mut char_count = 0usize;
-    for (i, c) in text.chars().enumerate() {
+    let mut utf16_count = 0u64;
+    for (i, c) in text.char_indices() {
         if line_idx == pos.line as usize {
-            if char_count == pos.character as usize {
+            if utf16_count == pos.character {
                 return Ok(i);
             }
-            char_count += 1;
+            utf16_count += c.len_utf16() as u64;
         }
         if c == '\n' {
             line_idx += 1;
             if line_idx > pos.line as usize {
                 break;
             }
-            char_count = 0;
+            utf16_count = 0;
         }
     }
-    if line_idx == pos.line as usize && char_count == pos.character as usize {
+    if line_idx == pos.line as usize && utf16_count == pos.character {
         return Ok(text.len());
     }
     bail!("position out of range")
@@ -703,7 +711,11 @@ async fn apply_text_edits_to_path(
         let end_idx = position_to_byte(&text, end)?;
         text.replace_range(start_idx..end_idx, &new_text);
     }
-    tokio::fs::write(&path, text.as_bytes()).await?;
+    tokio::task::spawn_blocking(move || {
+        crate::providers::write_file_atomic(&path, text.as_bytes(), false)
+    })
+    .await
+    .context("write file task panicked")??;
     Ok(())
 }
 

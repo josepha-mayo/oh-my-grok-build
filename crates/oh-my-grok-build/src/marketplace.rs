@@ -77,7 +77,8 @@ fn read_source_meta(dir: &Path) -> Result<Option<SourceMeta>> {
 fn write_source_meta(dir: &Path, meta: &SourceMeta) -> Result<()> {
     let path = source_meta_path(dir);
     let raw = serde_json::to_string_pretty(meta)?;
-    std::fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+    crate::providers::write_file_atomic(&path, raw.as_bytes(), true)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Expand `~` at the start of a path string and resolve it against the
@@ -101,20 +102,18 @@ fn resolve_local_plugin_source(source: &str) -> Result<PathBuf> {
         cwd.join(expanded)
     };
 
-    let meta = std::fs::symlink_metadata(&src)
-        .with_context(|| format!("plugin source does not exist: {}", src.display()))?;
-    if meta.is_symlink() {
-        bail!("plugin source must not be a symlink");
-    }
-    if !meta.is_dir() {
-        bail!("plugin source is not a directory");
-    }
-
-    let canonical_src = dunce::canonicalize(&src)
-        .with_context(|| format!("failed to canonicalize {}", src.display()))?;
     let canonical_cwd =
         dunce::canonicalize(&cwd).context("failed to canonicalize current directory")?;
+    let canonical_src = dunce::canonicalize(&src).with_context(|| {
+        format!(
+            "plugin source does not exist or is not reachable: {}",
+            src.display()
+        )
+    })?;
 
+    if !canonical_src.is_dir() {
+        bail!("plugin source is not a directory");
+    }
     if canonical_src == canonical_cwd {
         bail!("plugin source cannot be the current working directory");
     }
@@ -123,6 +122,19 @@ fn resolve_local_plugin_source(source: &str) -> Result<PathBuf> {
             "plugin source must be under the current working directory: {}",
             canonical_cwd.display()
         );
+    }
+    // Re-check the original path for symlinks after canonicalization so a
+    // swap between the check and execution is either rejected or still under cwd.
+    if std::fs::symlink_metadata(&src)
+        .with_context(|| {
+            format!(
+                "plugin source disappeared during validation: {}",
+                src.display()
+            )
+        })?
+        .is_symlink()
+    {
+        bail!("plugin source must not be a symlink");
     }
 
     Ok(canonical_src)
@@ -275,6 +287,15 @@ async fn clone_plugin(url: &str, dest: &Path, require_sha: Option<&str>) -> Resu
         bail!("failed to strip .git directory: {e}");
     }
 
+    let meta = SourceMeta {
+        source: url.to_string(),
+        sha: require_sha.map(|s| s.trim().to_lowercase()),
+    };
+    if let Err(e) = write_source_meta(&tmp, &meta) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+
     if let Err(e) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_dir_all(&tmp);
         bail!("failed to move cloned plugin into place: {e}");
@@ -302,11 +323,11 @@ fn validate_sha(sha: &str) -> Result<()> {
     if trimmed.is_empty() {
         bail!("pinned SHA must not be empty");
     }
-    if trimmed.len() < 7 {
-        bail!("pinned SHA must be at least 7 characters");
-    }
-    if trimmed.len() > 64 {
-        bail!("pinned SHA must be at most 64 characters");
+    // Git SHA-1 object IDs are exactly 40 hex digits; SHA-256 repos use 64.
+    // Require the full object ID so pinning is a cryptographic guarantee,
+    // not a short-prefix match.
+    if trimmed.len() != 40 && trimmed.len() != 64 {
+        bail!("pinned SHA must be a full 40- or 64-character hexadecimal object ID");
     }
     if !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("pinned SHA must be a hexadecimal string");
@@ -350,7 +371,7 @@ async fn clone_with_sha(url: &str, tmp: &Path, tmp_home: &Path, sha: &str) -> Re
     let actual_sha = String::from_utf8_lossy(&actual.stdout)
         .trim()
         .to_lowercase();
-    if actual_sha != want && !actual_sha.starts_with(&want) {
+    if actual_sha != want {
         bail!("checked out SHA {actual_sha} does not match required {sha}");
     }
     Ok(())
@@ -365,8 +386,30 @@ pub async fn run_plugin(cmd: PluginCommand) -> Result<()> {
     }
 }
 
+fn is_safe_plugin_list_dir(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if meta.is_symlink() {
+        return false;
+    }
+    if let Ok(cwd) = std::env::current_dir().and_then(dunce::canonicalize)
+        && let Ok(canonical) = dunce::canonicalize(dir)
+    {
+        return canonical.starts_with(&cwd);
+    }
+    false
+}
+
 async fn list_plugins() -> Result<()> {
-    let dirs = [plugin_dir()?, PathBuf::from("plugin")];
+    let mut dirs = vec![plugin_dir()?];
+    let bundled = PathBuf::from("plugin");
+    if is_safe_plugin_list_dir(&bundled) {
+        dirs.push(bundled);
+    }
     for dir in dirs {
         if !dir.exists() {
             continue;
@@ -434,17 +477,16 @@ async fn install_plugin(args: &PluginInstallArgs) -> Result<()> {
         let tmp = parent.join(format!(".install-{}", uuid::Uuid::new_v4()));
         copy_dir(&src, &tmp)?;
         validate_plugin_dir(&tmp)?;
+        let meta = SourceMeta {
+            source: args.source.clone(),
+            sha: args.require_sha.as_ref().map(|s| s.trim().to_lowercase()),
+        };
+        write_source_meta(&tmp, &meta)?;
         if let Err(e) = std::fs::rename(&tmp, &dest) {
             let _ = std::fs::remove_dir_all(&tmp);
             return Err(e.into());
         }
     }
-
-    let meta = SourceMeta {
-        source: args.source.clone(),
-        sha: args.require_sha.as_ref().map(|s| s.trim().to_lowercase()),
-    };
-    let _ = write_source_meta(&dest, &meta);
 
     println!("installed plugin {name} to {}", dest.display());
     Ok(())
@@ -455,6 +497,14 @@ async fn remove_plugin(name: &str) -> Result<()> {
     let dest = plugin_dir()?.join(name);
     if !dest.exists() {
         bail!("plugin '{name}' is not installed");
+    }
+    let canonical_plugin_dir = dunce::canonicalize(plugin_dir()?)?;
+    let canonical_dest = dunce::canonicalize(&dest)?;
+    if !canonical_dest.starts_with(&canonical_plugin_dir) {
+        bail!(
+            "plugin path {} is outside the plugin directory",
+            dest.display()
+        );
     }
     std::fs::remove_dir_all(&dest)?;
     println!("removed plugin {name}");
@@ -537,20 +587,20 @@ async fn refresh_one(name: &str, path: &Path, source: &str, sha: Option<&str>) -
         bail!("failed to backup old plugin {name}: {e}");
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::rename(&backup, path);
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&backup);
+        // Try to restore the old version. If that fails, keep the backup and
+        // report the error instead of deleting the only remaining copy.
+        if std::fs::rename(&backup, path).is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            bail!(
+                "failed to move refreshed plugin {name}: {e}; backup retained at {}",
+                backup.display()
+            );
+        }
         bail!("failed to move refreshed plugin {name}: {e}");
     }
     if let Err(e) = std::fs::remove_dir_all(&backup) {
         eprintln!("warning: failed to remove old plugin backup {name}: {e}");
     }
-
-    let meta = SourceMeta {
-        source: source.into(),
-        sha: sha.map(|s| s.into()),
-    };
-    let _ = write_source_meta(path, &meta);
     Ok(())
 }
 

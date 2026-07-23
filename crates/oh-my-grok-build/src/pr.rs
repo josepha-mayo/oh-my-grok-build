@@ -5,6 +5,7 @@
 //! installed.
 
 use std::process::{Command as SyncCommand, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -55,6 +56,8 @@ fn gh_cmd() -> Result<tokio::process::Command> {
     let path = ensure_gh()?;
     Ok(tokio::process::Command::new(path))
 }
+
+const GH_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn run_status(args: &PrStatusArgs) -> Result<()> {
     let branch = resolve_branch(&args.branch)?;
@@ -341,12 +344,19 @@ async fn gh_pr_is_in_merge_queue(pr_url: &str) -> Result<bool> {
                 .and_then(|r| r.data?.resource?.is_in_merge_queue)
                 .unwrap_or(false))
         }
-        Err(_) => Ok(false),
+        Err(e) => {
+            eprintln!("warning: could not check merge queue for {pr_url}: {e}");
+            Ok(false)
+        }
     }
 }
 
 async fn run_gh(mut cmd: tokio::process::Command) -> Result<String> {
-    let output = cmd.output().await.context("failed to run `gh`")?;
+    let output = match tokio::time::timeout(GH_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => bail!("`gh` command timed out after {}s", GH_TIMEOUT.as_secs()),
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("`gh` failed: {stderr}");
@@ -485,7 +495,10 @@ pub async fn pr_summarize(branch: &str) -> Result<String> {
     let url = json["url"].as_str().unwrap_or("");
     let head = json["headRefName"].as_str().unwrap_or("?");
     let base = json["baseRefName"].as_str().unwrap_or("?");
-    let failures = pr_check_failures(branch).await.unwrap_or_default();
+    let failures = pr_check_failures(branch).await.unwrap_or_else(|e| {
+        eprintln!("warning: could not fetch check failures for {branch}: {e}");
+        Vec::new()
+    });
     let check_line = if failures.is_empty() {
         "checks passing".into()
     } else {

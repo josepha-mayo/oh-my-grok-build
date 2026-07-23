@@ -103,9 +103,13 @@ fn plugin_skills_dirs() -> Vec<PathBuf> {
     for entry in std::fs::read_dir(&plugins_dir).into_iter().flatten() {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() && !ft.is_symlink() {
             let skills = path.join("skills");
-            if skills.is_dir() {
+            if let Ok(meta) = std::fs::symlink_metadata(&skills)
+                && meta.is_dir()
+                && !meta.file_type().is_symlink()
+            {
                 dirs.push(skills);
             }
         }
@@ -120,6 +124,12 @@ fn collect_skills_in_dir(dir: &Path, skills: &mut Vec<Skill>) {
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
+        let Ok(meta) = entry.file_type() else {
+            continue;
+        };
+        if !meta.is_file() || meta.is_symlink() {
+            continue;
+        }
         if path.extension().is_some_and(|e| e == "md") {
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,

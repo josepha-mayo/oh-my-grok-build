@@ -285,7 +285,39 @@ async fn run_tui(args: TuiArgs) -> Result<()> {
         argv.push("--".to_string());
         argv.push(p);
     }
-    let pager_args = PagerArgs::parse_from(argv);
+    let mut pager_args = PagerArgs::parse_from(argv);
+
+    let overrides = crate::tool_overrides::load_tool_overrides(
+        pager_args.agent.as_deref(),
+        pager_args.session_id.as_deref(),
+    )?;
+    crate::tool_overrides::apply_tool_overrides_to_pager_args(&overrides, &mut pager_args)?;
+
+    if !pager_args.yolo {
+        match crate::approvals::load_approvals(chrono::Utc::now()) {
+            Ok(approvals) => pager_args
+                .allow_rules
+                .extend(crate::approvals::to_allow_rules(&approvals)),
+            Err(e) => eprintln!("warning: failed to load approvals: {e}"),
+        }
+    }
+
+    let mut rules_parts = Vec::new();
+    if let Some(r) = pager_args.rules.take() {
+        rules_parts.push(r);
+    }
+    let skill_rules = crate::skill::skill_preamble();
+    if !skill_rules.trim().is_empty() {
+        rules_parts.push(skill_rules);
+    }
+    let taste_rules = crate::taste::taste_preamble();
+    if !taste_rules.trim().is_empty() {
+        rules_parts.push(taste_rules);
+    }
+    if !rules_parts.is_empty() {
+        pager_args.rules = Some(rules_parts.join("\n"));
+    }
+
     pager_run(pager_args, None).await?;
     Ok(())
 }
@@ -778,7 +810,7 @@ pub(crate) async fn run_single_turn_with(
         fork_session: session.fork_session,
         worktree: None,
         restore_code: false,
-        agent,
+        agent: agent.clone(),
         agents_json: None,
         cli_tools,
         cli_disallowed_tools,
@@ -803,7 +835,10 @@ pub(crate) async fn run_single_turn_with(
         background_wait_timeout: Duration::from_secs(300),
     };
 
-    let overrides = crate::tool_overrides::load_tool_overrides()?;
+    let overrides = crate::tool_overrides::load_tool_overrides(
+        agent.as_deref(),
+        effective_session_id.as_deref(),
+    )?;
     crate::tool_overrides::apply_tool_overrides_to_headless_options(&overrides, &mut options)?;
 
     if options.permission_mode_flag.as_deref() == Some("auto") {
