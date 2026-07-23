@@ -150,16 +150,11 @@ async fn run_session_resume(args: SessionResumeArgs) -> Result<()> {
     if let Some(ref sid) = args.target_session_id {
         validate_session_id(sid)?;
     }
-    let resume = if args.continue_last {
-        Some(String::new())
-    } else {
-        args.source_session_id.clone()
-    };
     let session = SessionParams {
-        resume,
+        resume: args.source_session_id.clone(),
         session_id: args.target_session_id,
         fork_session: args.fork_session,
-        continue_last: false,
+        continue_last: args.continue_last,
     };
     let prompt = args.prompt.unwrap_or_default();
     run_single_turn_with(

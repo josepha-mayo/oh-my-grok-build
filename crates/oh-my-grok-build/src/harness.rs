@@ -298,7 +298,7 @@ pub fn add_connector(
     registry.connectors.insert(
         name.clone(),
         ConnectorConfig {
-            name,
+            name: name.clone(),
             r#type: type_str,
             command,
             url,
@@ -313,7 +313,7 @@ pub fn add_connector(
     // API keys are only accepted via OMGB_API_KEY; persist the secret only after
     // the connector registry has been saved successfully.
     if let Some(key) = std::env::var("OMGB_API_KEY").ok().filter(|s| !s.is_empty()) {
-        crate::providers::write_api_key(&storage, Some(std::slice::from_ref(&storage)), &key)?;
+        crate::providers::write_api_key(&name, Some(std::slice::from_ref(&storage)), &key)?;
     }
 
     Ok(())

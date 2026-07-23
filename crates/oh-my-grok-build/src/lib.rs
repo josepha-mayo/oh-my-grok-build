@@ -657,8 +657,9 @@ pub(crate) async fn run_single_turn_with(
         Some(rules_parts.join("\n"))
     };
 
+    let resume = session.resume.as_ref().filter(|s| !s.is_empty()).cloned();
     let effective_session_id =
-        if session.resume.is_none() && !session.continue_last && session.session_id.is_none() {
+        if resume.is_none() && !session.continue_last && session.session_id.is_none() {
             Some(uuid::Uuid::new_v4().to_string())
         } else {
             session.session_id.clone()
@@ -666,7 +667,7 @@ pub(crate) async fn run_single_turn_with(
 
     let mut options = HeadlessOptions {
         session_id: effective_session_id.clone(),
-        resume: session.resume.clone(),
+        resume: resume.clone(),
         cwd: cwd.clone(),
         yolo,
         trust: yolo,
@@ -1077,7 +1078,7 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
     }
 
     let mut session = args.session.clone();
-    if session.session_id.is_none() {
+    if session.session_id.is_none() && !session.continue_last {
         session.session_id = Some(uuid::Uuid::new_v4().to_string());
     }
     let session_id = session.session_id.clone().unwrap_or_default();

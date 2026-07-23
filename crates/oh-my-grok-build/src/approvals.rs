@@ -99,12 +99,7 @@ fn extract_pattern(tool: &str, args: &str) -> Option<String> {
     match tool {
         "Bash" | "Monitor" => value.get("command").and_then(|v| v.as_str()).map(|s| {
             let cmd = s.trim();
-            let first = cmd.split_whitespace().next().unwrap_or(cmd);
-            if first.len() >= cmd.len() {
-                format!("{}:*", first)
-            } else {
-                format!("{} :*", cmd)
-            }
+            format!("{}:*", cmd)
         }),
         "Read" | "Edit" => value
             .get("file_path")
@@ -162,4 +157,75 @@ pub fn record_tool_calls(calls: &[(String, String)]) -> Result<()> {
         lines.push('\n');
     }
     crate::providers::write_file_atomic(&path, lines, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_pattern_uses_command_with_colon_wildcard() {
+        assert_eq!(
+            extract_pattern("Bash", r#"{"command":"rm -rf /"}"#),
+            Some("rm -rf /:*".into())
+        );
+        assert_eq!(
+            extract_pattern("Bash", r#"{"command":"git status"}"#),
+            Some("git status:*".into())
+        );
+        assert_eq!(
+            extract_pattern("Bash", r#"{"command":"rm"}"#),
+            Some("rm:*".into())
+        );
+    }
+
+    #[test]
+    fn bash_pattern_has_no_trailing_space() {
+        let pattern = extract_pattern("Bash", r#"{"command":"rm -rf /"}"#).unwrap();
+        assert!(
+            !pattern.ends_with(' '),
+            "pattern '{pattern}' should not end with a space"
+        );
+    }
+
+    #[test]
+    fn read_edit_patterns_use_path() {
+        assert_eq!(
+            extract_pattern("Read", r#"{"file_path":"src/main.rs"}"#),
+            Some("src/main.rs".into())
+        );
+        assert_eq!(
+            extract_pattern("Edit", r#"{"path":"/etc/passwd"}"#),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn to_allow_rules_wraps_patterns() {
+        let approvals = vec![
+            Approval {
+                tool: "Bash".into(),
+                pattern: "rm -rf /:*".into(),
+                expires_at: None,
+            },
+            Approval {
+                tool: "Read".into(),
+                pattern: "src/main.rs".into(),
+                expires_at: None,
+            },
+        ];
+        let rules = to_allow_rules(&approvals);
+        assert!(rules.contains(&"Bash(rm -rf /:*)".into()));
+        assert!(rules.contains(&"Read(src/main.rs)".into()));
+    }
+
+    #[test]
+    fn empty_pattern_yields_bare_tool() {
+        let approvals = vec![Approval {
+            tool: "Bash".into(),
+            pattern: "".into(),
+            expires_at: None,
+        }];
+        assert_eq!(to_allow_rules(&approvals), vec!["Bash".to_string()]);
+    }
 }

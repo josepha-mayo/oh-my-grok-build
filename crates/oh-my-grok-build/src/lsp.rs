@@ -308,7 +308,8 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
     let uri = Url::from_file_path(&abs)
         .map_err(|_| anyhow::anyhow!("invalid file path"))?
         .to_string();
-    let root = std::env::current_dir()?;
+    let root = dunce::canonicalize(std::env::current_dir()?)
+        .with_context(|| "failed to canonicalize workspace root")?;
     let root_uri = Url::from_file_path(&root)
         .map_err(|_| anyhow::anyhow!("invalid root path"))?
         .to_string();
@@ -387,7 +388,7 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
         })
     };
 
-    apply_workspace_edit(&edit).await?;
+    apply_workspace_edit(&edit, &root).await?;
     Ok(())
 }
 
@@ -629,14 +630,31 @@ fn position_to_byte(text: &str, pos: Position) -> Result<usize> {
     bail!("position out of range")
 }
 
-fn url_to_path(uri: &str) -> Result<std::path::PathBuf> {
+fn url_to_path(uri: &str, root: &Path) -> Result<std::path::PathBuf> {
     let url = Url::parse(uri).with_context(|| format!("invalid URI: {uri}"))?;
-    url.to_file_path()
-        .map_err(|_| anyhow::anyhow!("URI is not a file path: {uri}"))
+    let path = url
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("URI is not a file path: {uri}"))?;
+    let path = dunce::canonicalize(&path)
+        .with_context(|| format!("workspace edit URI does not exist: {uri}"))?;
+    let root = dunce::canonicalize(root)
+        .with_context(|| format!("workspace root does not exist: {}", root.display()))?;
+    if !path.starts_with(&root) {
+        bail!(
+            "workspace edit URI {} is outside workspace {}",
+            path.display(),
+            root.display()
+        );
+    }
+    Ok(path)
 }
 
-async fn apply_text_edits_to_path(uri: &str, edits_value: &serde_json::Value) -> Result<()> {
-    let path = url_to_path(uri)?;
+async fn apply_text_edits_to_path(
+    uri: &str,
+    edits_value: &serde_json::Value,
+    root: &Path,
+) -> Result<()> {
+    let path = url_to_path(uri, root)?;
     let mut edits = edits_value
         .as_array()
         .context("edits must be an array")?
@@ -665,13 +683,13 @@ async fn apply_text_edits_to_path(uri: &str, edits_value: &serde_json::Value) ->
     Ok(())
 }
 
-async fn apply_workspace_edit(edit: &serde_json::Value) -> Result<()> {
+async fn apply_workspace_edit(edit: &serde_json::Value, root: &Path) -> Result<()> {
     if let Some(changes) = edit.get("changes") {
         let changes = changes
             .as_object()
             .context("workspace changes must be an object")?;
         for (uri, edits_value) in changes {
-            apply_text_edits_to_path(uri, edits_value).await?;
+            apply_text_edits_to_path(uri, edits_value, root).await?;
         }
         return Ok(());
     }
@@ -687,7 +705,7 @@ async fn apply_workspace_edit(edit: &serde_json::Value) -> Result<()> {
                     .and_then(|u| u.as_str())
                     .context("missing textDocument uri")?;
                 if let Some(edits) = change.get("edits") {
-                    apply_text_edits_to_path(uri, edits).await?;
+                    apply_text_edits_to_path(uri, edits, root).await?;
                 }
             } else if change.get("kind").is_some() {
                 bail!("workspace file operations are not supported in refactor");

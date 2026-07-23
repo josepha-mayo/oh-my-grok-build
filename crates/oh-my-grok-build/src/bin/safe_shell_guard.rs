@@ -380,6 +380,9 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
             quote = Some(ch);
             continue;
         }
+        if SHELL_METACHARS.contains(&ch) {
+            return Err(format!("Blocked shell metacharacter '{}'", ch));
+        }
         if ch.is_whitespace() {
             if !current.is_empty() {
                 tokens.push(Token {
@@ -389,9 +392,6 @@ fn tokenize(command: &str) -> Result<Vec<Token>, String> {
                 current = String::new();
             }
             continue;
-        }
-        if SHELL_METACHARS.contains(&ch) {
-            return Err(format!("Blocked shell metacharacter '{}'", ch));
         }
         if ch == '$' || ch == '`' || (IS_WINDOWS && ch == '%') {
             if ch == '`' {
@@ -2154,6 +2154,8 @@ mod tests {
             "echo a && rm -rf /",
             "echo a | cat",
             "echo a > file",
+            "echo a\nrm -rf /",
+            "bash -c \"git status\nrm -rf /\"",
         ] {
             match dec(cmd) {
                 Decision::Allow => panic!("expected deny for {}", cmd),

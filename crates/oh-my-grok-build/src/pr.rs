@@ -98,6 +98,7 @@ async fn run_create(args: &PrCreateArgs, draft: bool) -> Result<()> {
         .base
         .clone()
         .unwrap_or_else(|| default_base_branch().unwrap_or_else(|_| "main".to_string()));
+    validate_branch_name(&base)?;
     let branch = resolve_branch(&None)?;
     let (title, body) = if args.fill {
         commit_title_body(&base, &branch)
@@ -111,20 +112,17 @@ async fn run_create(args: &PrCreateArgs, draft: bool) -> Result<()> {
     let mut cmd = tokio::process::Command::new("gh");
     cmd.arg("pr")
         .arg("create")
-        .arg("--title")
-        .arg(&title)
-        .arg("--body")
-        .arg(&body)
-        .arg("--base")
-        .arg(&base);
+        .arg(format!("--title={title}"))
+        .arg(format!("--body={body}"))
+        .arg(format!("--base={base}"));
     if draft {
         cmd.arg("--draft");
     }
     for label in &args.label {
-        cmd.arg("--label").arg(label);
+        cmd.arg(format!("--label={label}"));
     }
     for reviewer in &args.reviewer {
-        cmd.arg("--reviewer").arg(reviewer);
+        cmd.arg(format!("--reviewer={reviewer}"));
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -343,16 +341,16 @@ pub async fn pr_update(
     let mut cmd = tokio::process::Command::new("gh");
     cmd.arg("pr").arg("edit").arg(branch);
     if let Some(title) = title {
-        cmd.arg("--title").arg(title);
+        cmd.arg(format!("--title={title}"));
     }
     if let Some(body) = body {
-        cmd.arg("--body").arg(body);
+        cmd.arg(format!("--body={body}"));
     }
     for label in labels {
-        cmd.arg("--add-label").arg(label);
+        cmd.arg(format!("--add-label={label}"));
     }
     for reviewer in reviewers {
-        cmd.arg("--add-reviewer").arg(reviewer);
+        cmd.arg(format!("--add-reviewer={reviewer}"));
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -401,8 +399,7 @@ pub async fn pr_review_request(branch: &str, reviewers: &[String]) -> Result<()>
     cmd.arg("pr")
         .arg("edit")
         .arg(branch)
-        .arg("--add-reviewer")
-        .arg(&list)
+        .arg(format!("--add-reviewer={list}"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

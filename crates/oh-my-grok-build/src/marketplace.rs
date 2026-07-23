@@ -228,6 +228,7 @@ async fn run_git(tmp_home: &Path, args: &[&str], timeout: Duration) -> Result<Ou
         }
         Err(_) => {
             let _ = child.kill().await;
+            let _ = child.wait().await;
             out_handle.abort();
             err_handle.abort();
             bail!("git command timed out after {}s", timeout.as_secs());
