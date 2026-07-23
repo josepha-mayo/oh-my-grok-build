@@ -109,20 +109,30 @@ async fn run_create(args: &PrCreateArgs, draft: bool) -> Result<()> {
         )
     };
 
+    for label in &args.label {
+        validate_label(label)?;
+    }
+    for reviewer in &args.reviewer {
+        validate_reviewer(reviewer)?;
+    }
+
     let mut cmd = tokio::process::Command::new("gh");
     cmd.arg("pr")
         .arg("create")
-        .arg(format!("--title={title}"))
-        .arg(format!("--body={body}"))
-        .arg(format!("--base={base}"));
+        .arg("--title")
+        .arg(&title)
+        .arg("--body")
+        .arg(&body)
+        .arg("--base")
+        .arg(&base);
     if draft {
         cmd.arg("--draft");
     }
     for label in &args.label {
-        cmd.arg(format!("--label={label}"));
+        cmd.arg("--label").arg(label);
     }
     for reviewer in &args.reviewer {
-        cmd.arg(format!("--reviewer={reviewer}"));
+        cmd.arg("--reviewer").arg(reviewer);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -173,6 +183,32 @@ fn validate_branch_name(branch: &str) -> Result<()> {
         .any(|c| !(c.is_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')))
     {
         bail!("branch name contains disallowed character");
+    }
+    Ok(())
+}
+
+fn validate_label(label: &str) -> Result<()> {
+    if label.is_empty() {
+        bail!("label must not be empty");
+    }
+    if label.starts_with('-') {
+        bail!("label must not start with '-'");
+    }
+    if label.chars().any(|c| c.is_control() || c == '\0') {
+        bail!("label contains invalid character");
+    }
+    Ok(())
+}
+
+fn validate_reviewer(reviewer: &str) -> Result<()> {
+    if reviewer.is_empty() || reviewer.starts_with('-') {
+        bail!("invalid reviewer: {reviewer}");
+    }
+    if reviewer
+        .chars()
+        .any(|c| !(c.is_alphanumeric() || matches!(c, '-' | '/')))
+    {
+        bail!("reviewer contains invalid character: {reviewer}");
     }
     Ok(())
 }
@@ -337,20 +373,26 @@ pub async fn pr_update(
     reviewers: &[String],
 ) -> Result<()> {
     validate_branch_name(branch)?;
+    for label in labels {
+        validate_label(label)?;
+    }
+    for reviewer in reviewers {
+        validate_reviewer(reviewer)?;
+    }
     ensure_gh()?;
     let mut cmd = tokio::process::Command::new("gh");
     cmd.arg("pr").arg("edit").arg(branch);
     if let Some(title) = title {
-        cmd.arg(format!("--title={title}"));
+        cmd.arg("--title").arg(title);
     }
     if let Some(body) = body {
-        cmd.arg(format!("--body={body}"));
+        cmd.arg("--body").arg(body);
     }
     for label in labels {
-        cmd.arg(format!("--add-label={label}"));
+        cmd.arg("--add-label").arg(label);
     }
     for reviewer in reviewers {
-        cmd.arg(format!("--add-reviewer={reviewer}"));
+        cmd.arg("--add-reviewer").arg(reviewer);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -366,11 +408,17 @@ pub async fn pr_merge(branch: &str, method: &str) -> Result<()> {
     if !matches!(method.as_str(), "merge" | "squash" | "rebase") {
         bail!("unsupported merge method: {method}; expected merge, squash, or rebase");
     }
+    let method_arg = match method.as_str() {
+        "merge" => "--merge",
+        "squash" => "--squash",
+        "rebase" => "--rebase",
+        _ => unreachable!(),
+    };
     let mut cmd = tokio::process::Command::new("gh");
     cmd.arg("pr")
         .arg("merge")
         .arg(branch)
-        .arg(format!("--{method}"))
+        .arg(method_arg)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -384,14 +432,7 @@ pub async fn pr_review_request(branch: &str, reviewers: &[String]) -> Result<()>
         bail!("at least one reviewer is required");
     }
     for r in reviewers {
-        if r.is_empty() || r.starts_with('-') {
-            bail!("invalid reviewer: {r}");
-        }
-        if r.chars()
-            .any(|c| !(c.is_alphanumeric() || matches!(c, '-' | '/')))
-        {
-            bail!("reviewer contains invalid character: {r}");
-        }
+        validate_reviewer(r)?;
     }
     ensure_gh()?;
     let list = reviewers.join(",");
@@ -399,7 +440,8 @@ pub async fn pr_review_request(branch: &str, reviewers: &[String]) -> Result<()>
     cmd.arg("pr")
         .arg("edit")
         .arg(branch)
-        .arg(format!("--add-reviewer={list}"))
+        .arg("--add-reviewer")
+        .arg(&list)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

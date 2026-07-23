@@ -259,6 +259,10 @@ fn run_has_success(run: &[TimelineEvent]) -> bool {
     })
 }
 
+fn run_has_user_corrections(run: &[TimelineEvent]) -> bool {
+    run.iter().any(|e| e.category == "user_correction")
+}
+
 fn summarize_run(run: &[TimelineEvent]) -> String {
     run.iter()
         .map(|e| {
@@ -316,11 +320,13 @@ async fn llm_generate(prompt: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Read `timeline.jsonl` and, if a run had >= `threshold` tool calls, errors, and
-/// eventual success, ask the LLM to generate a reusable `Skill`.
+/// Read `timeline.jsonl` and, if a run had >= `threshold` tool calls and either
+/// (errors + eventual success) or explicit user corrections, ask the LLM to
+/// generate a reusable `Skill`.
 fn run_qualifies_for_skill(run: &[TimelineEvent], threshold: usize) -> bool {
     let tool_calls: usize = run.iter().map(tool_call_count).sum();
-    tool_calls >= threshold && run_has_errors(run) && run_has_success(run)
+    tool_calls >= threshold
+        && ((run_has_errors(run) && run_has_success(run)) || run_has_user_corrections(run))
 }
 
 pub async fn auto_create_skill_from_timeline(threshold: usize) -> Result<Option<Skill>> {
@@ -356,8 +362,9 @@ pub async fn auto_create_skill_from_timeline(threshold: usize) -> Result<Option<
     };
 
     let prompt = format!(
-        "The following is a timeline of an `omgb` run that used many tool calls, encountered errors, and eventually succeeded. \
-         Create a concise, reusable skill that would help avoid the errors and complete the task faster.\n\n{}\n\n\
+        "The following is a timeline of an `omgb` run that used many tool calls, encountered errors and eventually succeeded, \
+         or required explicit user corrections. Create a concise, reusable skill that would help avoid the errors, \
+         apply the corrections, and complete the task faster.\n\n{}\n\n\
          Return a JSON object with fields: name, trigger, steps (list of strings), pitfalls (list of strings), verification (list of strings). \
          The trigger should be a short path or keyword substring that identifies when this skill applies (e.g. \"crates/oh-my-grok-build\" or \"rust\").",
         summarize_run(run)

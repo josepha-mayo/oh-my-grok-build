@@ -637,6 +637,47 @@ fn is_git_alias_value(v: &str) -> bool {
     v.starts_with('!') || (v.contains('!') && v.contains("alias."))
 }
 
+fn is_dangerous_git_url(v: &str) -> bool {
+    let lower = v.to_lowercase();
+    if lower.starts_with("ext::") || lower.starts_with("remote-ext::") {
+        return true;
+    }
+    // Absolute/relative local paths cannot be remote-helper URLs.
+    if lower.starts_with('/')
+        || lower.starts_with("./")
+        || lower.starts_with("../")
+        || (IS_WINDOWS && lower.len() >= 2 && lower.as_bytes().get(1) == Some(&b':'))
+    {
+        return false;
+    }
+    // Remote-helper URLs look like "transport::anything" and are not "scheme://".
+    lower.contains("::") && !lower.contains("://")
+}
+
+fn git_option_deny_reason(sub: &str, u: &str) -> Option<&'static str> {
+    if u.starts_with("--config") || u == "-c" {
+        Some("git -c/--config can run arbitrary commands")
+    } else if sub == "rebase" && (u == "-x" || u == "--exec" || u.starts_with("--exec=")) {
+        Some("git rebase --exec runs arbitrary commands")
+    } else if sub == "rebase" && (u == "-i" || u == "--interactive") {
+        Some("git rebase -i requires an interactive terminal")
+    } else if (sub == "clone" || sub == "init")
+        && (u == "--template" || u.starts_with("--template="))
+    {
+        Some("git --template can run arbitrary hooks")
+    } else if (sub == "clone" || sub == "fetch" || sub == "pull")
+        && (u == "--upload-pack" || u.starts_with("--upload-pack="))
+    {
+        Some("git --upload-pack can run arbitrary commands")
+    } else if (sub == "clone" || sub == "push" || sub == "fetch")
+        && (u == "--receive-pack" || u.starts_with("--receive-pack="))
+    {
+        Some("git --receive-pack can run arbitrary commands")
+    } else {
+        None
+    }
+}
+
 fn check_git(tokens: &[Token], start: usize) -> Decision {
     let mut i = start + 1;
     let mut skip_value = false;
@@ -681,32 +722,19 @@ fn check_git(tokens: &[Token], start: usize) -> Decision {
             return Decision::Deny(format!("Blocked git subcommand: {v}"));
         }
 
-        // Scan the remainder of the command for dangerous options/aliases.
+        // Scan the remainder of the command for dangerous options/aliases/URLs.
         let sub = v.as_str();
         i += 1;
         while i < tokens.len() {
-            let t = &tokens[i];
-            let u = &t.value;
-            if t.quoted.is_some() {
-                if is_git_alias_value(u) {
-                    return Decision::Deny(
-                        "git aliases with '!' execute arbitrary commands".into(),
-                    );
-                }
-                i += 1;
-                continue;
-            }
-            if u.starts_with("--config") || u == "-c" {
-                return Decision::Deny("git -c/--config can run arbitrary commands".into());
-            }
+            let u = &tokens[i].value;
             if is_git_alias_value(u) {
                 return Decision::Deny("git aliases with '!' execute arbitrary commands".into());
             }
-            if sub == "rebase" && (u == "-x" || u == "--exec" || u.starts_with("--exec=")) {
-                return Decision::Deny("git rebase --exec runs arbitrary commands".into());
+            if let Some(reason) = git_option_deny_reason(sub, u) {
+                return Decision::Deny(reason.into());
             }
-            if sub == "rebase" && (u == "-i" || u == "--interactive") {
-                return Decision::Deny("git rebase -i requires an interactive terminal".into());
+            if !u.starts_with('-') && is_dangerous_git_url(u) {
+                return Decision::Deny("Blocked dangerous git URL".into());
             }
             i += 1;
         }
@@ -2409,6 +2437,28 @@ mod tests {
         deny("git rebase -i", "git rebase -i");
         deny("git config alias.foo '!rm'", "git aliases");
         deny("git '!rm'", "git aliases");
+    }
+
+    #[test]
+    fn git_quoted_dangerous_options_blocked() {
+        deny(r#"git rebase "-x" "rm -rf /""#, "git rebase --exec");
+        deny(r#"git rebase "--exec=rm -rf /""#, "git rebase --exec");
+        deny(r#"git rebase "-i""#, "git rebase -i");
+        deny("git clone --template=/tmp/evil repo", "git --template");
+        deny("git clone --upload-pack=/bin/rm repo", "git --upload-pack");
+        deny("git clone --config=core.pager=cat repo", "git -c/--config");
+    }
+
+    #[test]
+    fn git_remote_helper_urls_blocked() {
+        deny(r#"git clone "ext::sh -c id""#, "Blocked dangerous git URL");
+        deny(
+            r#"git remote add origin "ext::sh -c id""#,
+            "Blocked dangerous git URL",
+        );
+        deny(r#"git clone "foo::bar""#, "Blocked dangerous git URL");
+        allow(r#"git clone "https://github.com/foo/bar""#);
+        allow("git clone ../local-repo");
     }
 
     #[test]

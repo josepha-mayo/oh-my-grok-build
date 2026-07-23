@@ -150,14 +150,26 @@ pub fn taste_reject(prompt: &str, output: &str, tags: Vec<String>) -> Result<()>
 pub fn taste_edit(prompt: &str, before: &str, after: &str, tags: Vec<String>) -> Result<()> {
     with_store_lock(true, || {
         let mut store = load_store_raw()?;
+        let topic = topic_from_prompt(prompt);
         store.edited.push(TasteEdit {
             timestamp: Utc::now(),
-            topic: topic_from_prompt(prompt),
+            topic: topic.clone(),
             before: prompt_guard::limit_storage(before, 2048),
             after: prompt_guard::limit_storage(after, 2048),
-            tags,
+            tags: tags.clone(),
         });
-        save_store_raw(&store)
+        save_store_raw(&store)?;
+        let _ = crate::timeline::add_event(
+            "user_correction",
+            format!("edit for {topic}"),
+            Some(serde_json::json!({
+                "topic": topic,
+                "before": prompt_guard::limit_storage(before, 512),
+                "after": prompt_guard::limit_storage(after, 512),
+                "tags": tags,
+            })),
+        );
+        Ok(())
     })
 }
 

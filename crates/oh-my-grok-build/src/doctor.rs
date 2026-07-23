@@ -378,7 +378,9 @@ fn check_env_permissions(fix: bool) -> Result<Check> {
 
     if let Some(reason) = env_permissions_not_restricted(&path) {
         if fix {
-            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let raw = std::fs::read_to_string(&path).with_context(|| {
+                format!("failed to read {} to rewrite permissions", path.display())
+            })?;
             crate::providers::write_file_atomic(&path, raw.as_bytes(), true)
                 .context("failed to rewrite ~/.omgb/.env")?;
             return Ok(fixed_ok(

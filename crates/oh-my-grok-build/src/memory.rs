@@ -178,6 +178,14 @@ pub fn remember_one_shot(topic: &str, detail: &str) -> Result<OneShotNote> {
     let path = one_shot_path()?;
     with_file_lock(&path, true, || {
         let mut notes = load_one_shots()?;
+        let topic_norm = topic.trim().to_lowercase();
+        let detail_norm = detail.trim().to_lowercase();
+        if let Some(existing) = notes.iter().find(|n| {
+            n.topic.trim().to_lowercase() == topic_norm
+                && n.detail.trim().to_lowercase() == detail_norm
+        }) {
+            return Ok(existing.clone());
+        }
         let note = OneShotNote {
             id: uuid::Uuid::new_v4().to_string(),
             created_at: now(),
@@ -433,6 +441,20 @@ mod tests {
         assert_eq!(second.len(), 1);
         let third = recall_one_shot("meeting", 10).unwrap();
         assert!(third.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+        unsafe { std::env::remove_var("OMGB_HOME") };
+    }
+
+    #[test]
+    fn test_remember_one_shot_dedup() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = tmp_home();
+        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        let a = remember_one_shot("todo", "fix permissions").unwrap();
+        let b = remember_one_shot("todo", "fix permissions").unwrap();
+        assert_eq!(a.id, b.id);
+        let all = recall_one_shot("todo", 10).unwrap();
+        assert_eq!(all.len(), 1);
         std::fs::remove_dir_all(&home).ok();
         unsafe { std::env::remove_var("OMGB_HOME") };
     }

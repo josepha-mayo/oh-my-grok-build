@@ -488,59 +488,38 @@ async fn refresh_plugins(args: &PluginRefreshArgs) -> Result<()> {
         return Ok(());
     }
 
-    if args.async_refresh {
-        // Run all refreshes concurrently so no single hung source blocks the rest.
-        let futures: Vec<_> = targets
-            .into_iter()
-            .filter_map(|(name, path)| {
-                let meta = match read_source_meta(&path) {
-                    Ok(Some(m)) => m,
-                    Ok(None) => {
-                        eprintln!("warning: plugin {name} has no source metadata; skipping");
-                        return None;
-                    }
-                    Err(e) => {
-                        eprintln!("warning: plugin {name}: {e}; skipping");
-                        return None;
-                    }
-                };
-                if !meta.source.starts_with("http://") && !meta.source.starts_with("https://") {
-                    eprintln!("warning: plugin {name} source is not remote; skipping");
+    // Run all refreshes concurrently so no single hung source blocks the rest.
+    let futures: Vec<_> = targets
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let meta = match read_source_meta(&path) {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    eprintln!("warning: plugin {name} has no source metadata; skipping");
                     return None;
                 }
-                Some(tokio::spawn(async move {
-                    (
-                        name.clone(),
-                        refresh_one(&name, &path, &meta.source, meta.sha.as_deref()).await,
-                    )
-                }))
-            })
-            .collect();
-        for handle in futures {
-            match handle.await {
-                Ok((name, Ok(()))) => println!("refreshed plugin {name}"),
-                Ok((_, Err(e))) => eprintln!("refresh failed: {e}"),
-                Err(e) => eprintln!("refresh task panicked: {e}"),
+                Err(e) => {
+                    eprintln!("warning: plugin {name}: {e}; skipping");
+                    return None;
+                }
+            };
+            if !meta.source.starts_with("http://") && !meta.source.starts_with("https://") {
+                eprintln!("warning: plugin {name} source is not remote; skipping");
+                return None;
             }
-        }
-        return Ok(());
-    }
-
-    for (name, path) in targets {
-        let meta = match read_source_meta(&path)? {
-            Some(m) => m,
-            None => {
-                eprintln!("warning: plugin {name} has no source metadata; skipping");
-                continue;
-            }
-        };
-        if !meta.source.starts_with("http://") && !meta.source.starts_with("https://") {
-            eprintln!("warning: plugin {name} source is not remote; skipping");
-            continue;
-        }
-        match refresh_one(&name, &path, &meta.source, meta.sha.as_deref()).await {
-            Ok(()) => println!("refreshed plugin {name}"),
-            Err(e) => eprintln!("refresh failed for {name}: {e}"),
+            Some(tokio::spawn(async move {
+                (
+                    name.clone(),
+                    refresh_one(&name, &path, &meta.source, meta.sha.as_deref()).await,
+                )
+            }))
+        })
+        .collect();
+    for handle in futures {
+        match handle.await {
+            Ok((name, Ok(()))) => println!("refreshed plugin {name}"),
+            Ok((_, Err(e))) => eprintln!("refresh failed: {e}"),
+            Err(e) => eprintln!("refresh task panicked: {e}"),
         }
     }
     Ok(())

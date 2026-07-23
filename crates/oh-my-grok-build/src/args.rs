@@ -697,9 +697,6 @@ pub struct PluginInstallArgs {
 pub struct PluginRefreshArgs {
     /// Plugin name to refresh (refresh all if omitted)
     pub name: Option<String>,
-    /// Non-blocking refresh: do not wait for each source
-    #[arg(long)]
-    pub async_refresh: bool,
 }
 
 #[derive(Debug, Args, Clone)]
