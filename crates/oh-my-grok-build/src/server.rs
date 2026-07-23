@@ -529,6 +529,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/acp", get(ws_handler))
         .with_state(state);
     let listener = TcpListener::bind(bind_addr).await?;
     let actual_addr = listener.local_addr()?;

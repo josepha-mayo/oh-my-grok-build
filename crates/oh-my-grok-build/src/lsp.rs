@@ -94,7 +94,7 @@ fn pick_adapter(program: &Path) -> Result<(&'static str, &'static [&'static str]
         "py" => &["debugpy"],
         "go" => &["dlv"],
         "js" | "ts" | "mjs" | "cjs" => &["js-debug-adapter"],
-        "dll" | "exe" => &["netcoredbg"],
+        "dll" | "exe" => &["lldb-dap", "gdb", "netcoredbg"],
         "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" | "rs" => &["lldb-dap", "gdb"],
         _ => &[
             "lldb-dap",
@@ -328,7 +328,9 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
         .map_err(|_| anyhow::anyhow!("invalid root path"))?
         .to_string();
 
-    let mut cmd = tokio::process::Command::new(server.command[0]);
+    let server_path = which::which(server.command[0])
+        .with_context(|| format!("LSP server {} not found", server.command[0]))?;
+    let mut cmd = tokio::process::Command::new(server_path);
     cmd.args(&server.command[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -408,9 +410,9 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
 
 pub async fn dap_attach(program: &Path, pid: u32, extra_args: &[String]) -> Result<()> {
     let (id, cmd) = pick_adapter(program)?;
-    which::which(cmd[0]).with_context(|| format!("DAP adapter {id} not found"))?;
+    let adapter = which::which(cmd[0]).with_context(|| format!("DAP adapter {id} not found"))?;
 
-    let mut command = tokio::process::Command::new(cmd[0]);
+    let mut command = tokio::process::Command::new(adapter);
     command
         .args(&cmd[1..])
         .args(extra_args)
@@ -546,7 +548,9 @@ async fn start_lsp(args: &LspStartArgs) -> Result<()> {
     } else {
         args.languages.clone()
     };
-    let mut cmd = tokio::process::Command::new(server.command[0]);
+    let server_path = which::which(server.command[0])
+        .with_context(|| format!("LSP server {} not found", server.command[0]))?;
+    let mut cmd = tokio::process::Command::new(server_path);
     cmd.args(&server.command[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -568,7 +572,9 @@ async fn start_adapter(adapter: &str, extra: &[String]) -> Result<()> {
     let cmd = map
         .get(adapter)
         .with_context(|| format!("unknown DAP adapter: {adapter}"))?;
-    let child = tokio::process::Command::new(cmd[0])
+    let adapter_path =
+        which::which(cmd[0]).with_context(|| format!("DAP adapter {adapter} not found"))?;
+    let child = tokio::process::Command::new(adapter_path)
         .args(&cmd[1..])
         .args(extra)
         .stdin(Stdio::piped())

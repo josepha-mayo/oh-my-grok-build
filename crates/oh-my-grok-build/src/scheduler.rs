@@ -447,13 +447,16 @@ pub fn stop_daemon() -> Result<()> {
     }
     #[cfg(unix)]
     {
-        std::process::Command::new("kill")
+        let kill = which::which("kill").unwrap_or_else(|_| PathBuf::from("/bin/kill"));
+        std::process::Command::new(kill)
             .args(["-TERM", &pid.to_string()])
             .spawn()?;
     }
     #[cfg(not(unix))]
     {
-        std::process::Command::new("taskkill")
+        let taskkill = which::which("taskkill")
+            .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32\taskkill.exe"));
+        std::process::Command::new(taskkill)
             .args(["/PID", &pid.to_string(), "/F"])
             .spawn()?;
     }

@@ -483,7 +483,8 @@ fn find_workspace_root() -> Option<PathBuf> {
 
 async fn build_and_copy_safe_shell_guard(root: &Path, dst: &Path) -> Result<()> {
     let profile = build_profile();
-    let mut cmd = tokio::process::Command::new("cargo");
+    let cargo = which::which("cargo").context("`cargo` not found on PATH")?;
+    let mut cmd = tokio::process::Command::new(cargo);
     cmd.arg("build")
         .arg("-p")
         .arg("oh-my-grok-build")
@@ -644,10 +645,7 @@ fn check_stale_daemons(fix: bool) -> Result<Check> {
 }
 
 async fn check_git() -> Result<Check> {
-    let output = tokio::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .await;
+    let output = crate::git_cmd().arg("--version").output().await;
     match output {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);

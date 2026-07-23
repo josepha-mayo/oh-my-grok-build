@@ -125,6 +125,17 @@ const UNSAFE_ENV_KEYS: &[&str] = &[
     "ENV",
     "BASH_ENV",
     "PROMPT_COMMAND",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_PAGER",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_ATTR_GLOBAL",
+    "GIT_ATTR_SYSTEM",
+    "EMAIL",
 ];
 
 const HOOK_DIR_MARKERS: &[&str] = &[".grok/hooks", ".omgb/hooks"];
@@ -166,6 +177,45 @@ const GIT_GLOBAL_OPTS_WITH_VALUES: &[&str] = &[
     "--super-prefix",
     "--exec-path",
 ];
+
+/// Git config keys that, when set, can cause git to execute arbitrary commands
+/// or run arbitrary hooks the next time a git command is invoked.
+const GIT_CONFIG_EXEC_KEYS: &[&str] = &[
+    "core.pager",
+    "core.editor",
+    "core.hooksPath",
+    "core.fsmonitor",
+    "core.preloadIndex",
+    "core.excludesFile",
+    "core.worktree",
+    "core.sshCommand",
+    "core.ssh",
+    "gpg.program",
+    "init.templateDir",
+    "diff.external",
+    "merge.tool",
+];
+
+fn is_dangerous_git_config_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    if lower.starts_with("alias.") {
+        return true;
+    }
+    if GIT_CONFIG_EXEC_KEYS
+        .iter()
+        .any(|k| lower.eq_ignore_ascii_case(k))
+    {
+        return true;
+    }
+    let parts: Vec<&str> = lower.split('.').collect();
+    if parts.len() >= 3
+        && parts[0] == "filter"
+        && ["clean", "smudge", "process"].contains(&parts[parts.len() - 1])
+    {
+        return true;
+    }
+    parts[0] == "include" || parts[0].starts_with("includeif")
+}
 
 const NORMALIZABLE_STEMS: &[&str] = &[
     "python",
@@ -520,6 +570,8 @@ fn is_unsafe_env_key(key: &str) -> bool {
     UNSAFE_ENV_KEYS.contains(&upper.as_str())
         || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
+        || upper.starts_with("GIT_CONFIG_KEY_")
+        || upper.starts_with("GIT_CONFIG_VALUE_")
 }
 
 fn has_unsafe_env_assignment(token: &Token) -> Option<String> {
@@ -546,20 +598,25 @@ fn omg_dir() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".omgb"))
 }
 
+fn normalize_folder_path(s: &str) -> Option<String> {
+    let p = s.replace('\\', "/").trim_end_matches('/').to_string();
+    if p.is_empty() {
+        return None;
+    }
+    if !(p.starts_with('/') || (IS_WINDOWS && p.len() > 2 && p.as_bytes().get(1) == Some(&b':'))) {
+        return None;
+    }
+    let path = PathBuf::from(&p);
+    let resolved = dunce::canonicalize(&path).unwrap_or(path);
+    let mut s = resolved.to_string_lossy().replace('\\', "/");
+    if !s.ends_with('/') {
+        s.push('/');
+    }
+    Some(s.to_lowercase())
+}
+
 fn normalize_folders<'a>(iter: impl Iterator<Item = &'a str>) -> Vec<String> {
-    iter.map(|s| {
-        let mut s = s.replace('\\', "/").trim_end_matches('/').to_string();
-        if !s.is_empty() && !s.ends_with('/') {
-            s.push('/');
-        }
-        s.to_lowercase()
-    })
-    .filter(|s| {
-        !s.is_empty()
-            && (s.starts_with('/')
-                || (IS_WINDOWS && s.len() > 2 && s.as_bytes().get(1) == Some(&b':')))
-    })
-    .collect()
+    iter.filter_map(normalize_folder_path).collect()
 }
 
 fn trusted_folders() -> Vec<String> {
@@ -585,17 +642,22 @@ fn current_dir() -> String {
         .unwrap_or_default()
 }
 
-fn normalize_path(cwd: &str, p: &str) -> Option<String> {
+fn joined_path(cwd: &str, p: &str) -> Option<PathBuf> {
     let p = p.replace('\\', "/");
-    let joined = if p.starts_with('/')
-        || (IS_WINDOWS && p.len() > 1 && p.as_bytes().get(1) == Some(&b':'))
-    {
-        PathBuf::from(&p)
+    if p.is_empty() {
+        return None;
+    }
+    if p.starts_with('/') || (IS_WINDOWS && p.len() > 1 && p.as_bytes().get(1) == Some(&b':')) {
+        Some(PathBuf::from(&p))
     } else {
-        PathBuf::from(cwd).join(&p)
-    };
-    let normalized: PathBuf = joined.components().collect();
-    let mut s = normalized.to_string_lossy().replace('\\', "/");
+        Some(PathBuf::from(cwd).join(&p))
+    }
+}
+
+fn normalize_path(cwd: &str, p: &str) -> Option<String> {
+    let joined = joined_path(cwd, p)?;
+    let resolved = dunce::simplified(&joined).to_path_buf();
+    let mut s = resolved.to_string_lossy().replace('\\', "/");
     if !s.ends_with('/') {
         s.push('/');
     }
@@ -606,7 +668,19 @@ fn is_path_trusted(cwd: &str, p: &str, trusted: &[String]) -> bool {
     let Some(normalized) = normalize_path(cwd, p) else {
         return false;
     };
-    trusted.iter().any(|t| normalized.starts_with(t))
+    if !trusted.iter().any(|t| normalized.starts_with(t)) {
+        return false;
+    }
+    // If the path is a symlink, deny it: the symlink target can be swapped
+    // between our check and the shell's execution, creating a TOCTOU window.
+    if let Some(joined) = joined_path(cwd, p) {
+        if let Ok(meta) = std::fs::symlink_metadata(&joined) {
+            if meta.file_type().is_symlink() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn is_project_hook_command(cmd: &str) -> bool {
@@ -614,10 +688,41 @@ fn is_project_hook_command(cmd: &str) -> bool {
     HOOK_DIR_MARKERS.iter().any(|m| norm.contains(m))
 }
 
+fn is_shell_source_ext(path: &str) -> bool {
+    const ALLOWED: &[&str] = &[
+        "",
+        "sh",
+        "bash",
+        "zsh",
+        "ksh",
+        "csh",
+        "tcsh",
+        "fish",
+        "env",
+        "profile",
+        "bashrc",
+        "zshrc",
+        "bash_profile",
+        "bash_login",
+        "bash_logout",
+        "zlogout",
+        "zprofile",
+    ];
+    let lower = path.to_lowercase();
+    if let Some(idx) = lower.rfind('.') {
+        let ext = &lower[idx + 1..];
+        return ALLOWED.iter().any(|a| *a == ext);
+    }
+    true
+}
+
 fn check_source(tokens: &[Token], i: usize) -> Decision {
     let Some(token) = tokens.get(i + 1) else {
         return Decision::Deny("Blocked sourced script (no path)".into());
     };
+    if !is_shell_source_ext(&token.value) {
+        return Decision::Deny("Blocked sourced script (non-shell extension)".into());
+    }
     if is_path_trusted(&current_dir(), &token.value, &trusted_folders()) {
         Decision::Allow
     } else {
@@ -725,6 +830,7 @@ fn check_git(tokens: &[Token], start: usize) -> Decision {
         // Scan the remainder of the command for dangerous options/aliases/URLs.
         let sub = v.as_str();
         i += 1;
+        let mut config_non_options: Vec<&str> = Vec::new();
         while i < tokens.len() {
             let u = &tokens[i].value;
             if is_git_alias_value(u) {
@@ -733,10 +839,21 @@ fn check_git(tokens: &[Token], start: usize) -> Decision {
             if let Some(reason) = git_option_deny_reason(sub, u) {
                 return Decision::Deny(reason.into());
             }
-            if !u.starts_with('-') && is_dangerous_git_url(u) {
-                return Decision::Deny("Blocked dangerous git URL".into());
+            if !u.starts_with('-') {
+                if sub == "config" {
+                    config_non_options.push(u);
+                }
+                if is_dangerous_git_url(u) {
+                    return Decision::Deny("Blocked dangerous git URL".into());
+                }
             }
             i += 1;
+        }
+        if sub == "config"
+            && config_non_options.len() >= 2
+            && is_dangerous_git_config_key(config_non_options[0])
+        {
+            return Decision::Deny("git config key can run arbitrary commands".into());
         }
         return Decision::Allow;
     }
@@ -874,8 +991,18 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
 
     if base == "dd" {
         let argv: Vec<&str> = tokens[i..].iter().map(|t| t.value.as_str()).collect();
-        if argv.iter().any(|a| a.to_lowercase().contains("of=/dev/")) {
-            return Decision::Deny("Blocked dd writing to a raw device".into());
+        for a in &argv {
+            let lower = a.to_lowercase();
+            if let Some(path) = lower.strip_prefix("of=") {
+                let norm = path.replace('\\', "/");
+                if norm.starts_with("/dev/") || norm.starts_with("//./") || norm.starts_with("//?/")
+                {
+                    return Decision::Deny("Blocked dd writing to a raw device".into());
+                }
+            }
+            if lower.contains("of=/dev/") {
+                return Decision::Deny("Blocked dd writing to a raw device".into());
+            }
         }
         return Decision::Allow;
     }
@@ -1382,26 +1509,20 @@ fn parse_cmd(tokens: &[Token], i: usize) -> PrefixOutcome {
             if j + 1 >= tokens.len() {
                 return PrefixOutcome::Stop(Decision::Deny("cmd missing command string".into()));
             }
-            if j + 2 == tokens.len() && tokens[j + 1].quoted.is_some() {
-                let inner = match tokenize(&tokens[j + 1].value) {
-                    Ok(t) => t,
-                    Err(e) => return PrefixOutcome::Stop(Decision::Deny(e)),
-                };
-                let first = first_command_token(&inner, 0);
-                if let Some((_, ref base)) = first
-                    && WINDOWS_CMD_LAUNCHERS.contains(&base.as_str())
-                {
-                    return PrefixOutcome::Stop(Decision::Deny(format!(
-                        "Blocked unanalyzable command: {}",
-                        base
-                    )));
-                }
-                return PrefixOutcome::Stop(evaluate_tokens(
-                    &inner,
-                    first.map(|(idx, _)| idx).unwrap_or(inner.len()),
-                ));
-            }
-            let first = first_command_token(tokens, j + 1);
+            // cmd /c treats the rest of the line as one command string. Re-tokenize
+            // the tail so that a single quoted argument such as "call foo.bat" or
+            // "powershell -Command ..." is broken into words and checked for Windows
+            // launchers, script extensions, and interpreters.
+            let tail = tokens[j + 1..]
+                .iter()
+                .map(|t| t.value.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let inner = match tokenize(&tail) {
+                Ok(t) => t,
+                Err(e) => return PrefixOutcome::Stop(Decision::Deny(e)),
+            };
+            let first = first_command_token(&inner, 0);
             if let Some((_, ref base)) = first
                 && WINDOWS_CMD_LAUNCHERS.contains(&base.as_str())
             {
@@ -1411,8 +1532,8 @@ fn parse_cmd(tokens: &[Token], i: usize) -> PrefixOutcome {
                 )));
             }
             return PrefixOutcome::Stop(evaluate_tokens(
-                tokens,
-                first.map(|(idx, _)| idx).unwrap_or(tokens.len()),
+                &inner,
+                first.map(|(idx, _)| idx).unwrap_or(inner.len()),
             ));
         }
         if v.starts_with('/') && v.len() > 1 {
@@ -2256,6 +2377,38 @@ mod tests {
             ),
             ("pyw3 -c \"print(1)\"", "Blocked unanalyzable command: pyw"),
             ("rm -rf ~/", "Blocked rm -rf on a dangerous target"),
+            (
+                "dd if=/dev/zero of=\\\\.\\PhysicalDrive0",
+                "Blocked dd writing to a raw device",
+            ),
+            (
+                "git config core.pager \"bash -c 'rm -rf /'\"",
+                "git config key can run arbitrary commands",
+            ),
+            (
+                "git config --global alias.x rm",
+                "git config key can run arbitrary commands",
+            ),
+            (
+                "git config core.sshCommand \"bash -c 'rm -rf /'\"",
+                "git config key can run arbitrary commands",
+            ),
+            (
+                "git config gpg.program rm",
+                "git config key can run arbitrary commands",
+            ),
+            (
+                "git config filter.lfs.clean rm",
+                "git config key can run arbitrary commands",
+            ),
+            (
+                "git config include.path /tmp/evil",
+                "git config key can run arbitrary commands",
+            ),
+            (
+                "git config includeIf.gitdir:foo.path /tmp/evil",
+                "git config key can run arbitrary commands",
+            ),
         ] {
             deny(cmd, reason);
         }

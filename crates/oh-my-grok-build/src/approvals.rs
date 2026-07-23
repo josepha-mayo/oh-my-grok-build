@@ -15,12 +15,27 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_APPROVAL_TTL_DAYS: i64 = 30;
 const MAX_APPROVALS: usize = 10_000;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Approval {
     pub tool: String,
     pub pattern: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl PartialEq for Approval {
+    fn eq(&self, other: &Self) -> bool {
+        self.tool == other.tool && self.pattern == other.pattern
+    }
+}
+
+impl Eq for Approval {}
+
+impl std::hash::Hash for Approval {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.tool.hash(state);
+        self.pattern.hash(state);
+    }
 }
 
 fn approvals_path() -> Result<PathBuf> {
@@ -59,13 +74,8 @@ pub fn load_approvals(now: DateTime<Utc>) -> Result<Vec<Approval>> {
 pub fn to_allow_rules(approvals: &[Approval]) -> Vec<String> {
     approvals
         .iter()
-        .map(|a| {
-            if a.pattern.is_empty() {
-                a.tool.clone()
-            } else {
-                format!("{}({})", a.tool, a.pattern)
-            }
-        })
+        .filter(|a| !a.pattern.is_empty())
+        .map(|a| format!("{}({})", a.tool, a.pattern))
         .collect()
 }
 
@@ -96,7 +106,7 @@ fn extract_pattern(tool: &str, args: &str) -> Option<String> {
     }
     let value: serde_json::Value =
         serde_json::from_str(args).unwrap_or(serde_json::Value::String(args.to_string()));
-    match tool {
+    let pattern = match tool {
         "Bash" | "Monitor" => value
             .get("command")
             .and_then(|v| v.as_str())
@@ -124,7 +134,14 @@ fn extract_pattern(tool: &str, args: &str) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string()),
         _ => Some(args.to_string()),
-    }
+    };
+    pattern.filter(|p| !p.is_empty())
+}
+
+/// Shell tools are not persisted as approvals because a command string can hide
+/// destructive subcommands (interpreters, env -S, sudo, pipes, etc.).
+fn should_record(tool: &str) -> bool {
+    !matches!(tool, "Bash" | "Monitor")
 }
 
 pub fn record_tool_calls(calls: &[(String, String)]) -> Result<()> {
@@ -137,9 +154,15 @@ pub fn record_tool_calls(calls: &[(String, String)]) -> Result<()> {
     let now = Utc::now();
     for (name, args) in calls {
         let tool = normalize_tool_name(name);
+        if !should_record(&tool) {
+            continue;
+        }
         let Some(pattern) = extract_pattern(&tool, args) else {
             continue;
         };
+        if pattern.is_empty() {
+            continue;
+        }
         existing.insert(Approval {
             tool,
             pattern,
@@ -220,12 +243,22 @@ mod tests {
     }
 
     #[test]
-    fn empty_pattern_yields_bare_tool() {
-        let approvals = vec![Approval {
-            tool: "Bash".into(),
-            pattern: "".into(),
-            expires_at: None,
-        }];
-        assert_eq!(to_allow_rules(&approvals), vec!["Bash".to_string()]);
+    fn empty_pattern_is_skipped() {
+        let approvals = vec![
+            Approval {
+                tool: "Bash".into(),
+                pattern: "".into(),
+                expires_at: None,
+            },
+            Approval {
+                tool: "Read".into(),
+                pattern: "src/main.rs".into(),
+                expires_at: None,
+            },
+        ];
+        assert_eq!(
+            to_allow_rules(&approvals),
+            vec!["Read(src/main.rs)".to_string()]
+        );
     }
 }

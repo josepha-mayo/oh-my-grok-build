@@ -126,13 +126,17 @@ fn resolve_executable(name: &str, cwd: Option<&std::path::Path>) -> Result<PathB
         && candidate.components().count() > 1;
 
     // Single-component names and relative paths are both resolved against cwd first,
-    // then PATH, so connectors whose binaries live in the connector cwd work.
+    // then PATH, then the curated minimal PATH directories, so connectors whose
+    // binaries live in the connector cwd or in standard install locations work.
     if let Some(dir) = cwd {
         if let Some(p) = try_dir(dir) {
             return Ok(p);
         }
         if is_relative_path {
-            return Ok(candidate);
+            bail!(
+                "connector command not found in connector cwd: {}",
+                candidate.display()
+            );
         }
     }
 
@@ -143,7 +147,14 @@ fn resolve_executable(name: &str, cwd: Option<&std::path::Path>) -> Result<PathB
             }
         }
     }
-    Ok(candidate)
+
+    for dir in base_dirs() {
+        if let Some(p) = try_dir(&dir) {
+            return Ok(p);
+        }
+    }
+
+    bail!("connector command not found: {}", candidate.display())
 }
 
 fn minimal_path(binary_dir: Option<&std::path::Path>) -> String {

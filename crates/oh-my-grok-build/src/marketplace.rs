@@ -178,14 +178,13 @@ fn remove_symlinks_in_dir(dir: &Path) -> Result<()> {
 }
 
 fn base_git_cmd(tmp_home: &Path) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::git_cmd();
     cmd.stdin(Stdio::null())
         .env("HOME", tmp_home)
         .env("USERPROFILE", tmp_home)
         .env("XDG_CONFIG_HOME", tmp_home)
         .env("GIT_TEMPLATE_DIR", tmp_home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     cmd
 }
 

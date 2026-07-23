@@ -51,6 +51,11 @@ fn ensure_gh() -> Result<std::path::PathBuf> {
     which::which("gh").with_context(|| "`gh` CLI not found; install from https://cli.github.com")
 }
 
+fn gh_cmd() -> Result<tokio::process::Command> {
+    let path = ensure_gh()?;
+    Ok(tokio::process::Command::new(path))
+}
+
 async fn run_status(args: &PrStatusArgs) -> Result<()> {
     let branch = resolve_branch(&args.branch)?;
     println!("{}", pr_summarize(&branch).await?);
@@ -60,6 +65,8 @@ async fn run_status(args: &PrStatusArgs) -> Result<()> {
 fn default_base_branch() -> Result<String> {
     for base in ["main", "master"] {
         let out = SyncCommand::new("git")
+            .env("GIT_PAGER", "cat")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .args(["rev-parse", "--verify", &format!("origin/{base}")])
             .output()?;
         if out.status.success() {
@@ -71,6 +78,8 @@ fn default_base_branch() -> Result<String> {
 
 fn commit_title_body(base: &str, branch: &str) -> (String, String) {
     let out = SyncCommand::new("git")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .args([
             "log",
             &format!("{base}..{branch}"),
@@ -116,23 +125,20 @@ async fn run_create(args: &PrCreateArgs, draft: bool) -> Result<()> {
         validate_reviewer(reviewer)?;
     }
 
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = gh_cmd()?;
     cmd.arg("pr")
         .arg("create")
-        .arg("--title")
-        .arg(&title)
-        .arg("--body")
-        .arg(&body)
-        .arg("--base")
-        .arg(&base);
+        .arg(format!("--title={title}"))
+        .arg(format!("--body={body}"))
+        .arg(format!("--base={base}"));
     if draft {
         cmd.arg("--draft");
     }
     for label in &args.label {
-        cmd.arg("--label").arg(label);
+        cmd.arg(format!("--label={label}"));
     }
     for reviewer in &args.reviewer {
-        cmd.arg("--reviewer").arg(reviewer);
+        cmd.arg(format!("--reviewer={reviewer}"));
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -216,6 +222,8 @@ fn validate_reviewer(reviewer: &str) -> Result<()> {
 fn resolve_branch(branch: &Option<String>) -> Result<String> {
     let branch = branch.clone().unwrap_or_else(|| {
         std::process::Command::new("git")
+            .env("GIT_PAGER", "cat")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .args(["branch", "--show-current"])
             .output()
             .ok()
@@ -268,7 +276,7 @@ fn normalize_state(state: Option<&str>, is_draft: bool) -> String {
 
 async fn gh_pr_view(branch: &str) -> Result<PrData> {
     let _ = ensure_gh()?;
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = gh_cmd()?;
     cmd.args([
         "pr",
         "view",
@@ -286,7 +294,7 @@ async fn gh_pr_view(branch: &str) -> Result<PrData> {
     let number = parsed.number.unwrap_or(0);
     let state = normalize_state(parsed.state.as_deref(), parsed.is_draft.unwrap_or(false));
     let is_in_merge_queue = if state == "open" {
-        gh_pr_is_in_merge_queue(&url).await
+        gh_pr_is_in_merge_queue(&url).await.unwrap_or(false)
     } else {
         false
     };
@@ -299,8 +307,8 @@ async fn gh_pr_view(branch: &str) -> Result<PrData> {
     })
 }
 
-async fn gh_pr_is_in_merge_queue(pr_url: &str) -> bool {
-    let mut cmd = tokio::process::Command::new("gh");
+async fn gh_pr_is_in_merge_queue(pr_url: &str) -> Result<bool> {
+    let mut cmd = gh_cmd()?;
     const QUERY: &str =
         "query($url: URI!) { resource(url: $url) { ... on PullRequest { isInMergeQueue } } }";
     cmd.args([
@@ -328,12 +336,12 @@ async fn gh_pr_is_in_merge_queue(pr_url: &str) -> bool {
             struct Resource {
                 is_in_merge_queue: Option<bool>,
             }
-            serde_json::from_str::<Root>(&out)
+            Ok(serde_json::from_str::<Root>(&out)
                 .ok()
                 .and_then(|r| r.data?.resource?.is_in_merge_queue)
-                .unwrap_or(false)
+                .unwrap_or(false))
         }
-        Err(_) => false,
+        Err(_) => Ok(false),
     }
 }
 
@@ -349,7 +357,7 @@ async fn run_gh(mut cmd: tokio::process::Command) -> Result<String> {
 pub async fn pr_status_json(branch: &str) -> Result<Value> {
     validate_branch_name(branch)?;
     ensure_gh()?;
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = gh_cmd()?;
     cmd.args([
         "pr",
         "view",
@@ -380,19 +388,19 @@ pub async fn pr_update(
         validate_reviewer(reviewer)?;
     }
     ensure_gh()?;
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = gh_cmd()?;
     cmd.arg("pr").arg("edit").arg(branch);
     if let Some(title) = title {
-        cmd.arg("--title").arg(title);
+        cmd.arg(format!("--title={title}"));
     }
     if let Some(body) = body {
-        cmd.arg("--body").arg(body);
+        cmd.arg(format!("--body={body}"));
     }
     for label in labels {
-        cmd.arg("--add-label").arg(label);
+        cmd.arg(format!("--add-label={label}"));
     }
     for reviewer in reviewers {
-        cmd.arg("--add-reviewer").arg(reviewer);
+        cmd.arg(format!("--add-reviewer={reviewer}"));
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -414,7 +422,7 @@ pub async fn pr_merge(branch: &str, method: &str) -> Result<()> {
         "rebase" => "--rebase",
         _ => unreachable!(),
     };
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = gh_cmd()?;
     cmd.arg("pr")
         .arg("merge")
         .arg(branch)
@@ -436,12 +444,11 @@ pub async fn pr_review_request(branch: &str, reviewers: &[String]) -> Result<()>
     }
     ensure_gh()?;
     let list = reviewers.join(",");
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = gh_cmd()?;
     cmd.arg("pr")
         .arg("edit")
         .arg(branch)
-        .arg("--add-reviewer")
-        .arg(&list)
+        .arg(format!("--add-reviewer={list}"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -452,7 +459,7 @@ pub async fn pr_review_request(branch: &str, reviewers: &[String]) -> Result<()>
 pub async fn pr_check_failures(branch: &str) -> Result<Vec<String>> {
     validate_branch_name(branch)?;
     ensure_gh()?;
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = gh_cmd()?;
     cmd.args(["pr", "checks", branch, "--json", "name,state,link"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -1,7 +1,10 @@
 //! `oh-my-grok-build` / `omgb` composition-root binary.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -99,6 +102,100 @@ pub fn main() -> Result<()> {
         .enable_all()
         .build()?
         .block_on(async_main(cli))
+}
+
+static GIT_EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static SAFE_PATH: OnceLock<OsString> = OnceLock::new();
+
+fn git_executable_path() -> Option<&'static PathBuf> {
+    GIT_EXE
+        .get_or_init(|| {
+            let exe = if cfg!(windows) { "git.exe" } else { "git" };
+            std::env::var_os("PATH").and_then(|path_var| {
+                std::env::split_paths(&path_var)
+                    .map(|d| d.join(exe))
+                    .find(|p| p.is_file())
+            })
+        })
+        .as_ref()
+}
+
+fn safe_path() -> &'static OsString {
+    SAFE_PATH.get_or_init(|| {
+        let mut dirs = Vec::new();
+        if let Some(git) = git_executable_path()
+            && let Some(parent) = git.parent()
+        {
+            dirs.push(parent.to_path_buf());
+            if let Some(gp) = parent.parent() {
+                for sub in &[
+                    "bin",
+                    "usr/bin",
+                    "mingw64/bin",
+                    "libexec/git-core",
+                    "usr/libexec/git-core",
+                    "mingw64/libexec/git-core",
+                ] {
+                    dirs.push(gp.join(sub));
+                }
+            }
+        }
+        if cfg!(windows) {
+            if let Ok(windir) = std::env::var("SystemRoot") {
+                dirs.push(PathBuf::from(&windir).join("system32"));
+                dirs.push(PathBuf::from(windir));
+            }
+        } else {
+            for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+                dirs.push(PathBuf::from(d));
+            }
+        }
+        let seen: HashSet<_> = dirs.into_iter().filter(|p| p.is_dir()).collect();
+        std::env::join_paths(seen).unwrap_or_else(|_| OsString::new())
+    })
+}
+
+fn git_exec_path() -> Option<PathBuf> {
+    git_executable_path().and_then(|git| {
+        for anc in git.ancestors() {
+            for sub in &[
+                "libexec/git-core",
+                "mingw64/libexec/git-core",
+                "usr/libexec/git-core",
+            ] {
+                let candidate = anc.join(sub);
+                if candidate.is_dir() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Returns a `git` command with a sanitized environment: a minimal PATH, no
+/// inherited `GIT_*` or `LD_*` variables, and pager/editor/askpass disabled.
+pub(crate) fn git_cmd() -> Command {
+    let mut cmd = if let Some(git) = git_executable_path() {
+        Command::new(git)
+    } else {
+        Command::new("git")
+    };
+    cmd.env_clear();
+    if let Some(home) = dirs::home_dir() {
+        cmd.env("HOME", &home);
+        cmd.env("USERPROFILE", &home);
+    }
+    if let Some(exec_path) = git_exec_path() {
+        cmd.env("GIT_EXEC_PATH", exec_path);
+    }
+    cmd.env("PATH", safe_path())
+        .env("GIT_PAGER", "cat")
+        .env("GIT_EDITOR", "")
+        .env("GIT_SEQUENCE_EDITOR", "")
+        .env("GIT_ASKPASS", "")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
 }
 
 async fn async_main(cli: OmgbArgs) -> Result<()> {
@@ -707,14 +804,15 @@ pub(crate) async fn run_single_turn_with(
     };
 
     let overrides = crate::tool_overrides::load_tool_overrides()?;
-    crate::tool_overrides::apply_tool_overrides_to_headless_options(&overrides, &mut options);
+    crate::tool_overrides::apply_tool_overrides_to_headless_options(&overrides, &mut options)?;
 
-    if options.permission_mode_flag.as_deref() == Some("auto")
-        && let Ok(approvals) = crate::approvals::load_approvals(chrono::Utc::now())
-    {
-        options
-            .allow_rules
-            .extend(crate::approvals::to_allow_rules(&approvals));
+    if options.permission_mode_flag.as_deref() == Some("auto") {
+        match crate::approvals::load_approvals(chrono::Utc::now()) {
+            Ok(approvals) => options
+                .allow_rules
+                .extend(crate::approvals::to_allow_rules(&approvals)),
+            Err(e) => eprintln!("warning: failed to load approvals: {e}"),
+        }
     }
 
     let mut last_result: Result<()> = Ok(());
@@ -758,7 +856,7 @@ pub(crate) async fn run_single_turn_with(
                     let cwd = cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    record_session_approvals(sid, &cwd);
+                    record_session_approvals(sid, &cwd, yolo);
                 }
                 record_taste_from_success(prompt).await;
                 return Ok(());
@@ -807,14 +905,19 @@ fn count_chat_tool_calls(session_id: &str, cwd: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
-fn record_session_approvals(session_id: &str, cwd: &std::path::Path) {
+fn record_session_approvals(session_id: &str, cwd: &std::path::Path, yolo: bool) {
+    if yolo {
+        return;
+    }
     if let Some(calls) = load_chat_tool_calls(session_id, cwd) {
         let tuples: Vec<_> = calls
             .into_iter()
             .filter(|c| !is_turn_sentinel(c))
             .map(|c| (c.name, c.arguments.to_string()))
             .collect();
-        let _ = crate::approvals::record_tool_calls(&tuples);
+        if let Err(e) = crate::approvals::record_tool_calls(&tuples) {
+            eprintln!("warning: failed to record approvals: {e}");
+        }
     }
 }
 
@@ -925,7 +1028,7 @@ async fn maybe_auto_create_skill(tool_calls: usize) {
 }
 
 async fn git_worktree_status() -> Result<(bool, String)> {
-    let out = Command::new("git")
+    let out = git_cmd()
         .args(["status", "--short"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -939,7 +1042,7 @@ async fn git_worktree_status() -> Result<(bool, String)> {
 }
 
 async fn git_diff_text() -> Result<String> {
-    let out = Command::new("git")
+    let out = git_cmd()
         .args(["diff", "--no-ext-diff", "--no-color"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -952,7 +1055,7 @@ async fn git_diff_text() -> Result<String> {
 }
 
 async fn git_config(key: &str) -> Result<Option<String>> {
-    let out = Command::new("git")
+    let out = git_cmd()
         .args(["config", "--get", key])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -989,11 +1092,7 @@ pub(crate) async fn git_commit_all(
     extra_path: Option<&std::path::Path>,
 ) -> Result<()> {
     if let Some(path) = extra_path {
-        let add = Command::new("git")
-            .args(["add", "--"])
-            .arg(path)
-            .status()
-            .await?;
+        let add = git_cmd().args(["add", "--"]).arg(path).status().await?;
         if !add.success() {
             bail!("git add failed for {}", path.display());
         }
@@ -1009,13 +1108,13 @@ pub(crate) async fn git_commit_all(
     }
 
     let add_flag = if include_untracked { "-A" } else { "-u" };
-    let add = Command::new("git").args(["add", add_flag]).status().await?;
+    let add = git_cmd().args(["add", add_flag]).status().await?;
     if !add.success() {
         bail!("git add failed");
     }
 
     let (name, email) = git_author().await?;
-    let commit = Command::new("git")
+    let commit = git_cmd()
         .env("GIT_AUTHOR_NAME", &name)
         .env("GIT_AUTHOR_EMAIL", &email)
         .env("GIT_COMMITTER_NAME", &name)
@@ -1049,7 +1148,7 @@ async fn run_review() -> Result<()> {
 }
 
 async fn git_repo_root() -> Result<std::path::PathBuf> {
-    let out = Command::new("git")
+    let out = git_cmd()
         .args(["rev-parse", "--show-toplevel"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1065,7 +1164,7 @@ async fn git_repo_root() -> Result<std::path::PathBuf> {
 async fn run_undo(args: UndoArgs) -> Result<()> {
     let mode = if args.hard { "--hard" } else { "--soft" };
     let root = git_repo_root().await?;
-    let out = Command::new("git")
+    let out = git_cmd()
         .current_dir(&root)
         .args(["reset", mode, "HEAD~1"])
         .output()
@@ -1270,7 +1369,7 @@ async fn run_team(args: TeamArgs) -> Result<()> {
     if !args.yolo {
         bail!("`omgb team` requires --yolo to auto-approve tool use");
     }
-    let git = Command::new("git")
+    let git = git_cmd()
         .args(["rev-parse", "--git-dir"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1282,7 +1381,7 @@ async fn run_team(args: TeamArgs) -> Result<()> {
     if !git_worktree_status().await?.0 {
         bail!("git working tree is not clean; commit or stash changes before running `omgb team`");
     }
-    let main_exists = Command::new("git")
+    let main_exists = git_cmd()
         .args(["rev-parse", "--verify", "main"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1370,7 +1469,7 @@ async fn run_team(args: TeamArgs) -> Result<()> {
 
 async fn create_worktree(path: &PathBuf) -> Result<String> {
     let branch = format!("omgb-team-{}", uuid::Uuid::new_v4());
-    let out = Command::new("git")
+    let out = git_cmd()
         .args(["worktree", "add", "-b", &branch, "-q"])
         .arg(path)
         .arg("main")
@@ -1384,7 +1483,7 @@ async fn create_worktree(path: &PathBuf) -> Result<String> {
 }
 
 async fn remove_worktree(path: &PathBuf) -> Result<()> {
-    let out = Command::new("git")
+    let out = git_cmd()
         .args(["worktree", "remove", "--force", "-q"])
         .arg(path)
         .output()
@@ -1407,7 +1506,7 @@ async fn remove_worktree(path: &PathBuf) -> Result<()> {
 }
 
 async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()> {
-    let stage = Command::new("git")
+    let stage = git_cmd()
         .current_dir(worktree)
         .args(["add", "-A"])
         .status()
@@ -1416,7 +1515,7 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
         bail!("git add -A in worktree failed");
     }
 
-    let diff = Command::new("git")
+    let diff = git_cmd()
         .current_dir(worktree)
         .args(["diff", "--cached", "--quiet"])
         .status()
@@ -1427,7 +1526,7 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
 
     let (name, email) = git_author().await?;
     let commit_msg = format!("omgb team agent {branch}");
-    let commit = Command::new("git")
+    let commit = git_cmd()
         .current_dir(worktree)
         .env("GIT_AUTHOR_NAME", &name)
         .env("GIT_AUTHOR_EMAIL", &email)
@@ -1445,7 +1544,7 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
     if !clean {
         bail!("main working tree is not clean; commit or stash changes before merging team output");
     }
-    let checkout = Command::new("git")
+    let checkout = git_cmd()
         .current_dir(&main_dir)
         .args(["checkout", "main"])
         .status()
@@ -1455,7 +1554,7 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
     }
 
     let merge_msg = format!("Merge omgb team agent {branch}");
-    let merge = Command::new("git")
+    let merge = git_cmd()
         .current_dir(&main_dir)
         .args([
             "merge",
@@ -1470,10 +1569,7 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
     if !merge.success() {
         bail!("git merge failed");
     }
-    let delete = Command::new("git")
-        .args(["branch", "-D", branch])
-        .status()
-        .await;
+    let delete = git_cmd().args(["branch", "-D", branch]).status().await;
     if let Err(e) = delete {
         eprintln!("warning: failed to delete team branch {branch}: {e}");
     } else if let Ok(status) = delete
