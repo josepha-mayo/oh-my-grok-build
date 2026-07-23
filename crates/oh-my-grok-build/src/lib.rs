@@ -135,14 +135,9 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Use(args) => run_use(args).await,
         OmgbCommand::Browser(args) => run_browser(args).await,
         OmgbCommand::Mcp(args) => xai_grok_pager::mcp_cmd::run(args).await,
-        OmgbCommand::Doctor(args) => {
-            if args.json {
-                // SAFETY: this is set before any async work and read only by the doctor report printer.
-                unsafe { std::env::set_var("OMGB_JSON", "1") };
-            }
-            doctor::run_doctor(args.fix).await
-        }
+        OmgbCommand::Doctor(args) => doctor::run_doctor(args.fix, args.json).await,
         OmgbCommand::Taste(args) => run_taste(args),
+        OmgbCommand::Skill(args) => run_skill(args).await,
         OmgbCommand::Commit(args) => run_commit(args).await,
         OmgbCommand::Review => run_review().await,
         OmgbCommand::Undo(args) => run_undo(args).await,
@@ -487,7 +482,7 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
         } else {
             OutputFormat::Plain
         },
-        None,
+        args.max_turns,
         args.tools.clone(),
         args.disallowed_tools.clone(),
         None,
@@ -525,7 +520,7 @@ async fn run_autonomous(args: AutonomousArgs) -> Result<()> {
         args.model,
         args.yolo,
         OutputFormat::Plain,
-        Some(50),
+        args.max_turns.or(Some(50)),
         Some("run_terminal_cmd,read_file,search_replace,grep,list_dir".to_string()),
         None,
         None,
@@ -589,6 +584,42 @@ async fn run_browser(args: BrowserArgs) -> Result<()> {
     .await
 }
 
+async fn resolve_model_candidates(prompt: &str, explicit: Option<String>) -> Result<Vec<String>> {
+    if let Some(m) = explicit {
+        return Ok(vec![m]);
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(id) = moe::select_provider_or_fallback(prompt).await {
+        providers::ensure_provider_configured(&id)?;
+        candidates.push(format!("omgb-{id}"));
+    }
+
+    let mut locals: Vec<String> = moe::available_providers()
+        .await?
+        .into_iter()
+        .filter(|id| providers::is_local_provider_id(id))
+        .collect();
+    locals.sort_by(|a, b| {
+        moe::provider_cost(a)
+            .partial_cmp(&moe::provider_cost(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    locals.dedup();
+    for id in locals {
+        let m = format!("omgb-{id}");
+        if !candidates.contains(&m) {
+            candidates.push(m);
+        }
+    }
+
+    if candidates.is_empty() {
+        bail!("no providers available (set *_API_KEY or use a loopback local server)");
+    }
+    Ok(candidates)
+}
+
 pub(crate) async fn run_single_turn_with(
     prompt: &str,
     model: Option<String>,
@@ -602,29 +633,45 @@ pub(crate) async fn run_single_turn_with(
     session: &SessionParams,
     memory: bool,
 ) -> Result<()> {
-    let full_prompt = format!("{}{}", prompt, taste::taste_preamble());
-    let model = if let Some(m) = model {
-        Some(m)
-    } else if let Ok(id) = moe::select_provider_or_fallback(prompt).await {
-        providers::ensure_provider_configured(&id)?;
-        Some(format!("omgb-{id}"))
-    } else {
+    let candidates = resolve_model_candidates(prompt, model).await?;
+
+    let mut rules_parts = Vec::new();
+    if memory
+        && let Ok(r) = crate::memory::recall_for_prompt_with_one_shot(prompt, 5, true)
+        && !r.trim().is_empty()
+    {
+        rules_parts.push(r);
+    }
+    let skill_rules = crate::skill::skill_preamble();
+    if !skill_rules.is_empty() {
+        rules_parts.push(skill_rules);
+    }
+    let taste_rules = crate::taste::taste_preamble();
+    if !taste_rules.is_empty() {
+        rules_parts.push(taste_rules);
+    }
+    let rules = if rules_parts.is_empty() {
         None
-    };
-    let rules = if memory {
-        crate::memory::recall_for_prompt(prompt, 5).ok()
     } else {
-        None
+        Some(rules_parts.join("\n"))
     };
-    let options = HeadlessOptions {
-        session_id: session.session_id.clone(),
+
+    let effective_session_id =
+        if session.resume.is_none() && !session.continue_last && session.session_id.is_none() {
+            Some(uuid::Uuid::new_v4().to_string())
+        } else {
+            session.session_id.clone()
+        };
+
+    let mut options = HeadlessOptions {
+        session_id: effective_session_id.clone(),
         resume: session.resume.clone(),
-        cwd,
+        cwd: cwd.clone(),
         yolo,
         trust: yolo,
         output_format,
         json_schema: None,
-        model,
+        model: None,
         rules,
         system_prompt_override: None,
         continue_last_session: session.continue_last,
@@ -639,7 +686,16 @@ pub(crate) async fn run_single_turn_with(
         allow_rules: Vec::new(),
         deny_rules: Vec::new(),
         max_turns,
-        permission_mode_flag: None,
+        permission_mode_flag: {
+            let from_env = std::env::var("OMGB_PERMISSION_MODE")
+                .ok()
+                .filter(|s| !s.is_empty());
+            if yolo {
+                from_env
+            } else {
+                from_env.or(Some("auto".into()))
+            }
+        },
         reasoning_effort: None,
         self_verify: false,
         best_of_n: None,
@@ -647,17 +703,140 @@ pub(crate) async fn run_single_turn_with(
         background_wait_timeout: Duration::from_secs(300),
     };
 
-    let _ = timeline::add_event(
-        "exec",
-        prompt
-            .split_whitespace()
-            .take(8)
-            .collect::<Vec<_>>()
-            .join(" "),
-        None,
-    );
+    let overrides = crate::tool_overrides::load_tool_overrides()?;
+    crate::tool_overrides::apply_tool_overrides_to_headless_options(&overrides, &mut options);
 
-    run_single_turn(HeadlessPrompt::Text(full_prompt), false, options).await
+    let mut last_result: Result<()> = Ok(());
+    for m in &candidates {
+        let provider_id = m.strip_prefix("omgb-").unwrap_or(m);
+        if let Err(e) = providers::ensure_provider_configured(provider_id) {
+            eprintln!("warning: provider '{provider_id}' is not configured: {e}");
+            continue;
+        }
+        let mut opts = options.clone();
+        opts.model = Some(m.clone());
+        match run_single_turn(HeadlessPrompt::Text(prompt.to_string()), false, opts).await {
+            Ok(()) => {
+                let tool_calls = if let Some(ref sid) = effective_session_id {
+                    let cwd = cwd
+                        .clone()
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    count_chat_tool_calls(sid, &cwd)
+                } else {
+                    0
+                };
+                let _ = timeline::add_event(
+                    "exec",
+                    prompt
+                        .split_whitespace()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    Some(serde_json::json!({"tool_calls": tool_calls, "success": true})),
+                );
+                maybe_auto_create_skill(tool_calls).await;
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("warning: model '{m}' failed: {e}");
+                last_result = Err(e);
+            }
+        }
+    }
+
+    if let Some(ref sid) = effective_session_id {
+        let cwd = cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let tool_calls = count_chat_tool_calls(sid, &cwd);
+        let _ = timeline::add_event(
+            "exec",
+            prompt
+                .split_whitespace()
+                .take(8)
+                .collect::<Vec<_>>()
+                .join(" "),
+            Some(serde_json::json!({"tool_calls": tool_calls, "success": false})),
+        );
+    }
+
+    last_result
+}
+
+fn count_chat_tool_calls(session_id: &str, cwd: &std::path::Path) -> usize {
+    load_chat_tool_calls(session_id, cwd)
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
+fn load_chat_tool_calls(
+    session_id: &str,
+    cwd: &std::path::Path,
+) -> Option<Vec<xai_grok_shell::sampling::ToolCall>> {
+    use xai_grok_shell::sampling::{AssistantItem, ConversationItem};
+
+    let sessions_cwd = xai_grok_shell::util::grok_home::sessions_cwd_dir(&cwd.to_string_lossy());
+    let path = sessions_cwd.join(session_id).join("chat_history.jsonl");
+    if !path.is_file() {
+        return None;
+    }
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return None;
+    };
+    let mut calls = Vec::new();
+    for line in raw.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        if let Ok(ConversationItem::Assistant(AssistantItem { tool_calls, .. })) =
+            serde_json::from_str::<ConversationItem>(line)
+        {
+            calls.extend(tool_calls);
+        }
+    }
+    Some(calls)
+}
+
+fn has_repeated_tool_call(session_id: &str, cwd: &std::path::Path, threshold: usize) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    let Some(calls) = load_chat_tool_calls(session_id, cwd) else {
+        return false;
+    };
+    let mut last: Option<(String, String)> = None;
+    let mut streak = 0;
+    for call in calls {
+        let key = (call.name.clone(), call.arguments.to_string());
+        if last.as_ref() == Some(&key) {
+            streak += 1;
+        } else {
+            last = Some(key);
+            streak = 1;
+        }
+        if streak >= threshold {
+            return true;
+        }
+    }
+    false
+}
+
+async fn maybe_auto_create_skill(tool_calls: usize) {
+    let threshold = std::env::var("OMGB_AUTO_SKILL")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(5);
+    if threshold == 0 || tool_calls < threshold {
+        return;
+    }
+    match crate::skill::auto_create_skill_from_timeline(threshold).await {
+        Ok(Some(skill)) => {
+            if let Err(e) = crate::skill::write_skill(&skill) {
+                eprintln!("warning: failed to write auto-generated skill: {e}");
+            } else {
+                println!("auto-generated skill: {}", skill.name);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("warning: auto skill creation failed: {e}"),
+    }
 }
 
 async fn git_worktree_status() -> Result<(bool, String)> {
@@ -820,6 +999,7 @@ async fn run_undo(args: UndoArgs) -> Result<()> {
 
 async fn run_loop(args: LoopArgs) -> Result<()> {
     const MAX_DIFF_CHARS: usize = 16 * 1024;
+    const TOOL_CALL_LOOP_THRESHOLD: usize = 16;
 
     if !args.yolo {
         bail!("`omgb loop` requires --yolo to auto-approve tool use");
@@ -828,6 +1008,13 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
     if !git_worktree_status().await?.0 {
         bail!("git working tree is not clean; commit or stash changes before running `omgb loop`");
     }
+
+    let mut session = args.session.clone();
+    if session.session_id.is_none() {
+        session.session_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+    let session_id = session.session_id.clone().unwrap_or_default();
+    let cwd = std::env::current_dir()?;
 
     let mut iteration = 0;
     let mut prompt = args.prompt.clone();
@@ -841,15 +1028,19 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
             args.model.clone(),
             args.yolo,
             OutputFormat::Plain,
+            args.max_turns,
             None,
             None,
             None,
             None,
-            None,
-            &args.session,
+            &session,
             args.memory,
         )
         .await?;
+
+        if has_repeated_tool_call(&session_id, &cwd, TOOL_CALL_LOOP_THRESHOLD) {
+            bail!("anti-loop: same tool call repeated {TOOL_CALL_LOOP_THRESHOLD} times in a row");
+        }
 
         (clean, status) = git_worktree_status().await?;
         if clean {
@@ -974,6 +1165,16 @@ async fn run_schedule(args: ScheduleArgs) -> Result<()> {
         }
         ScheduleCommand::Delete { name } => delete_job(&name).await,
         ScheduleCommand::Run { name } => run_job(&name, false).await,
+        ScheduleCommand::SetExpiry { name, expires_at } => {
+            omgb_schedule_set_expiry(&name, expires_at.as_deref()).await?;
+            println!("set expiry for '{name}'");
+            Ok(())
+        }
+        ScheduleCommand::CleanupExpired => {
+            let removed = omgb_schedule_cleanup_expired().await?;
+            println!("removed {removed} expired job(s)");
+            Ok(())
+        }
         ScheduleCommand::Start => spawn_daemon().await,
         ScheduleCommand::Daemon => run_daemon_loop().await,
         ScheduleCommand::Stop => stop_daemon(),
@@ -1275,7 +1476,61 @@ fn run_taste(args: TasteArgs) -> Result<()> {
             taste::add_dislike(&note)?;
             println!("recorded dislike");
         }
+        TasteCommand::Accept {
+            prompt,
+            output,
+            tags,
+        } => {
+            taste::taste_accept(&prompt, &output, tags)?;
+            println!("recorded accept");
+        }
+        TasteCommand::Reject {
+            prompt,
+            output,
+            tags,
+        } => {
+            taste::taste_reject(&prompt, &output, tags)?;
+            println!("recorded reject");
+        }
+        TasteCommand::Edit {
+            prompt,
+            before,
+            after,
+            tags,
+        } => {
+            taste::taste_edit(&prompt, &before, &after, tags)?;
+            println!("recorded edit");
+        }
         TasteCommand::List => taste::list_taste()?,
+    }
+    Ok(())
+}
+
+async fn run_skill(args: SkillArgs) -> Result<()> {
+    match args.command {
+        SkillCommand::List => {
+            for skill in crate::skill::list_skills()? {
+                println!("{} (trigger: {})", skill.name, skill.trigger);
+            }
+        }
+        SkillCommand::Show { name } => {
+            for skill in crate::skill::list_skills()? {
+                if skill.name.eq_ignore_ascii_case(&name) {
+                    let body = crate::skill::format_skill_markdown(&skill)?;
+                    println!("{body}");
+                    return Ok(());
+                }
+            }
+            eprintln!("skill not found: {name}");
+        }
+        SkillCommand::AutoCreate { threshold } => {
+            if let Some(skill) = crate::skill::auto_create_skill_from_timeline(threshold).await? {
+                crate::skill::write_skill(&skill)?;
+                println!("created skill: {}", skill.name);
+            } else {
+                println!("no suitable timeline run found");
+            }
+        }
     }
     Ok(())
 }

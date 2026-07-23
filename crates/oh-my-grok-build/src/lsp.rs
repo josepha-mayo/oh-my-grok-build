@@ -105,10 +105,10 @@ fn pick_adapter(program: &Path) -> Result<(&'static str, &'static [&'static str]
         ],
     };
     for &id in ids {
-        if let Some(&cmd) = adapter_map().get(id) {
-            if which::which(cmd[0]).is_ok() {
-                return Ok((id, cmd));
-            }
+        if let Some(&cmd) = adapter_map().get(id)
+            && which::which(cmd[0]).is_ok()
+        {
+            return Ok((id, cmd));
         }
     }
     bail!("no DAP adapter found for {}", program.display())
@@ -225,6 +225,26 @@ impl JsonRpcClient {
         }
     }
 
+    /// Keep the adapter process alive and stream its stdout to the terminal
+    /// until the process exits. Used by `dap attach` so the debugger is not
+    /// killed immediately after the handshake.
+    async fn relay(mut self) -> Result<()> {
+        let mut child = self.child;
+        let copy = tokio::spawn(async move {
+            let mut stdout = tokio::io::stdout();
+            let _ = tokio::io::copy(&mut self.stdout, &mut stdout).await;
+        });
+        let status = child.wait().await.context("wait for DAP adapter to exit")?;
+        copy.abort();
+        if !status.success() {
+            bail!(
+                "DAP adapter exited with status {}",
+                status.code().unwrap_or(-1)
+            );
+        }
+        Ok(())
+    }
+
     async fn read_message(&mut self) -> Result<serde_json::Value> {
         let mut header = String::new();
         let mut len: Option<usize> = None;
@@ -266,8 +286,7 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
     which::which(server.command[0])
         .with_context(|| format!("LSP server {} not found", server.command[0]))?;
 
-    let abs = file_path
-        .canonicalize()
+    let abs = dunce::canonicalize(file_path)
         .with_context(|| format!("file not found: {}", file_path.display()))?;
     let uri = Url::from_file_path(&abs)
         .map_err(|_| anyhow::anyhow!("invalid file path"))?
@@ -361,16 +380,14 @@ pub async fn dap_attach(program: &Path, pid: u32, extra_args: &[String]) -> Resu
         .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .kill_on_drop(true);
     let child = command
         .spawn()
         .with_context(|| format!("spawn DAP adapter {id}"))?;
     let mut client = JsonRpcClient::new(child)?;
 
-    let program_abs = program
-        .canonicalize()
-        .unwrap_or_else(|_| program.to_path_buf());
+    let program_abs = dunce::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
     let program_str = program_abs.to_string_lossy().to_string();
 
     let _ = client
@@ -396,15 +413,15 @@ pub async fn dap_attach(program: &Path, pid: u32, extra_args: &[String]) -> Resu
         "type": id,
     });
     for arg in extra_args {
-        if let Some((k, v)) = arg.split_once('=') {
-            if let Some(obj) = attach_args.as_object_mut() {
-                obj.insert(k.to_string(), json!(v));
-            }
+        if let Some((k, v)) = arg.split_once('=')
+            && let Some(obj) = attach_args.as_object_mut()
+        {
+            obj.insert(k.to_string(), json!(v));
         }
     }
 
     let _ = client.dap_request("attach", attach_args).await?;
-    Ok(())
+    client.relay().await
 }
 
 pub async fn run_lsp(cmd: LspCommand) -> Result<()> {
@@ -420,6 +437,11 @@ pub async fn run_lsp(cmd: LspCommand) -> Result<()> {
             }
         }
         LspCommand::Start(args) => start_lsp(&args).await?,
+        LspCommand::Refactor {
+            file,
+            old_name,
+            new_name,
+        } => lsp_refactor(&file, &old_name, &new_name).await?,
     }
     Ok(())
 }
@@ -432,6 +454,11 @@ pub async fn run_dap(cmd: DapCommand) -> Result<()> {
             }
         }
         DapCommand::Start(args) => start_adapter(&args.adapter, args.extra.as_slice()).await?,
+        DapCommand::Attach {
+            program,
+            pid,
+            extra,
+        } => dap_attach(&program, pid, &extra).await?,
     }
     Ok(())
 }
@@ -572,7 +599,7 @@ fn position_to_byte(text: &str, pos: Position) -> Result<usize> {
 fn url_to_path(uri: &str) -> Result<std::path::PathBuf> {
     let url = Url::parse(uri).with_context(|| format!("invalid URI: {uri}"))?;
     url.to_file_path()
-        .map_err(|_| anyhow::anyhow!("URI is not a file path: {uri}").into())
+        .map_err(|_| anyhow::anyhow!("URI is not a file path: {uri}"))
 }
 
 async fn apply_workspace_edit(edit: &serde_json::Value) -> Result<()> {

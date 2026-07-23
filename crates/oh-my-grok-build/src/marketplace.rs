@@ -252,7 +252,27 @@ async fn clone_shallow(url: &str, tmp: &Path, tmp_home: &Path) -> Result<()> {
     }
 }
 
+fn validate_sha(sha: &str) -> Result<()> {
+    let trimmed = sha.trim();
+    if trimmed.is_empty() {
+        bail!("pinned SHA must not be empty");
+    }
+    if trimmed.len() < 7 {
+        bail!("pinned SHA must be at least 7 characters");
+    }
+    if trimmed.len() > 64 {
+        bail!("pinned SHA must be at most 64 characters");
+    }
+    if !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("pinned SHA must be a hexadecimal string");
+    }
+    Ok(())
+}
+
 async fn clone_with_sha(url: &str, tmp: &Path, tmp_home: &Path, sha: &str) -> Result<()> {
+    validate_sha(sha)?;
+    let want = sha.trim().to_lowercase();
+
     // Do a full clone so we can check out an arbitrary SHA. Plugins are small,
     // and this avoids servers that do not support reachability SHA fetches.
     let mut child = base_git_cmd(tmp_home)
@@ -291,8 +311,10 @@ async fn clone_with_sha(url: &str, tmp: &Path, tmp_home: &Path, sha: &str) -> Re
         .output()
         .await
         .context("spawn git rev-parse")?;
-    let actual_sha = String::from_utf8_lossy(&actual.stdout).trim().to_string();
-    if actual_sha != sha {
+    let actual_sha = String::from_utf8_lossy(&actual.stdout)
+        .trim()
+        .to_lowercase();
+    if actual_sha != want && !actual_sha.starts_with(&want) {
         bail!("checked out SHA {actual_sha} does not match required {sha}");
     }
     Ok(())
@@ -384,7 +406,7 @@ async fn install_plugin(args: &PluginInstallArgs) -> Result<()> {
 
     let meta = SourceMeta {
         source: args.source.clone(),
-        sha: args.require_sha.clone(),
+        sha: args.require_sha.as_ref().map(|s| s.trim().to_lowercase()),
     };
     let _ = write_source_meta(&dest, &meta);
 

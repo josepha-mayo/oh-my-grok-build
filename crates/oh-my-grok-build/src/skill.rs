@@ -59,7 +59,7 @@ fn format_list(items: &[String]) -> String {
     }
 }
 
-fn format_skill_markdown(skill: &Skill) -> Result<String> {
+pub fn format_skill_markdown(skill: &Skill) -> Result<String> {
     let front = toml::to_string(skill)?;
     let body = format!(
         "# {}\n\n> Trigger: `{}`\n\n## Steps\n{}\n## Pitfalls\n{}\n## Verification\n{}\n",
@@ -240,17 +240,15 @@ fn extract_json(text: &str) -> String {
 async fn llm_generate(prompt: &str) -> Result<String> {
     let prompt_file = crate::write_prompt_temp(prompt).await?;
     let _guard = crate::PromptFileGuard(prompt_file.clone());
-    let output_file = std::env::temp_dir().join(format!("omgb-skill-{}.md", uuid::Uuid::new_v4()));
     let exe = std::env::current_exe()?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("exec")
         .arg("--prompt-file")
         .arg(&prompt_file)
-        .arg("--output-file")
-        .arg(&output_file)
         .arg("--yolo")
         .arg("--tools")
         .arg("read_file,grep,list_dir,web_search,web_fetch")
+        .env_remove("OMGB_AUTO_SKILL")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let out = cmd.output().await?;
@@ -258,13 +256,16 @@ async fn llm_generate(prompt: &str) -> Result<String> {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("skill generation failed: {stderr}");
     }
-    let text = tokio::fs::read_to_string(&output_file).await?;
-    let _ = tokio::fs::remove_file(&output_file).await;
-    Ok(text)
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 /// Read `timeline.jsonl` and, if a run had >= `threshold` tool calls, errors, and
 /// eventual success, ask the LLM to generate a reusable `Skill`.
+fn run_qualifies_for_skill(run: &[TimelineEvent], threshold: usize) -> bool {
+    let tool_calls: usize = run.iter().map(tool_call_count).sum();
+    tool_calls >= threshold && run_has_errors(run) && run_has_success(run)
+}
+
 pub async fn auto_create_skill_from_timeline(threshold: usize) -> Result<Option<Skill>> {
     let path = crate::providers::omg_dir()?.join("timeline.jsonl");
     if !path.exists() {
@@ -287,8 +288,7 @@ pub async fn auto_create_skill_from_timeline(threshold: usize) -> Result<Option<
     let runs = group_runs(events);
     let mut candidate: Option<&[TimelineEvent]> = None;
     for run in runs.iter().rev() {
-        let tool_calls: usize = run.iter().map(tool_call_count).sum();
-        if tool_calls >= threshold && run_has_errors(run) && run_has_success(run) {
+        if run_qualifies_for_skill(run, threshold) {
             candidate = Some(run);
             break;
         }

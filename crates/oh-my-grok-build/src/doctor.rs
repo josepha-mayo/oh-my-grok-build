@@ -59,7 +59,7 @@ fn fixed_ok(name: &str, message: impl Into<String>) -> Check {
 }
 
 /// Run a full environment health check. If `fix` is true, apply safe remediations.
-pub async fn run_doctor(fix: bool) -> Result<()> {
+pub async fn run_doctor(fix: bool, json: bool) -> Result<()> {
     let mut checks = Vec::new();
 
     checks.push(check_providers().unwrap_or_else(|e| fail("provider config", format!("{e:#}"))));
@@ -80,12 +80,12 @@ pub async fn run_doctor(fix: bool) -> Result<()> {
             .unwrap_or_else(|e| fail("git", format!("{e:#}"))),
     );
 
-    print_report(&checks, fix);
+    print_report(&checks, fix, json);
     Ok(())
 }
 
-fn print_report(checks: &[Check], fix: bool) {
-    if std::env::var("OMGB_JSON").is_ok() {
+fn print_report(checks: &[Check], fix: bool, json: bool) {
+    if json {
         let json = json!({
             "fix": fix,
             "checks": checks.iter().map(|c| json!({
@@ -304,12 +304,11 @@ fn find_workspace_root() -> Option<PathBuf> {
     let mut dir = exe.parent()?;
     for _ in 0..6 {
         let cargo = dir.join("Cargo.toml");
-        if cargo.is_file() {
-            if let Ok(text) = std::fs::read_to_string(&cargo) {
-                if text.contains("[workspace]") {
-                    return Some(dir.to_path_buf());
-                }
-            }
+        if cargo.is_file()
+            && let Ok(text) = std::fs::read_to_string(&cargo)
+            && text.contains("[workspace]")
+        {
+            return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
     }
@@ -401,6 +400,7 @@ fn check_plugin_hooks() -> Result<Check> {
 
 #[derive(Deserialize)]
 struct SubagentRecord {
+    #[allow(dead_code)]
     id: String,
     pid: u32,
 }

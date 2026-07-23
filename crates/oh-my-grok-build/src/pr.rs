@@ -10,16 +10,34 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::args::{PrCommand, PrCreateArgs, PrStatusArgs};
+use crate::args::{PrCommand, PrCreateArgs, PrMergeArgs, PrReviewArgs, PrStatusArgs, PrUpdateArgs};
 
 pub async fn run_pr(cmd: PrCommand) -> Result<()> {
     match cmd {
         PrCommand::Status(args) => run_status(&args).await,
         PrCommand::Create(args) => run_create(&args, args.draft).await,
         PrCommand::CreateDraft(args) => run_create(&args, true).await,
+        PrCommand::Update(args) => run_update(&args).await,
+        PrCommand::Merge(args) => run_merge(&args).await,
+        PrCommand::Review(args) => run_review(&args).await,
         PrCommand::MergeQueue(args) => run_merge_queue(&args).await,
         PrCommand::Checks(args) => run_checks(&args).await,
     }
+}
+
+async fn run_update(args: &PrUpdateArgs) -> Result<()> {
+    let branch = resolve_branch(&args.branch)?;
+    pr_update(&branch, &args.title, &args.body).await
+}
+
+async fn run_merge(args: &PrMergeArgs) -> Result<()> {
+    let branch = resolve_branch(&args.branch)?;
+    pr_merge(&branch, &args.method).await
+}
+
+async fn run_review(args: &PrReviewArgs) -> Result<()> {
+    let branch = resolve_branch(&args.branch)?;
+    pr_review_request(&branch, &args.reviewers).await
 }
 
 fn ensure_gh() -> Result<std::path::PathBuf> {
@@ -128,9 +146,11 @@ struct GhPrView {
 struct GhCheck {
     name: String,
     state: String,
+    #[allow(dead_code)]
     link: String,
 }
 
+#[allow(dead_code)]
 struct PrData {
     state: String,
     url: String,

@@ -128,6 +128,8 @@ const UNSAFE_ENV_KEYS: &[&str] = &[
 
 const HOOK_DIR_MARKERS: &[&str] = &[".grok/hooks", ".omgb/hooks"];
 
+const GIT_DANGEROUS_SUBCOMMANDS: &[&str] = &["clean", "reset", "submodule", "filter-repo"];
+
 const NORMALIZABLE_STEMS: &[&str] = &[
     "python",
     "python2",
@@ -496,80 +498,36 @@ fn has_unsafe_env_assignment(token: &Token) -> Option<String> {
     })
 }
 
-/// Returns true if `path` resolves to a location under the current working
-/// directory and is not a symlink. Uses best-effort filesystem checks.
-fn is_safe_project_path(path: &str) -> bool {
-    use std::path::Path;
-    let p = Path::new(path);
-    let Ok(cwd) = std::env::current_dir() else {
-        return false;
-    };
-    let resolved = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
-    };
-    let Ok(canonical) = dunce::canonicalize(&resolved) else {
-        // If the path does not exist, fall back to a pure string containment
-        // check so that generated-but-not-yet-existing hooks can still be gated.
-        let Ok(canonical_cwd) = dunce::canonicalize(&cwd) else {
-            return false;
-        };
-        return resolved
-            .components()
-            .all(|c| c != std::path::Component::ParentDir)
-            && resolved.starts_with(&canonical_cwd);
-    };
-    let Ok(canonical_cwd) = dunce::canonicalize(&cwd) else {
-        return false;
-    };
-    if !canonical.starts_with(&canonical_cwd) {
-        return false;
-    }
-    // Reject symlinks that escape the project tree.
-    if let Ok(meta) = std::fs::symlink_metadata(&resolved)
-        && meta.is_symlink()
-    {
-        return false;
-    }
-    true
-}
-
 fn is_project_hook_command(cmd: &str) -> bool {
     HOOK_DIR_MARKERS.iter().any(|m| cmd.contains(m))
 }
 
-fn check_source(tokens: &[Token], i: usize) -> Decision {
-    let argv: Vec<&str> = tokens
-        .iter()
-        .skip(i + 1)
-        .map(|t| t.value.as_str())
-        .collect();
-    if argv.is_empty() {
-        return Decision::Deny("source requires a script argument".into());
-    }
-    let target = argv[0];
-    if target.starts_with('~') || target.starts_with("http://") || target.starts_with("https://") {
-        return Decision::Deny("Blocked sourced script from untrusted location".into());
-    }
-    if target.contains("..") {
-        return Decision::Deny("Blocked sourced script path traversal".into());
-    }
-    if !target.ends_with(".sh")
-        && !target.ends_with(".bash")
-        && !target.ends_with(".zsh")
-        && !target.ends_with(".dash")
-    {
-        return Decision::Deny("Blocked sourced script with non-shell extension".into());
-    }
-    if !is_safe_project_path(target) {
-        return Decision::Deny("Blocked sourced script outside the project directory".into());
-    }
-    Decision::Allow
+fn check_source(_tokens: &[Token], _i: usize) -> Decision {
+    // Sourcing any shell script can execute arbitrary code; block unconditionally.
+    Decision::Deny("Blocked sourced script".into())
 }
 
 fn check_project_hook(_cmd: &str) -> Decision {
     Decision::Deny("Blocked project hook".into())
+}
+
+fn check_git(tokens: &[Token], start: usize) -> Decision {
+    for token in tokens.iter().skip(start + 1) {
+        if token.quoted.is_some() {
+            continue;
+        }
+        let v = &token.value;
+        if v.starts_with("--config") || v == "-c" {
+            return Decision::Deny("git -c/--config can run arbitrary commands".into());
+        }
+        if v.contains('!') {
+            return Decision::Deny("git aliases with '!' execute arbitrary commands".into());
+        }
+        if GIT_DANGEROUS_SUBCOMMANDS.contains(&v.as_str()) {
+            return Decision::Deny(format!("Blocked dangerous git subcommand: {v}"));
+        }
+    }
+    Decision::Allow
 }
 
 fn has_bare_tilde(token: &Token) -> bool {
@@ -601,7 +559,7 @@ fn evaluate_tokens(tokens: &[Token], start: usize) -> Decision {
             let base = get_base_name(&cmd_token.value);
 
             if base == "git" {
-                return Decision::Allow;
+                return check_git(tokens, i);
             }
 
             if is_project_hook_command(&cmd_token.value) {

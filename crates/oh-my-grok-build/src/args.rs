@@ -95,6 +95,8 @@ pub enum OmgbCommand {
     Doctor(DoctorArgs),
     /// Remember a coding-style preference
     Taste(TasteArgs),
+    /// Manage auto-generated skills
+    Skill(SkillArgs),
     /// Commit the current working tree
     Commit(CommitArgs),
     /// Review current changes (git status + diff)
@@ -147,6 +149,9 @@ pub struct ExecArgs {
     /// Inject relevant cross-session memory into the prompt
     #[arg(long)]
     pub memory: bool,
+    /// Maximum number of model turns for this prompt
+    #[arg(long)]
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -154,7 +159,7 @@ pub struct LoopArgs {
     pub prompt: String,
     #[arg(short, long)]
     pub model: Option<String>,
-    #[arg(short = 'n', long, default_value = "10")]
+    #[arg(short = 'n', long, default_value = "50")]
     pub max_iterations: u32,
     /// Auto-approve tool use for the loop (required for non-interactive use).
     #[arg(long)]
@@ -170,6 +175,9 @@ pub struct LoopArgs {
     /// Inject relevant cross-session memory into the prompt
     #[arg(long)]
     pub memory: bool,
+    /// Maximum number of model turns per loop iteration
+    #[arg(long)]
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -187,6 +195,9 @@ pub struct AutonomousArgs {
     /// Inject relevant cross-session memory into the prompt
     #[arg(long)]
     pub memory: bool,
+    /// Maximum number of model turns for autonomous execution
+    #[arg(long)]
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -297,6 +308,14 @@ pub enum ScheduleCommand {
     Delete { name: String },
     /// Run a job now
     Run { name: String },
+    /// Set or clear a job's expiry time
+    SetExpiry {
+        name: String,
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    /// Remove expired jobs from the schedule
+    CleanupExpired,
     /// Start the persistent scheduler daemon
     Start,
     /// Stop the persistent scheduler daemon
@@ -470,6 +489,8 @@ pub enum MemoryCommand {
     Recall(MemoryRecallArgs),
     /// List recent memory notes
     List(MemoryListArgs),
+    /// Record a one-shot occurrence journal entry
+    Oneshot(MemoryOneshotArgs),
     /// Deduplicate near-duplicate notes
     Compact,
 }
@@ -497,6 +518,14 @@ pub struct MemoryListArgs {
     pub limit: usize,
 }
 
+#[derive(Debug, Args, Clone)]
+pub struct MemoryOneshotArgs {
+    /// Short topic/category for the one-shot note
+    pub topic: String,
+    /// Detailed note text
+    pub detail: String,
+}
+
 #[derive(Debug, Subcommand, Clone)]
 pub enum HashlineCommand {
     /// Apply a hashline patch file to a target file
@@ -521,6 +550,12 @@ pub enum PrCommand {
     Create(PrCreateArgs),
     /// Create a draft PR (deprecated; use `create --draft`)
     CreateDraft(PrCreateArgs),
+    /// Update an existing PR's title and body
+    Update(PrUpdateArgs),
+    /// Merge the PR for this branch
+    Merge(PrMergeArgs),
+    /// Request reviewers for the PR on this branch
+    Review(PrReviewArgs),
     /// Check whether the branch's PR is in a merge queue
     MergeQueue(PrStatusArgs),
     /// Show CI checks for the current (or specified) branch
@@ -544,12 +579,44 @@ pub struct PrCreateArgs {
     pub draft: bool,
 }
 
+#[derive(Debug, Args, Clone)]
+pub struct PrUpdateArgs {
+    #[arg(short, long)]
+    pub title: String,
+    #[arg(short, long)]
+    pub body: String,
+    #[arg(short, long)]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct PrMergeArgs {
+    #[arg(short, long)]
+    pub branch: Option<String>,
+    #[arg(long, default_value = "squash")]
+    pub method: String,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct PrReviewArgs {
+    #[arg(short, long)]
+    pub branch: Option<String>,
+    #[arg(required = true)]
+    pub reviewers: Vec<String>,
+}
+
 #[derive(Debug, Subcommand, Clone)]
 pub enum LspCommand {
     /// List known LSP servers
     List,
     /// Start an LSP server in the workspace
     Start(LspStartArgs),
+    /// Run a semantic rename/refactor on a file
+    Refactor {
+        file: std::path::PathBuf,
+        old_name: String,
+        new_name: String,
+    },
 }
 
 #[derive(Debug, Args, Clone)]
@@ -567,6 +634,14 @@ pub enum DapCommand {
     List,
     /// Start a debug adapter
     Start(DapStartArgs),
+    /// Attach a DAP adapter to a running process
+    Attach {
+        program: std::path::PathBuf,
+        #[arg(long)]
+        pid: u32,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
 }
 
 #[derive(Debug, Args, Clone)]
@@ -752,8 +827,49 @@ pub enum TasteCommand {
     Like { note: String },
     /// Record something to avoid
     Dislike { note: String },
+    /// Record an output you accepted as correct
+    Accept {
+        prompt: String,
+        output: String,
+        #[arg(short, long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
+    /// Record an output you rejected
+    Reject {
+        prompt: String,
+        output: String,
+        #[arg(short, long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
+    /// Record a before/after edit you preferred
+    Edit {
+        prompt: String,
+        before: String,
+        after: String,
+        #[arg(short, long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
     /// List stored taste notes
     List,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub command: SkillCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum SkillCommand {
+    /// List persisted skills
+    List,
+    /// Show a skill by name
+    Show { name: String },
+    /// Suggest and write a skill from the timeline
+    AutoCreate {
+        #[arg(short, long, default_value = "5")]
+        threshold: usize,
+    },
 }
 
 #[derive(Debug, Args, Clone)]

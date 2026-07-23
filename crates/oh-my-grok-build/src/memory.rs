@@ -220,6 +220,7 @@ pub fn recall_one_shot(topic: &str, n: usize) -> Result<Vec<OneShotNote>> {
     Ok(returned)
 }
 
+#[allow(dead_code)]
 pub fn recall_for_prompt(query: &str, limit: usize) -> Result<String> {
     recall_for_prompt_with_one_shot(query, limit, false)
 }
@@ -296,6 +297,10 @@ pub fn run_memory(cmd: MemoryCommand) -> Result<()> {
         MemoryCommand::Remember(args) => {
             let note = remember(&args.content, &args.tags)?;
             println!("remembered {} ({} tags)", note.id, note.tags.len());
+        }
+        MemoryCommand::Oneshot(args) => {
+            let note = remember_one_shot(&args.topic, &args.detail)?;
+            println!("recorded one-shot {} ({})", note.id, note.topic);
         }
         MemoryCommand::Recall(args) => {
             for note in recall(&args.query, args.limit)? {
