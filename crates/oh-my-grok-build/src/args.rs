@@ -91,6 +91,8 @@ pub enum OmgbCommand {
     Browser(BrowserArgs),
     /// Manage MCP servers
     Mcp(xai_grok_pager::mcp_cmd::McpArgs),
+    /// Environment diagnostics and remediation
+    Doctor(DoctorArgs),
     /// Remember a coding-style preference
     Taste(TasteArgs),
     /// Commit the current working tree
@@ -769,6 +771,16 @@ pub struct UndoArgs {
     /// Hard reset, discarding working tree changes
     #[arg(long)]
     pub hard: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct DoctorArgs {
+    /// Apply safe remediations
+    #[arg(long)]
+    pub fix: bool,
+    /// Print report as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args, Clone)]

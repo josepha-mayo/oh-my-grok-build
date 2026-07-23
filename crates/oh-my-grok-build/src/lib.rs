@@ -13,6 +13,7 @@ use xai_grok_pager::headless::{HeadlessOptions, HeadlessPrompt, OutputFormat, ru
 use xai_grok_shell::agent::config::Config as AgentConfig;
 
 mod args;
+mod doctor;
 mod harness;
 mod hashline;
 mod lsp;
@@ -27,10 +28,12 @@ mod research;
 mod scheduler;
 mod server;
 mod session;
+mod skill;
 mod subagents;
 mod swarm;
 mod taste;
 mod timeline;
+mod tool_overrides;
 
 use args::*;
 
@@ -132,6 +135,13 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Use(args) => run_use(args).await,
         OmgbCommand::Browser(args) => run_browser(args).await,
         OmgbCommand::Mcp(args) => xai_grok_pager::mcp_cmd::run(args).await,
+        OmgbCommand::Doctor(args) => {
+            if args.json {
+                // SAFETY: this is set before any async work and read only by the doctor report printer.
+                unsafe { std::env::set_var("OMGB_JSON", "1") };
+            }
+            doctor::run_doctor(args.fix).await
+        }
         OmgbCommand::Taste(args) => run_taste(args),
         OmgbCommand::Commit(args) => run_commit(args).await,
         OmgbCommand::Review => run_review().await,

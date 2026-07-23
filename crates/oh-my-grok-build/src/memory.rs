@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::args::MemoryCommand;
 
 const MEMORY_FILE: &str = "memory.jsonl";
+const ONE_SHOT_FILE: &str = "one_shot_journal.jsonl";
 
 fn memory_path() -> Result<std::path::PathBuf> {
     Ok(crate::providers::omg_dir()?.join(MEMORY_FILE))
@@ -39,6 +40,16 @@ pub struct MemoryNote {
     pub access_count: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OneShotNote {
+    pub id: String,
+    pub created_at: i64,
+    pub topic: String,
+    pub detail: String,
+    #[serde(default)]
+    pub seen: bool,
+}
+
 fn load_notes() -> Result<Vec<MemoryNote>> {
     ensure_store()?;
     let path = memory_path()?;
@@ -57,6 +68,34 @@ fn load_notes() -> Result<Vec<MemoryNote>> {
 fn save_notes(notes: &[MemoryNote]) -> Result<()> {
     ensure_store()?;
     let path = memory_path()?;
+    let mut content = String::new();
+    for note in notes {
+        content.push_str(&serde_json::to_string(note)?);
+        content.push('\n');
+    }
+    crate::providers::write_file_atomic(&path, content, true)
+}
+
+fn one_shot_path() -> Result<std::path::PathBuf> {
+    Ok(crate::providers::omg_dir()?.join(ONE_SHOT_FILE))
+}
+
+fn load_one_shots() -> Result<Vec<OneShotNote>> {
+    let path = one_shot_path()?;
+    if !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        return Ok(Vec::new());
+    }
+    let mut notes = Vec::new();
+    for line in std::fs::read_to_string(&path)?.lines() {
+        if let Ok(n) = serde_json::from_str::<OneShotNote>(line) {
+            notes.push(n);
+        }
+    }
+    Ok(notes)
+}
+
+fn save_one_shots(notes: &[OneShotNote]) -> Result<()> {
+    let path = one_shot_path()?;
     let mut content = String::new();
     for note in notes {
         content.push_str(&serde_json::to_string(note)?);
@@ -86,6 +125,11 @@ fn score_note(note: &MemoryNote, terms: &[String]) -> usize {
     terms.iter().filter(|t| text.contains(t.as_str())).count()
 }
 
+fn score_one_shot(note: &OneShotNote, terms: &[String]) -> usize {
+    let text = format!("{} {}", note.topic, note.detail).to_lowercase();
+    terms.iter().filter(|t| text.contains(t.as_str())).count()
+}
+
 pub fn remember(content: &str, tags: &[String]) -> Result<MemoryNote> {
     let mut notes = load_notes()?;
     let note = MemoryNote {
@@ -97,6 +141,20 @@ pub fn remember(content: &str, tags: &[String]) -> Result<MemoryNote> {
     };
     notes.push(note.clone());
     save_notes(&notes)?;
+    Ok(note)
+}
+
+pub fn remember_one_shot(topic: &str, detail: &str) -> Result<OneShotNote> {
+    let mut notes = load_one_shots()?;
+    let note = OneShotNote {
+        id: uuid::Uuid::new_v4().to_string(),
+        created_at: now(),
+        topic: topic.to_string(),
+        detail: detail.to_string(),
+        seen: false,
+    };
+    notes.push(note.clone());
+    save_one_shots(&notes)?;
     Ok(note)
 }
 
@@ -130,9 +188,54 @@ pub fn recall(query: &str, limit: usize) -> Result<Vec<MemoryNote>> {
     Ok(scored.into_iter().map(|(_, n)| n).take(limit).collect())
 }
 
+pub fn recall_one_shot(topic: &str, n: usize) -> Result<Vec<OneShotNote>> {
+    let mut notes = load_one_shots()?;
+    let terms = tokenize(topic);
+    let empty = terms.is_empty();
+    let mut candidates: Vec<(usize, i64, usize)> = notes
+        .iter()
+        .enumerate()
+        .filter(|(_, note)| !note.seen)
+        .map(|(i, note)| {
+            let score = if empty {
+                0
+            } else {
+                score_one_shot(note, &terms)
+            };
+            (score, note.created_at, i)
+        })
+        .filter(|(score, _, _)| empty || *score > 0)
+        .collect();
+    candidates.sort_by(|a, b| b.cmp(a));
+    let selected: Vec<usize> = candidates.into_iter().take(n).map(|(_, _, i)| i).collect();
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    for &i in &selected {
+        notes[i].seen = true;
+    }
+    let returned: Vec<OneShotNote> = selected.iter().map(|&i| notes[i].clone()).collect();
+    notes.retain(|note| !note.seen);
+    save_one_shots(&notes)?;
+    Ok(returned)
+}
+
 pub fn recall_for_prompt(query: &str, limit: usize) -> Result<String> {
+    recall_for_prompt_with_one_shot(query, limit, false)
+}
+
+pub fn recall_for_prompt_with_one_shot(
+    query: &str,
+    limit: usize,
+    include_one_shot: bool,
+) -> Result<String> {
     let notes = recall(query, limit)?;
-    if notes.is_empty() {
+    let shots = if include_one_shot {
+        recall_one_shot(query, limit)?
+    } else {
+        Vec::new()
+    };
+    if notes.is_empty() && shots.is_empty() {
         return Ok(String::new());
     }
     let mut out = String::from("\n\nRelevant memory (do not repeat work already noted):\n");
@@ -146,6 +249,13 @@ pub fn recall_for_prompt(query: &str, limit: usize) -> Result<String> {
             "-{}{}\n",
             note.content.lines().next().unwrap_or(&note.content),
             tags
+        ));
+    }
+    for shot in shots {
+        out.push_str(&format!(
+            "- [{}] {}\n",
+            shot.topic,
+            shot.detail.lines().next().unwrap_or(&shot.detail)
         ));
     }
     Ok(out)
@@ -255,6 +365,24 @@ mod tests {
         let notes = list(None, 10).unwrap();
         assert_eq!(notes.len(), 1);
         assert!(notes[0].tags.contains(&"tag".to_string()));
+        std::fs::remove_dir_all(&home).ok();
+        unsafe { std::env::remove_var("OMGB_HOME") };
+    }
+
+    #[test]
+    fn test_remember_and_recall_one_shot() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = tmp_home();
+        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        remember_one_shot("meeting", "discuss rust migration").unwrap();
+        remember_one_shot("meeting", "discuss api keys").unwrap();
+        let first = recall_one_shot("meeting", 1).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].seen);
+        let second = recall_one_shot("meeting", 1).unwrap();
+        assert_eq!(second.len(), 1);
+        let third = recall_one_shot("meeting", 10).unwrap();
+        assert!(third.is_empty());
         std::fs::remove_dir_all(&home).ok();
         unsafe { std::env::remove_var("OMGB_HOME") };
     }

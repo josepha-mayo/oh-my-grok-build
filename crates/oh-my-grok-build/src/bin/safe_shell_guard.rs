@@ -568,11 +568,8 @@ fn check_source(tokens: &[Token], i: usize) -> Decision {
     Decision::Allow
 }
 
-fn check_project_hook(cmd: &str) -> Decision {
-    if !is_safe_project_path(cmd) {
-        return Decision::Deny("Blocked project hook outside the project directory".into());
-    }
-    Decision::Allow
+fn check_project_hook(_cmd: &str) -> Decision {
+    Decision::Deny("Blocked project hook".into())
 }
 
 fn has_bare_tilde(token: &Token) -> bool {

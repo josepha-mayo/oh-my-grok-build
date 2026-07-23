@@ -13,7 +13,7 @@ use crate::args::HarnessType;
 use crate::taste::taste_preamble;
 
 const IS_WINDOWS: bool = cfg!(windows);
-const DEFAULT_CONNECTOR_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_CONNECTOR_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn registry_path() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join("connectors.json"))
@@ -472,8 +472,7 @@ async fn run_http_connector(cfg: &ConnectorConfig, url: &str, prompt: &str) -> R
         headers.insert("Authorization".into(), format!("Bearer {secret}"));
     }
     let body = serde_json::json!({ "prompt": format!("{}{}", prompt, taste_preamble()) });
-    let (status, text) =
-        http_post_json(&url, &headers, body, std::time::Duration::from_secs(120)).await?;
+    let (status, text) = http_post_json(&url, &headers, body, DEFAULT_CONNECTOR_TIMEOUT).await?;
     if status != 200 {
         bail!("connector HTTP {status}: {text}");
     }

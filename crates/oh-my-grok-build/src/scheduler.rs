@@ -56,6 +56,22 @@ impl PidFile {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Expiry {
+    Ts(i64),
+    Iso(DateTime<Utc>),
+}
+
+impl Expiry {
+    fn as_datetime(self) -> Option<DateTime<Utc>> {
+        match self {
+            Expiry::Ts(ts) => DateTime::from_timestamp(ts, 0),
+            Expiry::Iso(dt) => Some(dt),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledJob {
     pub name: String,
@@ -65,6 +81,8 @@ pub struct ScheduledJob {
     #[serde(default)]
     pub yolo: bool,
     pub last_run: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub expires_at: Option<Expiry>,
 }
 
 /// Acquire an exclusive file lock on `schedule.lock`.
@@ -170,6 +188,7 @@ pub async fn add_job(
             model,
             yolo,
             last_run: None,
+            expires_at: None,
         });
         println!("scheduled job '{name}'");
         Ok(())
@@ -361,22 +380,56 @@ pub async fn run_daemon_loop() -> Result<()> {
                 return Ok(());
             }
         }
-        let due_jobs: Result<Vec<ScheduledJob>> =
-            with_jobs_read(|jobs| Ok(jobs.iter().filter(|j| is_due(j)).cloned().collect())).await;
-        if let Ok(jobs) = due_jobs {
-            let mut set = tokio::task::JoinSet::new();
-            for job in jobs {
-                set.spawn(async move { run_job(&job.name, true).await });
-            }
-            while let Some(res) = set.join_next().await {
-                match res {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => eprintln!("scheduler: job error: {e}"),
-                    Err(e) => eprintln!("scheduler: job task panicked: {e}"),
-                }
+        let (due_jobs, expired): (Vec<ScheduledJob>, usize) = with_jobs_read(|jobs| {
+            let now = Utc::now();
+            let due: Vec<_> = jobs.iter().filter(|j| is_due(j)).cloned().collect();
+            let expired = jobs.iter().filter(|j| is_expired(j, now)).count();
+            Ok((due, expired))
+        })
+        .await?;
+        if expired > 0 {
+            with_jobs(|jobs| {
+                let now = Utc::now();
+                jobs.retain(|j| !is_expired(j, now));
+                Ok(())
+            })
+            .await?;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for job in due_jobs {
+            set.spawn(async move { run_job(&job.name, true).await });
+        }
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("scheduler: job error: {e}"),
+                Err(e) => eprintln!("scheduler: job task panicked: {e}"),
             }
         }
     }
+}
+
+pub async fn omgb_schedule_cleanup_expired() -> Result<usize> {
+    with_jobs(|jobs| {
+        let now = Utc::now();
+        let before = jobs.len();
+        jobs.retain(|j| !is_expired(j, now));
+        Ok(before - jobs.len())
+    })
+    .await
+}
+
+pub async fn omgb_schedule_set_expiry(id: &str, expires_at: Option<&str>) -> Result<()> {
+    let expiry = parse_expiry(expires_at)?;
+    with_jobs(|jobs| {
+        let job = jobs
+            .iter_mut()
+            .find(|j| j.name == id)
+            .ok_or_else(|| anyhow::anyhow!("job '{id}' not found"))?;
+        job.expires_at = expiry;
+        Ok(())
+    })
+    .await
 }
 
 pub fn stop_daemon() -> Result<()> {
@@ -409,7 +462,36 @@ pub fn stop_daemon() -> Result<()> {
     Ok(())
 }
 
+fn is_expired(job: &ScheduledJob, now: DateTime<Utc>) -> bool {
+    job.expires_at
+        .and_then(|e| e.as_datetime())
+        .is_some_and(|e| now >= e)
+}
+
+fn parse_expiry(raw: Option<&str>) -> Result<Option<Expiry>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let raw = raw.trim();
+    if let Ok(ts) = raw.parse::<i64>() {
+        if DateTime::from_timestamp(ts, 0).is_none() {
+            bail!("expiry timestamp out of range: {raw}");
+        }
+        return Ok(Some(Expiry::Ts(ts)));
+    }
+    match raw.parse::<DateTime<Utc>>() {
+        Ok(dt) => Ok(Some(Expiry::Iso(dt))),
+        Err(e) => bail!("invalid expiry '{raw}': {e}"),
+    }
+}
+
 fn is_due(job: &ScheduledJob) -> bool {
+    if is_expired(job, Utc::now()) {
+        return false;
+    }
     if let Some(secs) = parse_interval(&job.expression) {
         return job
             .last_run
@@ -528,6 +610,7 @@ mod tests {
             model: None,
             yolo: false,
             last_run: Some(Utc::now() - TimeDelta::seconds(90)),
+            expires_at: None,
         };
         assert!(is_due(&job));
         job.last_run = Some(Utc::now() - TimeDelta::seconds(30));
@@ -545,7 +628,43 @@ mod tests {
             model: None,
             yolo: false,
             last_run: None,
+            expires_at: None,
         };
         assert!(is_due(&job));
+    }
+
+    #[test]
+    fn test_is_expired_and_parse_expiry() {
+        let past = Utc::now() - TimeDelta::seconds(10);
+        let future = Utc::now() + TimeDelta::seconds(10);
+        let mut job = ScheduledJob {
+            name: "t".into(),
+            expression: "60s".into(),
+            prompt: "".into(),
+            model: None,
+            yolo: false,
+            last_run: None,
+            expires_at: None,
+        };
+        assert!(!is_expired(&job, Utc::now()));
+        assert!(is_due(&job));
+        job.expires_at = Some(Expiry::Ts(past.timestamp()));
+        assert!(is_expired(&job, Utc::now()));
+        assert!(!is_due(&job));
+        job.expires_at = Some(Expiry::Iso(future));
+        assert!(!is_expired(&job, Utc::now()));
+
+        assert!(parse_expiry(None).unwrap().is_none());
+        assert!(parse_expiry(Some("")).unwrap().is_none());
+        assert!(matches!(
+            parse_expiry(Some("1700000000")).unwrap().unwrap(),
+            Expiry::Ts(1700000000)
+        ));
+        assert!(
+            parse_expiry(Some("2024-01-01T00:00:00Z"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(parse_expiry(Some("invalid")).is_err());
     }
 }
