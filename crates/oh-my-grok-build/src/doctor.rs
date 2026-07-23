@@ -1,9 +1,22 @@
 //! Environment diagnostics and remediation for `omgb`.
 
+use std::collections::HashSet;
+use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -58,30 +71,181 @@ fn fixed_ok(name: &str, message: impl Into<String>) -> Check {
     }
 }
 
-/// Run a full environment health check. If `fix` is true, apply safe remediations.
-pub async fn run_doctor(fix: bool, json: bool) -> Result<()> {
-    let mut checks = Vec::new();
-
-    checks.push(check_providers().unwrap_or_else(|e| fail("provider config", format!("{e:#}"))));
-    checks.push(
+async fn run_checks(fix: bool) -> Vec<Check> {
+    vec![
+        check_providers().unwrap_or_else(|e| fail("provider config", format!("{e:#}"))),
         check_env_permissions(fix).unwrap_or_else(|e| fail("env permissions", format!("{e:#}"))),
-    );
-    checks.push(
         check_safe_shell_guard(fix)
             .await
             .unwrap_or_else(|e| fail("safe-shell-guard", format!("{e:#}"))),
-    );
-    checks.push(check_plugin_hooks().unwrap_or_else(|e| fail("plugin hooks", format!("{e:#}"))));
-    checks
-        .push(check_stale_daemons(fix).unwrap_or_else(|e| fail("stale daemons", format!("{e:#}"))));
-    checks.push(
+        check_plugin_hooks().unwrap_or_else(|e| fail("plugin hooks", format!("{e:#}"))),
+        check_stale_daemons(fix).unwrap_or_else(|e| fail("stale daemons", format!("{e:#}"))),
         check_git()
             .await
             .unwrap_or_else(|e| fail("git", format!("{e:#}"))),
-    );
+    ]
+}
 
+/// Run a full environment health check. If `fix` is true, apply safe remediations.
+pub async fn run_doctor(fix: bool, json: bool) -> Result<()> {
+    if fix && !json && stdout().is_terminal() {
+        return run_doctor_tui().await;
+    }
+    let checks = run_checks(fix).await;
     print_report(&checks, fix, json);
     Ok(())
+}
+
+fn is_fixable(name: &str) -> bool {
+    matches!(
+        name,
+        "env permissions" | "safe-shell-guard" | "stale daemons"
+    )
+}
+
+async fn apply_fix_by_name(name: &str) -> Result<Check> {
+    match name {
+        "env permissions" => check_env_permissions(true),
+        "safe-shell-guard" => check_safe_shell_guard(true).await,
+        "stale daemons" => check_stale_daemons(true),
+        _ => bail!("'{name}' has no automated remediation"),
+    }
+}
+
+async fn run_doctor_tui() -> Result<()> {
+    let initial = run_checks(false).await;
+    let checks = initial.clone();
+    let selected = tokio::task::spawn_blocking(move || tui_select_fixes(&checks))
+        .await
+        .map_err(|e| anyhow::anyhow!("TUI task panicked: {e}"))??;
+
+    let mut final_checks = initial;
+    for name in selected {
+        let updated = apply_fix_by_name(&name)
+            .await
+            .unwrap_or_else(|e| fail(&name, format!("failed to apply remediation: {e:#}")));
+        if let Some(c) = final_checks.iter_mut().find(|c| c.name == name) {
+            *c = updated;
+        }
+    }
+
+    print_report(&final_checks, true, false);
+    Ok(())
+}
+
+fn tui_select_fixes(checks: &[Check]) -> Result<Vec<String>> {
+    let fixable: HashSet<String> = checks
+        .iter()
+        .filter(|c| is_fixable(&c.name) && !matches!(c.status, Status::Ok))
+        .map(|c| c.name.clone())
+        .collect();
+    if fixable.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut state = ListState::default();
+    state.select(Some(0));
+    let mut selected: HashSet<String> = fixable.clone();
+    let mut apply = false;
+
+    let result = loop {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(f.area());
+
+            let items: Vec<ListItem> = checks
+                .iter()
+                .map(|c| {
+                    let can_fix = fixable.contains(&c.name);
+                    let checkbox = if can_fix {
+                        if selected.contains(&c.name) {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        }
+                    } else {
+                        "   "
+                    };
+                    let (glyph, color) = match c.status {
+                        Status::Ok => ("[OK]", Color::Green),
+                        Status::Warn => ("[WARN]", Color::Yellow),
+                        Status::Fail => ("[FAIL]", Color::Red),
+                    };
+                    let line = Line::from(vec![
+                        Span::styled(checkbox, Style::default().fg(Color::Cyan)),
+                        Span::raw(" "),
+                        Span::styled(glyph, Style::default().fg(color)),
+                        Span::raw(format!(" {}: {}", c.name, c.message)),
+                    ]);
+                    ListItem::new(line)
+                })
+                .collect();
+
+            let title = if fixable.is_empty() {
+                "omgb doctor — no remediations available".to_string()
+            } else {
+                "omgb doctor — Space=toggle, Enter=apply, q=quit".to_string()
+            };
+            let list = List::new(items)
+                .block(Block::default().title(title).borders(Borders::ALL))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("> ");
+            f.render_stateful_widget(list, chunks[0], &mut state);
+
+            let help = Paragraph::new(
+                "Use arrow keys to move, Space to toggle a fix, Enter to apply, q to quit.",
+            );
+            f.render_widget(help, chunks[1]);
+        })?;
+
+        if crossterm::event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = crossterm::event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break Vec::new(),
+                KeyCode::Up => {
+                    if let Some(i) = state.selected() {
+                        state.select(Some(i.saturating_sub(1)));
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(i) = state.selected() {
+                        state.select(Some((i + 1).min(checks.len() - 1)));
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(i) = state.selected() {
+                        let name = &checks[i].name;
+                        if fixable.contains(name) && !selected.insert(name.clone()) {
+                            selected.remove(name);
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    apply = true;
+                    break selected.into_iter().collect();
+                }
+                _ => {}
+            }
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    if apply { Ok(result) } else { Ok(Vec::new()) }
 }
 
 fn print_report(checks: &[Check], fix: bool, json: bool) {

@@ -13,6 +13,7 @@ blake3 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 constant_time_eq = { workspace = true }
+crossterm = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
 fs2 = { workspace = true }
@@ -31,6 +32,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 quick-xml = { workspace = true }
 qrcode = { workspace = true }
+ratatui = { workspace = true }
 scraper = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 which = { workspace = true }

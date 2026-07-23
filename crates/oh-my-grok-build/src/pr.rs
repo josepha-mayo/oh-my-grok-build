@@ -4,7 +4,7 @@
 //! merge-queue inspection. Falls back to helpful diagnostics when `gh` is not
 //! installed.
 
-use std::process::Stdio;
+use std::process::{Command as SyncCommand, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -27,7 +27,14 @@ pub async fn run_pr(cmd: PrCommand) -> Result<()> {
 
 async fn run_update(args: &PrUpdateArgs) -> Result<()> {
     let branch = resolve_branch(&args.branch)?;
-    pr_update(&branch, &args.title, &args.body).await
+    pr_update(
+        &branch,
+        args.title.as_deref(),
+        args.body.as_deref(),
+        &args.label,
+        &args.reviewer,
+    )
+    .await
 }
 
 async fn run_merge(args: &PrMergeArgs) -> Result<()> {
@@ -50,17 +57,74 @@ async fn run_status(args: &PrStatusArgs) -> Result<()> {
     Ok(())
 }
 
+fn default_base_branch() -> Result<String> {
+    for base in ["main", "master"] {
+        let out = SyncCommand::new("git")
+            .args(["rev-parse", "--verify", &format!("origin/{base}")])
+            .output()?;
+        if out.status.success() {
+            return Ok(base.to_string());
+        }
+    }
+    bail!("could not detect default base branch (main/master)");
+}
+
+fn commit_title_body(base: &str, branch: &str) -> (String, String) {
+    let out = SyncCommand::new("git")
+        .args([
+            "log",
+            &format!("{base}..{branch}"),
+            "--pretty=format:%s%n%b",
+            "-1",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    if let Some(out) = out {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines();
+        let title = lines.next().unwrap_or("").trim().to_string();
+        let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+        if !title.is_empty() {
+            return (title, body);
+        }
+    }
+    (branch.to_string(), String::new())
+}
+
 async fn run_create(args: &PrCreateArgs, draft: bool) -> Result<()> {
     ensure_gh()?;
+    let base = args
+        .base
+        .clone()
+        .unwrap_or_else(|| default_base_branch().unwrap_or_else(|_| "main".to_string()));
+    let branch = resolve_branch(&None)?;
+    let (title, body) = if args.fill {
+        commit_title_body(&base, &branch)
+    } else {
+        (
+            args.title.clone().unwrap_or_else(|| branch.clone()),
+            args.body.clone(),
+        )
+    };
+
     let mut cmd = tokio::process::Command::new("gh");
     cmd.arg("pr")
         .arg("create")
         .arg("--title")
-        .arg(&args.title)
+        .arg(&title)
         .arg("--body")
-        .arg(&args.body);
+        .arg(&body)
+        .arg("--base")
+        .arg(&base);
     if draft {
         cmd.arg("--draft");
+    }
+    for label in &args.label {
+        cmd.arg("--label").arg(label);
+    }
+    for reviewer in &args.reviewer {
+        cmd.arg("--reviewer").arg(reviewer);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -267,18 +331,30 @@ pub async fn pr_status_json(branch: &str) -> Result<Value> {
         .with_context(|| format!("could not parse `gh pr view` JSON for {branch}"))
 }
 
-pub async fn pr_update(branch: &str, title: &str, body: &str) -> Result<()> {
+pub async fn pr_update(
+    branch: &str,
+    title: Option<&str>,
+    body: Option<&str>,
+    labels: &[String],
+    reviewers: &[String],
+) -> Result<()> {
     validate_branch_name(branch)?;
     ensure_gh()?;
     let mut cmd = tokio::process::Command::new("gh");
-    cmd.arg("pr")
-        .arg("edit")
-        .arg(branch)
-        .arg("--title")
-        .arg(title)
-        .arg("--body")
-        .arg(body)
-        .stdin(Stdio::null())
+    cmd.arg("pr").arg("edit").arg(branch);
+    if let Some(title) = title {
+        cmd.arg("--title").arg(title);
+    }
+    if let Some(body) = body {
+        cmd.arg("--body").arg(body);
+    }
+    for label in labels {
+        cmd.arg("--add-label").arg(label);
+    }
+    for reviewer in reviewers {
+        cmd.arg("--add-reviewer").arg(reviewer);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     run_gh(cmd).await?;

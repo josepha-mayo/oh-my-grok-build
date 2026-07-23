@@ -571,9 +571,21 @@ pub struct PrStatusArgs {
 #[derive(Debug, Args, Clone)]
 pub struct PrCreateArgs {
     #[arg(short, long)]
-    pub title: String,
+    pub title: Option<String>,
     #[arg(short, long, default_value = "Generated with omgb")]
     pub body: String,
+    /// Target base branch (auto-detected if omitted)
+    #[arg(short, long)]
+    pub base: Option<String>,
+    /// Labels to apply (repeatable)
+    #[arg(short, long)]
+    pub label: Vec<String>,
+    /// Reviewers to request (repeatable)
+    #[arg(short, long)]
+    pub reviewer: Vec<String>,
+    /// Auto-generate title/body from the latest commit on this branch
+    #[arg(long)]
+    pub fill: bool,
     /// Create the PR as a draft
     #[arg(long)]
     pub draft: bool,
@@ -582,11 +594,17 @@ pub struct PrCreateArgs {
 #[derive(Debug, Args, Clone)]
 pub struct PrUpdateArgs {
     #[arg(short, long)]
-    pub title: String,
+    pub title: Option<String>,
     #[arg(short, long)]
-    pub body: String,
+    pub body: Option<String>,
     #[arg(short, long)]
     pub branch: Option<String>,
+    /// Labels to add (repeatable)
+    #[arg(short, long)]
+    pub label: Vec<String>,
+    /// Reviewers to add (repeatable)
+    #[arg(short, long)]
+    pub reviewer: Vec<String>,
 }
 
 #[derive(Debug, Args, Clone)]

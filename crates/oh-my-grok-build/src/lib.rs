@@ -758,6 +758,7 @@ pub(crate) async fn run_single_turn_with(
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     record_session_approvals(sid, &cwd);
                 }
+                record_taste_from_success(prompt).await;
                 return Ok(());
             }
             Err(e) => {
@@ -786,6 +787,7 @@ pub(crate) async fn run_single_turn_with(
                 .join(" "),
             Some(data),
         );
+        record_taste_from_failure(prompt, &errors);
     }
 
     last_result
@@ -804,6 +806,33 @@ fn record_session_approvals(session_id: &str, cwd: &std::path::Path) {
             .map(|c| (c.name, c.arguments.to_string()))
             .collect();
         let _ = crate::approvals::record_tool_calls(&tuples);
+    }
+}
+
+async fn record_taste_from_success(prompt: &str) {
+    if std::env::var("OMGB_AUTO_TASTE").ok().as_deref() == Some("0") {
+        return;
+    }
+    if let Ok(diff) = git_diff_text().await
+        && !diff.trim().is_empty()
+    {
+        let _ = crate::taste::taste_accept(prompt, &diff, vec!["auto".into()]);
+    }
+}
+
+fn record_taste_from_failure(prompt: &str, errors: &[String]) {
+    if std::env::var("OMGB_AUTO_TASTE").ok().as_deref() == Some("0") {
+        return;
+    }
+    let output = errors
+        .iter()
+        .filter(|e| !e.is_empty())
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !output.is_empty() {
+        let _ = crate::taste::taste_reject(prompt, &output, vec!["auto".into()]);
     }
 }
 
