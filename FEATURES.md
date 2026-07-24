@@ -2,7 +2,7 @@
 
 This file is the single source of truth for what `oh-my-grok-build` is and what still needs to happen before it is production-ready.
 
-> **Project north star:** `oh-my-grok-build` is a first-class extension of the open-source `xai-org/grok-build` **Rust harness**, not a separate tool or language rewrite. We build *on top of* the existing Rust crates (`xai-grok-pager`, `xai-grok-shell`, `xai-grok-mcp`, etc.), add missing harness features in Rust, and ship the binary as `oh-my-grok-build` (alias `omgb`). The legacy TypeScript/Node wrapper under `tools/oh-my-grok-build` and the Capacitor web mobile app under `grok-build-app` are no longer part of this repo.
+> **Project north star:** `oh-my-grok-build` is a first-class extension of the open-source `xai-org/grok-build` **Rust harness**, not a separate tool or language rewrite. We build *on top of* the existing Rust crates (`xai-grok-pager`, `xai-grok-shell`, `xai-grok-mcp`, etc.), add missing harness features in Rust, and ship the binary as `oh-my-grok-build` (alias `omgb`). The legacy TypeScript/Node wrapper under `tools/oh-my-grok-build` has been removed. The mobile app is a separate React Native + Expo project in the `grok-build-app` repo.
 
 ## 1. Core principles
 
@@ -26,8 +26,8 @@ This file is the single source of truth for what `oh-my-grok-build` is and what 
 | `crates/omgb-research` | ArXiv/web research and patch proposal. |
 | `crates/omgb-harness` | Cross-harness connectors for OpenCode, Codex, Claude, Hermes, Pi, OMP, etc. |
 | `crates/omgb-mobile-relay` | ACP/WebSocket server for the mobile app, QR pairing, rate limiting, origin/secret checks. |
-| `plugin/` | Grok Build plugin skills and slash commands (`/use`, `/browser`, `/schedule`, `/loop`, `/btw`, `/taste`, `/autonomous`, `/research`, etc.). |
-| `omgb-mobile/` (or separate repo) | Real native mobile app (Swift/Kotlin or Rust/Tauri). Not in this harness repo. |
+| `plugin/` | Grok Build plugin skills and slash commands (`/use`, `/browser`, `/schedule`, `/loop`, `/btw`, `/taste`, `/autonomous`, `/research`, `/workflow`, `/live`, etc.). |
+| `grok-build-app/` (separate repo) | React Native + Expo mobile app. |
 | `AGENTS.md` | Agent rules and conventions. |
 | `FEATURES.md` | This file. |
 
@@ -39,8 +39,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 
 | Feature | Status |
 | --- | --- |
-| Remove `grok-build-app` (Capacitor web app) from harness repo | ✅ |
-| Move `tools/oh-my-grok-build` (Node harness) out of `tools/` (archived) | ✅ |
+| Remove `tools/oh-my-grok-build` (Node harness) out of `tools/` (archived) | ✅ |
 | Write `FEATURES.md` as the single source of truth | ✅ |
 | Update `AGENTS.md` to describe Rust-first architecture | ✅ |
 | Update CI to run `cargo` checks | ✅ |
@@ -59,8 +58,9 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | `omgb loop` — iterate until working tree is clean | ✅ |
 | `omgb cron` / `omgb schedule` — scheduled prompt execution | ✅ |
 | `omgb team` — team mode with isolated git worktrees | ✅ |
-| `omgb swarm` — parallel subagents | ✅ |
+| `omgb swarm` — parallel subagents with task splitting and majority-vote fallback | ✅ |
 | `omgb subagent spawn/list/kill/logs/trace` | ✅ |
+| `omgb workflow` — exec/fan_out/shell workflow runner | ✅ |
 | `omgb research` — arXiv/web research and patch proposal | ✅ |
 | `omgb timeline` — recent session/job events | ✅ |
 | `omgb harness` — drive OpenCode, Codex, Claude, Hermes, Pi, OMP CLI agents | ✅ |
@@ -68,8 +68,11 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | `omgb connect <url>` — CLI ACP client | ✅ |
 | `omgb use` / `omgb browser` — desktop/browser MCP control | ✅ |
 | `omgb mcp` — memory, browser, computer MCP server management | ✅ |
+| Web-search tool pack — Tavily, Brave, Serper, Google, Bing, SearXNG, DuckDuckGo | ✅ |
+| `/workflow` and `/live` slash commands in the pager | ✅ |
+| Nested subagent permission chain with depth limits | ✅ |
 | Taste learning (`/taste`) injected into prompts | ✅ |
-| Slash commands in connect/TUI: `/loop`, `/schedule`, `/btw`, `/plan`, `/yolo`, `/autonomous`, `/taste`, `/use`, `/browser`, `/research` | ✅ |
+| Slash commands in connect/TUI: `/loop`, `/schedule`, `/btw`, `/plan`, `/yolo`, `/autonomous`, `/taste`, `/use`, `/browser`, `/research`, `/workflow`, `/live` | ✅ |
 | SSRF/private-IP/cloud-metadata URL filtering for browser, fetch, and connect | ✅ |
 | Safe env filtering for providers/MCP (`*_API_KEY` only, block `PATH`/`LD_PRELOAD`/etc.) | ✅ |
 | Desktop-control safety (`OMGB_ALLOW_DESKTOP_CONTROL` gating) | ✅ |
@@ -108,18 +111,17 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | Installation packages (Homebrew, cargo-binstall, MSI, DEB/RPM, signed tarball) | ⏳ |
 | GitHub Releases with signed binaries and SBOM | ⏳ |
 | CI (GitHub Actions) runs `cargo test`, `cargo clippy`, `cargo fmt --check`, cross-platform builds | ✅ |
-| App-store-ready native mobile app in separate repo | ⏳ |
-| User-facing docs (`README.md`, `docs/`) and man pages / `--help` | ⏳ |
+| App-store-ready native mobile app in separate repo | 🚧 |
+| User-facing docs (`README.md`, `docs/`) and man pages / `--help` | 🚧 |
 | Security hardening guide, telemetry policy, privacy policy | ⏳ |
 | Update mechanism (`omgb update`) with release channel support | ⏳ |
 
 ## 4. Mobile app
 
-- The mobile app is **not** a web/Capacitor app in this repo. It is a separate, real native mobile project.
+- The mobile app is **not** in this harness repo. It is a separate React Native + Expo project at `github.com/josepha-mayo/grok-build-app`.
 - It communicates over ACP/WebSocket with `omgb serve` on the local machine.
 - It supports both `omgb` and the upstream `grok` ACP servers (same protocol, secret in pairing URL).
-- It uses QR pairing, local notifications, voice input, message paging, model picker, slash commands, and tool output rendering.
-- Repository: `github.com/josepha-mayo/grok-build-app` or `github.com/josepha-mayo/omgb-mobile`.
+- It uses QR pairing, secure credential storage, chat, tool approval, model picker, slash commands, message paging, and a `/live` voice/text screen.
 
 ## 5. Verification commands
 
@@ -135,6 +137,7 @@ cargo build --bin oh-my-grok-build --profile release-dist
 
 ## 6. Notes
 
-- The legacy TypeScript/Node wrapper has been removed; all production code is now Rust.
+- The legacy TypeScript/Node wrapper has been removed; the `omgb` Rust binary is the production code.
+- The `grok-build-app` mobile repo uses React Native/Expo and is not part of the Rust workspace.
 - Upstream Rust crates in `crates/codegen/xai-grok-*` should be edited sparingly. Prefer new `omgb-*` crates and public upstream APIs. If an upstream seam is missing, open an issue/PR to expose it rather than forking logic.
 - All new code follows `rustfmt.toml`/`clippy.toml`, keeps secrets out of logs, and never auto-approves dangerous tools unless `yolo`/`always-approve` is explicitly set.

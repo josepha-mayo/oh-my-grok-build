@@ -14,8 +14,8 @@ This repo adds **oh-my-grok-build** (`omgb`) as an opinionated productivity, orc
 |------|---------|
 | `crates/codegen/` | Upstream Grok Build Rust source (treat as upstream; edit only when necessary) |
 | `crates/oh-my-grok-build/` | `omgb` Rust CLI: providers, scheduler, subagents, team mode, research, server/relay, connectors |
-| `plugin/` | Grok Build plugin: skills, hooks, agents, slash commands (incl. `/use`, `/browser`, `/schedule`, `/btw`) |
-| `grok-build-app/` | Native mobile app in a separate private repo; not present in this workspace |
+| `plugin/` | Grok Build plugin: skills, hooks, agents, slash commands (incl. `/use`, `/browser`, `/schedule`, `/btw`, `/workflow`, `/live`) |
+| `grok-build-app/` | Native mobile app (React Native + Expo) in a separate private repo; not part of this Rust workspace |
 | `AGENTS.md` | This file |
 
 ## Conventions
@@ -41,9 +41,11 @@ This repo adds **oh-my-grok-build** (`omgb`) as an opinionated productivity, orc
 
 ```bash
 cargo fmt -p oh-my-grok-build
-cargo clippy -p oh-my-grok-build
+cargo clippy -p oh-my-grok-build --all-targets
 cargo test -p oh-my-grok-build
 ```
+
+If a session is spawned by `/loop`, place a project brief named `oh_my_grok_build_brief.md` in the working directory or home directory; `omgb` loads it and prepends it to each `/loop` prompt.
 
 The `omgb` binary is produced at `target/release/omgb` (`target\release\omgb.exe` on Windows).
 `cargo build -p oh-my-grok-build` also builds `safe-shell-guard` (`target/release/safe-shell-guard`/`safe-shell-guard.exe`). Copy that binary to `plugin/bin/safe-shell-guard` (or `plugin\bin\safe-shell-guard.exe` on Windows) so the plugin hook (`../bin/safe-shell-guard`) resolves it.

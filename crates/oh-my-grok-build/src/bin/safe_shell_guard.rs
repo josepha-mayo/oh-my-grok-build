@@ -501,7 +501,8 @@ fn version_suffix_start(s: &str) -> Option<usize> {
         return None;
     }
     let suffix = &s[pos..];
-    if !suffix.chars().next().unwrap().is_ascii_digit() || suffix.contains("..") {
+    let first_digit = suffix.chars().next().is_some_and(|c| c.is_ascii_digit());
+    if !first_digit || suffix.contains("..") {
         return None;
     }
     let parts: Vec<&str> = suffix.split('.').collect();
@@ -675,10 +676,10 @@ fn has_symlink_in_tail(base: &Path, path: &Path) -> bool {
         if i < skip {
             continue;
         }
-        if let Ok(meta) = std::fs::symlink_metadata(&prefix) {
-            if meta.is_symlink() {
-                return true;
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(&prefix)
+            && meta.is_symlink()
+        {
+            return true;
         }
     }
     false
@@ -1739,13 +1740,14 @@ fn parse_xargs(tokens: &[Token], i: usize) -> PrefixOutcome {
             j += 2;
             continue;
         }
-        if v.starts_with("--") && v.contains('=') {
-            let eq = v.find('=').unwrap();
-            let val = &v[eq + 1..];
-            if val.contains('~') {
-                return PrefixOutcome::Stop(Decision::Deny(
-                    "Blocked tilde expansion in xargs option value".into(),
-                ));
+        if v.starts_with("--") {
+            if let Some(eq) = v.find('=') {
+                let val = &v[eq + 1..];
+                if val.contains('~') {
+                    return PrefixOutcome::Stop(Decision::Deny(
+                        "Blocked tilde expansion in xargs option value".into(),
+                    ));
+                }
             }
             j += 1;
             continue;

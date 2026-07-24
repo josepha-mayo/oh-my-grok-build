@@ -69,11 +69,28 @@ omgb connect ws://127.0.0.1:9999
 | `omgb provider add|list|remove|discover|test` | Manage BYOK/local providers and keys. |
 | `omgb model switch <provider>` | Set the default model (provider id or `omgb-<id>`). |
 | `omgb research "<topic>"` | Search arXiv and, if `--model` is given, generate a `.patch`. |
+| `omgb loop "<prompt>"` | Iterate until the git working tree is clean (anti-loop guard). |
+| `omgb swarm "<prompt>"` | Parallel subagents with task splitting and majority-vote fallback. |
+| `omgb workflow run|list|show|new` | Run YAML/JSON workflows with exec/fan_out/shell steps. |
+| `omgb subagent spawn|list|kill|logs|trace` | Spawn and manage child subagents with depth limits. |
 | `omgb cron "<expr>" "<prompt>"` | Schedule a repeating job (cron or interval expression). |
 | `omgb schedule list|run|delete|start|stop` | Manage scheduled jobs. |
 | `omgb use` / `omgb browser` | Desktop/browser control. Gated by `--yolo` or `OMGB_ALLOW_DESKTOP_CONTROL=1`. |
 | `omgb serve` / `omgb connect` | WebSocket relay server and client. |
 | `omgb harness` | Register and run cross-harness connectors. |
+| `omgb timeline` | Show recent session/job events. |
+
+## Mobile app
+
+A separate React Native + Expo mobile app lives in the `grok-build-app` repository.
+It pairs with `omgb serve` over ACP/WebSocket using a QR code or manual URL/secret,
+and supports chat, tool approval, model switching, slash commands, message history
+paging, and a `/live` voice/text screen.
+
+```bash
+cd grok-build-app
+npx expo start
+```
 
 ## Security notes
 

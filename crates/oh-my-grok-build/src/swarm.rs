@@ -171,7 +171,7 @@ pub(crate) fn build_split_prompt(count: usize, prompt: &str) -> String {
     format!(
         "Split the following task into exactly {count} self-contained subtasks \
          that can each be solved independently. Return ONLY a JSON array of strings, \
-         with no markdown, no explanation.\n\nTask: {prompt}"
+         with no markdown, no explanation, no code fences.\n\nExample: [\"subtask 1\", \"subtask 2\"]\n\nTask: {prompt}"
     )
 }
 
@@ -235,6 +235,26 @@ pub(crate) fn parse_subtasks(raw: &str) -> Option<Vec<String>> {
         if let Some(arr) = try_array(candidate) {
             return Some(arr);
         }
+    }
+
+    // Fallback: numbered list like "1. task one\n2. task two".
+    let numbered: Vec<String> = trimmed
+        .lines()
+        .filter_map(|line| {
+            let s = line.trim();
+            let rest = s
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start_matches(['.', ')'])
+                .trim_start();
+            if rest.len() < s.len() && !rest.is_empty() {
+                Some(rest.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !numbered.is_empty() && numbered.len() <= 20 {
+        return Some(numbered);
     }
 
     None
@@ -305,6 +325,15 @@ mod tests {
         assert!(parse_subtasks("[]").is_none());
         assert!(parse_subtasks("not json").is_none());
         assert!(parse_subtasks("{\"foo\": [\"a\"]}").is_none());
+    }
+
+    #[test]
+    fn parse_subtasks_numbered_list() {
+        let raw = "1. first task\n2) second task\n3. third task";
+        assert_eq!(
+            parse_subtasks(raw).unwrap(),
+            vec!["first task", "second task", "third task"]
+        );
     }
 
     #[test]
