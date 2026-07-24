@@ -224,14 +224,15 @@ pub fn kill(id: &str) -> Result<()> {
     }
     #[cfg(unix)]
     {
+        // The subagent called setsid, so its PID is also its process-group ID.
         std::process::Command::new("kill")
-            .args(["-TERM", &record.pid.to_string()])
+            .args(["-TERM", &format!("-{}", record.pid)])
             .spawn()?;
     }
     #[cfg(not(unix))]
     {
         std::process::Command::new("taskkill")
-            .args(["/PID", &record.pid.to_string(), "/F"])
+            .args(["/PID", &record.pid.to_string(), "/F", "/T"])
             .spawn()?;
     }
     println!("killed subagent {} (pid {})", record.id, record.pid);

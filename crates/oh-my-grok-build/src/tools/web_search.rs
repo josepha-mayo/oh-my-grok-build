@@ -59,6 +59,7 @@ impl Tool for OmgbWebSearchTool {
     ) -> Result<WebSearchOutput, ToolError> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ToolError::execution(self.id(), e.to_string()))?;
 
@@ -138,36 +139,28 @@ impl Tool for OmgbWebSearchTool {
     }
 }
 
-fn apply_allowed(out: WebSearchOutput, allowed: Option<&[String]>) -> WebSearchOutput {
-    if let Some(domains) = allowed {
-        let filtered: Vec<String> = out
-            .citations
-            .iter()
-            .filter(|url| {
-                url::Url::parse(url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-                    .is_some_and(|h| {
-                        domains
-                            .iter()
-                            .any(|d| h == *d || h.ends_with(&format!(".{d}")))
-                    })
-            })
-            .cloned()
-            .collect();
-        WebSearchOutput {
-            citations: filtered,
-            ..out
-        }
-    } else {
-        out
-    }
+fn domain_allowed(url: &str, domains: &[String]) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+        .is_some_and(|h| {
+            domains
+                .iter()
+                .any(|d| h == *d || h.ends_with(&format!(".{d}")))
+        })
 }
 
-fn build_output(query: &str, items: &[(String, String, String)]) -> WebSearchOutput {
+fn build_output(
+    query: &str,
+    items: &[(String, String, String)],
+    allowed: Option<&[String]>,
+) -> WebSearchOutput {
     let mut content = String::new();
     let mut citations = Vec::new();
     for (title, url, snippet) in items {
+        if allowed.is_some_and(|domains| !domain_allowed(url, domains)) {
+            continue;
+        }
         content.push_str(&format!("## {title}\n{snippet}\n<{url}>\n\n"));
         citations.push(url.clone());
     }
@@ -221,7 +214,7 @@ async fn tavily(
             }
         }
     }
-    Ok(apply_allowed(build_output(query, &items), allowed))
+    Ok(build_output(query, &items, allowed))
 }
 
 async fn brave(
@@ -265,7 +258,7 @@ async fn brave(
             }
         }
     }
-    Ok(apply_allowed(build_output(query, &items), allowed))
+    Ok(build_output(query, &items, allowed))
 }
 
 async fn serper(
@@ -305,7 +298,7 @@ async fn serper(
             }
         }
     }
-    Ok(apply_allowed(build_output(query, &items), allowed))
+    Ok(build_output(query, &items, allowed))
 }
 
 async fn google(
@@ -345,7 +338,7 @@ async fn google(
             }
         }
     }
-    Ok(apply_allowed(build_output(query, &items), allowed))
+    Ok(build_output(query, &items, allowed))
 }
 
 async fn bing(
@@ -389,23 +382,31 @@ async fn bing(
             }
         }
     }
-    Ok(apply_allowed(build_output(query, &items), allowed))
+    Ok(build_output(query, &items, allowed))
 }
 
 async fn searxng(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     base: &str,
     query: &str,
     allowed: Option<&[String]>,
 ) -> Result<WebSearchOutput> {
-    let url = format!("{base}/search");
-    let resp: serde_json::Value = client
-        .get(&url)
-        .query(&[("q", query), ("format", "json")])
-        .send()
-        .await?
-        .json()
-        .await?;
+    let encoded = urlencoding::encode(query);
+    let raw = format!(
+        "{}/search?q={encoded}&format=json",
+        base.trim_end_matches('/')
+    );
+    let (allow_local, allow_private) = if crate::net::is_url_host_loopback(base) {
+        (true, true)
+    } else if crate::net::is_url_host_private(base).await {
+        (false, true)
+    } else {
+        (false, false)
+    };
+    let vurl = crate::net::validate_url(&raw, allow_local, allow_private).await?;
+    let text = crate::net::http_get_text(&vurl, None, std::time::Duration::from_secs(30)).await?;
+    let resp: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("invalid searxng json: {e}"))?;
     let mut items = Vec::new();
     if let Some(results) = resp.get("results").and_then(|v| v.as_array()) {
         for r in results {
@@ -429,7 +430,7 @@ async fn searxng(
             }
         }
     }
-    Ok(apply_allowed(build_output(query, &items), allowed))
+    Ok(build_output(query, &items, allowed))
 }
 
 async fn duckduckgo(
@@ -484,5 +485,5 @@ async fn duckduckgo(
             items.push((title, real_url, snippet));
         }
     }
-    Ok(apply_allowed(build_output(query, &items), allowed))
+    Ok(build_output(query, &items, allowed))
 }

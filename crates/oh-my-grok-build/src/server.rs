@@ -89,14 +89,16 @@ fn pairing_host(bind_addr: SocketAddr, advertise_host: Option<IpAddr>) -> String
     }
 }
 
-fn pairing_url(bind_addr: SocketAddr, advertise_host: Option<IpAddr>) -> String {
+fn pairing_url(
+    bind_addr: SocketAddr,
+    advertise_host: Option<IpAddr>,
+    advertise_port: Option<u16>,
+    wss: bool,
+) -> String {
     let host = pairing_host(bind_addr, advertise_host);
-    // The server serves plain WebSocket traffic. Advertise `ws://` so clients
-    // connecting directly to the printed QR/URL work. A TLS-terminating reverse
-    // proxy can re-export the relay as `wss://` if the user configures one.
-    let scheme = "ws";
-    let port = bind_addr.port();
-    let default_port = 80;
+    let scheme = if wss { "wss" } else { "ws" };
+    let port = advertise_port.unwrap_or(bind_addr.port());
+    let default_port = if wss { 443 } else { 80 };
     if port == default_port {
         format!("{scheme}://{host}/ws")
     } else {
@@ -108,8 +110,14 @@ fn pairing_payload(url: &str, secret: &str) -> String {
     serde_json::json!({"url": url, "secret": secret }).to_string()
 }
 
-fn print_pairing_info(bind_addr: SocketAddr, secret: &str, advertise_host: Option<IpAddr>) {
-    let url = pairing_url(bind_addr, advertise_host);
+fn print_pairing_info(
+    bind_addr: SocketAddr,
+    secret: &str,
+    advertise_host: Option<IpAddr>,
+    advertise_port: Option<u16>,
+    wss: bool,
+) {
+    let url = pairing_url(bind_addr, advertise_host, advertise_port, wss);
     println!("  pairing url: {url}");
     // The QR encodes the URL and secret separately so the mobile client can
     // connect with an Authorization header instead of putting the secret in
@@ -210,12 +218,19 @@ async fn prune_rate_limiter(
     rate_limit_per_minute: Option<u32>,
     rate_limiter: &Mutex<HashMap<IpAddr, Vec<Instant>>>,
 ) {
+    let mut map = rate_limiter.lock().await;
+    prune_rate_limiter_locked(rate_limit_per_minute, &mut map, Instant::now());
+}
+
+fn prune_rate_limiter_locked(
+    rate_limit_per_minute: Option<u32>,
+    map: &mut HashMap<IpAddr, Vec<Instant>>,
+    now: Instant,
+) {
     if rate_limit_per_minute.is_none() {
         return;
     }
-    let now = Instant::now();
     let window = Duration::from_secs(60);
-    let mut map = rate_limiter.lock().await;
     let mut empty = Vec::new();
     for (ip, entries) in map.iter_mut() {
         entries.retain(|t| now.saturating_duration_since(*t) < window);
@@ -261,11 +276,10 @@ async fn check_rate_limit(
         return Ok(());
     }
 
-    prune_rate_limiter(Some(limit), rate_limiter).await;
-
     let now = Instant::now();
     let ip = addr.ip();
     let mut map = rate_limiter.lock().await;
+    prune_rate_limiter_locked(Some(limit), &mut map, now);
     let entries = map.entry(ip).or_default();
     if entries.len() as u32 >= limit {
         return Err("rate limit exceeded");
@@ -539,12 +553,21 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     if let Some(ip) = advertise_host {
         println!("  advertise host: {ip}");
     }
+    if let Some(port) = args.advertise_port {
+        println!("  advertise port: {port}");
+    }
     if let Some(path) = &secret_path {
         println!("  secret file: {}", path.display());
     } else if provided {
         println!("  secret: <provided>");
     }
-    print_pairing_info(actual_addr, &public_secret, advertise_host);
+    print_pairing_info(
+        actual_addr,
+        &public_secret,
+        advertise_host,
+        args.advertise_port,
+        args.wss,
+    );
 
     axum::serve(
         listener,
@@ -645,13 +668,36 @@ mod tests {
     fn test_pairing_url_no_secret() {
         let bind = SocketAddr::new("0.0.0.0".parse().unwrap(), 2419);
         let host = Some("192.168.1.2".parse().unwrap());
-        assert_eq!(pairing_url(bind, host), "ws://192.168.1.2:2419/ws");
+        assert_eq!(
+            pairing_url(bind, host, None, false),
+            "ws://192.168.1.2:2419/ws"
+        );
     }
 
     #[test]
     fn test_pairing_url_loopback() {
         let bind = SocketAddr::new("127.0.0.1".parse().unwrap(), 2419);
-        assert_eq!(pairing_url(bind, None), "ws://127.0.0.1:2419/ws");
+        assert_eq!(
+            pairing_url(bind, None, None, false),
+            "ws://127.0.0.1:2419/ws"
+        );
+    }
+
+    #[test]
+    fn test_pairing_url_wss_default_port() {
+        let bind = SocketAddr::new("0.0.0.0".parse().unwrap(), 443);
+        let host = Some("192.168.1.2".parse().unwrap());
+        assert_eq!(pairing_url(bind, host, None, true), "wss://192.168.1.2/ws");
+    }
+
+    #[test]
+    fn test_pairing_url_wss_advertise_port() {
+        let bind = SocketAddr::new("0.0.0.0".parse().unwrap(), 2419);
+        let host = Some("192.168.1.2".parse().unwrap());
+        assert_eq!(
+            pairing_url(bind, host, Some(443), true),
+            "wss://192.168.1.2/ws"
+        );
     }
 
     #[test]

@@ -139,6 +139,7 @@ const UNSAFE_ENV_KEYS: &[&str] = &[
 ];
 
 const HOOK_DIR_MARKERS: &[&str] = &[".grok/hooks", ".omgb/hooks"];
+const MAX_TRUSTED_FOLDERS_BYTES: u64 = 1024 * 1024;
 
 const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
     "add",
@@ -620,6 +621,29 @@ fn normalize_folders<'a>(iter: impl Iterator<Item = &'a str>) -> Vec<String> {
     iter.filter_map(normalize_folder_path).collect()
 }
 
+fn metadata_is_secure(meta: &std::fs::Metadata) -> bool {
+    if !meta.is_file() || meta.is_symlink() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return false;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn trusted_folders() -> Vec<String> {
     if let Ok(raw) = std::env::var("OMGB_TRUSTED_FOLDERS") {
         return normalize_folders(raw.split(';'));
@@ -628,6 +652,15 @@ fn trusted_folders() -> Vec<String> {
     let Some(path) = path else {
         return Vec::new();
     };
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return Vec::new();
+    };
+    if !metadata_is_secure(&meta) {
+        return Vec::new();
+    }
+    if meta.len() > MAX_TRUSTED_FOLDERS_BYTES {
+        return Vec::new();
+    }
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };

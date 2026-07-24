@@ -794,6 +794,16 @@ pub struct ServeArgs {
     /// use --allowed-origins to restrict client origins.
     #[arg(long)]
     pub insecure_allow_lan: bool,
+    /// Advertise the pairing URL with the wss:// scheme. The omgb server still
+    /// listens for plain WebSocket traffic; use this when a TLS-terminating
+    /// reverse proxy is in front of the server.
+    #[arg(long)]
+    pub wss: bool,
+    /// Port to advertise in the QR pairing URL (defaults to the bind port).
+    /// Use this when a TLS-terminating reverse proxy listens on a different
+    /// port than the omgb server.
+    #[arg(long)]
+    pub advertise_port: Option<u16>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -953,6 +963,9 @@ pub struct WorkflowRunArgs {
     /// Print the steps without running them
     #[arg(long)]
     pub dry_run: bool,
+    /// Allow workflow steps to execute arbitrary shell commands
+    #[arg(long)]
+    pub allow_shell: bool,
 }
 
 #[derive(Debug, Args, Clone)]

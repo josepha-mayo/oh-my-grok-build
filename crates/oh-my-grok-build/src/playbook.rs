@@ -146,7 +146,7 @@ async fn run_shell(step: &ShellStep) -> Result<()> {
     Ok(())
 }
 
-fn safe_shell_guard_path() -> Option<PathBuf> {
+pub(crate) fn safe_shell_guard_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let name = if cfg!(windows) {
         "safe-shell-guard.exe"
@@ -170,7 +170,7 @@ fn safe_shell_guard_path() -> Option<PathBuf> {
     None
 }
 
-async fn guard_shell_command(command: &str, args: &[String]) -> Result<()> {
+pub(crate) async fn guard_shell_command(command: &str, args: &[String]) -> Result<()> {
     let guard = safe_shell_guard_path()
         .ok_or_else(|| anyhow::anyhow!("safe-shell-guard binary not found; build it first"))?;
     let mut parts = vec![
@@ -210,7 +210,7 @@ async fn guard_shell_command(command: &str, args: &[String]) -> Result<()> {
             .get("reason")
             .and_then(|v| v.as_str())
             .unwrap_or("blocked");
-        bail!("playbook shell step blocked by safe-shell-guard: {reason}");
+        bail!("shell command blocked by safe-shell-guard: {reason}");
     }
     Ok(())
 }

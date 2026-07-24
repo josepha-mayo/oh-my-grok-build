@@ -46,8 +46,10 @@ impl PidFile {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        if let Err(e) = file.try_lock_exclusive() {
-            bail!("scheduler daemon is already running: {e}");
+        if file.try_lock_exclusive().is_err() {
+            // Advisory locks are released on process exit/FD close, so a held
+            // lock means another scheduler is genuinely running.
+            bail!("scheduler daemon is already running");
         }
         file.set_len(0)?;
         let mut file = file;
