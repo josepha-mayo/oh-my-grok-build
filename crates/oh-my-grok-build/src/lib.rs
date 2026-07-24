@@ -1222,6 +1222,7 @@ async fn run_undo(args: UndoArgs) -> Result<()> {
 }
 
 fn load_brief() -> Option<String> {
+    const MAX_BRIEF_BYTES: u64 = 64 * 1024;
     let mut dirs = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         dirs.push(cwd);
@@ -1233,6 +1234,16 @@ fn load_brief() -> Option<String> {
         loop {
             let path = dir.join("oh_my_grok_build_brief.md");
             if path.is_file() {
+                if let Ok(meta) = std::fs::metadata(&path)
+                    && meta.len() > MAX_BRIEF_BYTES
+                {
+                    eprintln!(
+                        "warning: {} is larger than {} bytes; skipping brief",
+                        path.display(),
+                        MAX_BRIEF_BYTES
+                    );
+                    return None;
+                }
                 return std::fs::read_to_string(&path).ok();
             }
             if !dir.pop() {
