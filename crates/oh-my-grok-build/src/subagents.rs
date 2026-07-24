@@ -24,6 +24,10 @@ pub struct SubagentRecord {
     pub prompt: String,
     pub started_at: DateTime<Utc>,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub depth: u8,
 }
 
 fn load_records() -> Result<Vec<SubagentRecord>> {
@@ -79,6 +83,29 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
     if !yolo {
         bail!("subagent spawn requires --yolo to auto-approve tool use");
     }
+
+    let parent_depth: u8 = std::env::var("OMGB_SUBAGENT_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let parent_id = std::env::var("OMGB_SUBAGENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    if parent_depth >= 2 {
+        bail!("grandchild subagents cannot spawn further subagents");
+    }
+    if parent_depth == 1 {
+        let current_id = parent_id.as_deref().unwrap_or("");
+        let children = load_records()?
+            .into_iter()
+            .filter(|r| r.parent_id.as_deref() == Some(current_id))
+            .count();
+        if children >= 5 {
+            bail!("subagent has already spawned 5 grandchild subagents");
+        }
+    }
+
     let exe = std::env::current_exe()?.to_string_lossy().to_string();
     let id = format!(
         "sub-{}-{}",
@@ -89,7 +116,21 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
     let err_path = log_path(&id, "err")?;
     std::fs::create_dir_all(&logs_dir()?)?;
 
-    let prompt_file = crate::write_prompt_temp(prompt).await?;
+    let prompt = if parent_depth > 0 {
+        let spawn_hint = if parent_depth == 1 {
+            "You may spawn up to 5 grandchild subagents by running `omgb subagent spawn --yolo \"<task>\"` from a tool."
+        } else {
+            "You cannot spawn further subagents."
+        };
+        format!(
+            "You are a subagent at nesting depth {}. {spawn_hint}\n\n{prompt}",
+            parent_depth + 1
+        )
+    } else {
+        prompt.to_string()
+    };
+
+    let prompt_file = crate::write_prompt_temp(&prompt).await?;
     let out_file = std::fs::File::create(&out_path)?;
     let err_file = std::fs::File::create(&err_path)?;
     let mut cmd = tokio::process::Command::new(&exe);
@@ -97,6 +138,12 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
         .arg("--prompt-file")
         .arg(&prompt_file)
         .arg("--prompt-file-own")
+        .env("OMGB_SUBAGENT_DEPTH", (parent_depth + 1).to_string())
+        .env("OMGB_SUBAGENT_ID", &id)
+        .env(
+            "OMGB_SUBAGENT_PARENT_ID",
+            parent_id.as_deref().unwrap_or(""),
+        )
         .kill_on_drop(false)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
@@ -119,12 +166,14 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
     let record = SubagentRecord {
         id: id.clone(),
         pid,
-        prompt: prompt.to_string(),
+        prompt,
         started_at: Utc::now(),
         command: format!(
             "{exe} exec --prompt-file <prompt>{}",
             if yolo { " --yolo" } else { "" }
         ),
+        parent_id,
+        depth: parent_depth + 1,
     };
     append_record(&record)?;
     println!("spawned subagent {id} (pid {pid})");

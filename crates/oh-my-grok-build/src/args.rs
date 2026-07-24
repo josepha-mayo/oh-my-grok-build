@@ -85,6 +85,8 @@ pub enum OmgbCommand {
     Plugin(PluginCommand),
     /// Run a deterministic CI playbook
     Playbook(PlaybookArgs),
+    /// Run or manage reusable agent workflows
+    Workflow(WorkflowArgs),
     /// Computer use prompt
     Use(UseArgs),
     /// Browser use prompt
@@ -921,4 +923,42 @@ pub struct PlaybookArgs {
     /// Print the steps without running them
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct WorkflowArgs {
+    #[command(subcommand)]
+    pub command: WorkflowCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum WorkflowCommand {
+    /// Run a saved workflow or file
+    Run(WorkflowRunArgs),
+    /// List saved workflows
+    List,
+    /// Show a saved workflow
+    Show { name: String },
+    /// Create a new workflow stub
+    New(WorkflowNewArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct WorkflowRunArgs {
+    /// Workflow name from ~/.omgb/workflows
+    pub name: Option<String>,
+    /// Workflow file path (JSON or TOML)
+    #[arg(long, value_name = "FILE")]
+    pub file: Option<PathBuf>,
+    /// Print the steps without running them
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct WorkflowNewArgs {
+    /// Workflow display name
+    pub name: String,
+    /// Initial task description
+    pub description: String,
 }

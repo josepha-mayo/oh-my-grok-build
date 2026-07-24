@@ -154,19 +154,29 @@ pub(crate) fn load_env_file() -> Result<HashMap<String, String>> {
 /// routing discover keys before a provider is persisted to config.
 pub(crate) fn env_keys_to_load() -> HashSet<String> {
     let mut keys = HashSet::new();
-    let mut collect = |p: &ProviderConfig| {
-        for k in valid_env_keys(p) {
-            keys.insert(k);
-        }
-    };
+    for k in [
+        "TAVILY_API_KEY",
+        "BRAVE_API_KEY",
+        "SERPER_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_CX",
+        "BING_API_KEY",
+        "SEARXNG_URL",
+    ] {
+        keys.insert(k.to_string());
+    }
 
     if let Ok(cfg) = load_omg_config() {
         for p in cfg.providers.values() {
-            collect(p);
+            for k in valid_env_keys(p) {
+                keys.insert(k);
+            }
         }
     }
     for t in catalog::TEMPLATES {
-        collect(&t.to_provider_config());
+        for k in valid_env_keys(&t.to_provider_config()) {
+            keys.insert(k);
+        }
     }
     if let Ok(dir) = omg_dir() {
         let connectors_path = dir.join("connectors.json");
@@ -398,8 +408,14 @@ fn provider_env_keys(provider_id: &str, canonical: Option<&str>) -> Option<Vec<S
 }
 
 pub(crate) fn is_valid_env_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.ends_with("_API_KEY")
+    if key.is_empty() {
+        return false;
+    }
+    let allowed_names = ["GOOGLE_CX", "SEARXNG_URL"];
+    if allowed_names.contains(&key) {
+        return true;
+    }
+    key.ends_with("_API_KEY")
         && key
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')

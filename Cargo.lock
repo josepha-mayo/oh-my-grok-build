@@ -6963,6 +6963,10 @@ dependencies = [
  "xai-grok-pager",
  "xai-grok-pager-minimal",
  "xai-grok-shell",
+ "xai-grok-tools",
+ "xai-tool-protocol",
+ "xai-tool-runtime",
+ "xai-tool-types",
  "xai-tty-utils",
 ]
 

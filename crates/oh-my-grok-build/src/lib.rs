@@ -39,6 +39,8 @@ mod swarm;
 mod taste;
 mod timeline;
 mod tool_overrides;
+mod tools;
+mod workflow;
 
 use args::*;
 
@@ -83,6 +85,8 @@ pub fn main() -> Result<()> {
     // operation and runs before any other thread or signal handler is installed.
     // SAFETY: no other threads exist at this point.
     unsafe { load_omg_env_into_process() }?;
+
+    xai_grok_tools::registry::types::register_tool_pack(crate::tools::register);
 
     let cli = OmgbArgs::parse();
 
@@ -227,6 +231,7 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Dap(args) => lsp::run_dap(args).await,
         OmgbCommand::Plugin(args) => marketplace::run_plugin(args).await,
         OmgbCommand::Playbook(args) => playbook::run_playbook(&args).await,
+        OmgbCommand::Workflow(args) => workflow::run_workflow(&args).await,
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
         OmgbCommand::Harness(args) => run_harness(args).await,
         OmgbCommand::Serve(args) => server::serve(&args).await,
@@ -1216,6 +1221,28 @@ async fn run_undo(args: UndoArgs) -> Result<()> {
     Ok(())
 }
 
+fn load_brief() -> Option<String> {
+    let mut dirs = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home);
+    }
+    for mut dir in dirs {
+        loop {
+            let path = dir.join("oh_my_grok_build_brief.md");
+            if path.is_file() {
+                return std::fs::read_to_string(&path).ok();
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    None
+}
+
 async fn run_loop(args: LoopArgs) -> Result<()> {
     const MAX_DIFF_CHARS: usize = 16 * 1024;
     const TOOL_CALL_LOOP_THRESHOLD: usize = 16;
@@ -1234,9 +1261,13 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
     }
     let session_id = session.session_id.clone().unwrap_or_default();
     let cwd = std::env::current_dir()?;
+    let brief = load_brief();
 
     let mut iteration = 0;
-    let mut prompt = args.prompt.clone();
+    let base_prompt = args.prompt.clone();
+    let mut prompt = brief
+        .as_ref()
+        .map_or_else(|| base_prompt.clone(), |b| format!("{b}\n\n{base_prompt}"));
     let mut clean = true;
     let mut status;
     while iteration < args.max_iterations {
@@ -1279,10 +1310,13 @@ async fn run_loop(args: LoopArgs) -> Result<()> {
         } else {
             format!("{status}\n{diff}")
         };
-        prompt = format!(
+        let next = format!(
             "Original task: {}\n\nCurrent git changes:\n{}\n\nContinue until complete.",
             args.prompt, changes
         );
+        prompt = brief
+            .as_ref()
+            .map_or_else(|| next.clone(), |b| format!("{b}\n\n{next}"));
     }
     if !clean {
         if args.commit || args.commit_untracked {

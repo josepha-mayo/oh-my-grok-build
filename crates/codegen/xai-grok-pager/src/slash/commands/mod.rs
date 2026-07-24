@@ -32,6 +32,7 @@ pub mod imagine;
 pub mod imagine_video;
 pub mod import_claude;
 pub mod jump;
+pub mod live;
 pub mod login;
 pub mod logout;
 pub mod loop_cmd;
@@ -66,6 +67,7 @@ pub mod usage;
 pub mod view_plan;
 pub mod vim_mode;
 pub mod voice;
+pub mod workflow;
 use super::command::SlashCommand;
 use std::sync::Arc;
 /// All pager-local builtin commands, in display order.
@@ -118,6 +120,8 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(recap::RecapCommand),
         Arc::new(terminal_setup::TerminalSetupCommand),
         Arc::new(voice::VoiceCommand),
+        Arc::new(live::LiveCommand),
+        Arc::new(workflow::WorkflowCommand),
         Arc::new(loop_cmd::LoopCommand),
         Arc::new(imagine::ImagineCommand),
         Arc::new(imagine_video::ImagineVideoCommand),

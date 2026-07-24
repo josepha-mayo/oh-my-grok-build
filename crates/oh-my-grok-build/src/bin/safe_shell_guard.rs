@@ -687,7 +687,7 @@ fn has_symlink_in_tail(base: &Path, path: &Path) -> bool {
 fn is_path_trusted(cwd: &str, p: &str, trusted: &[String]) -> bool {
     let canonical_cwd = match dunce::canonicalize(cwd) {
         Ok(p) => p,
-        Err(_) => dunce::simplified(PathBuf::from(cwd)).to_path_buf(),
+        Err(_) => dunce::simplified(&PathBuf::from(cwd)).to_path_buf(),
     };
     let joined: PathBuf = if is_absolute_path(p) {
         PathBuf::from(p)
