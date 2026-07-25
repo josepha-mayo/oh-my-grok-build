@@ -33,17 +33,10 @@ const LOCAL_PROVIDER_IDS: &[&str] = &[
     "koboldcpp",
     "mistral-rs",
     "sglang",
-    "tensorrt-llm",
     "mlc-llm",
     "xinference",
-    "faraday",
-    "aichat",
-    "ava",
-    "exllamav2",
-    "ctranslate2",
-    "ctransformers",
-    "candle",
-    "triton",
+    "aphrodite",
+    "litellm",
     "text-generation-inference",
     "lorax",
 ];
@@ -713,7 +706,7 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
         provider.auto_compact_threshold_percent = Some(th.clamp(0, 100));
     }
     provider.id = id.clone();
-    if provider.model.trim().is_empty() {
+    if provider.model.trim().is_empty() || provider.model == "local-model" {
         bail!("--model is required for provider '{id}'");
     }
     if let Some(backend) = &args.backend {
@@ -733,34 +726,56 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
     // until the provider config has been fully validated and saved.
     let api_key = std::env::var("OMGB_API_KEY").ok().filter(|s| !s.is_empty());
 
-    if provider.context_window.is_none() {
-        let api_key_for_fetch = if let Some(ref k) = api_key {
-            Some(k.clone())
-        } else {
-            resolve_api_key(&provider)?
-        };
-        let backend = provider
-            .api_backend
-            .as_deref()
-            .unwrap_or("chat_completions");
-        let extra = provider.extra_headers.clone().unwrap_or_default();
-        let allow_local =
-            is_local_provider_id(&provider.id) || is_url_host_loopback(&provider.base_url);
-        let allow_private = is_url_host_private(&provider.base_url).await;
-        // Reject insecure public HTTP before the provider is saved.
-        validate_url(&provider.base_url, allow_local, allow_private).await?;
-        let is_ollama = provider.id == "ollama" || is_ollama_url(&provider.base_url);
-        let cw = fetch_model_context_window(
-            &provider.base_url,
-            api_key_for_fetch.as_deref(),
-            backend,
-            &extra,
-            allow_local,
-            allow_private,
-            is_ollama,
-            &provider.model,
+    let api_key_for_fetch = if let Some(ref k) = api_key {
+        Some(k.clone())
+    } else {
+        resolve_api_key(&provider)?
+    };
+    let backend = provider
+        .api_backend
+        .as_deref()
+        .unwrap_or("chat_completions");
+    let extra = provider.extra_headers.clone().unwrap_or_default();
+    let allow_local =
+        is_local_provider_id(&provider.id) || is_url_host_loopback(&provider.base_url);
+    let allow_private = is_url_host_private(&provider.base_url).await;
+    // Reject insecure public HTTP before the provider is saved.
+    validate_url(&provider.base_url, allow_local, allow_private).await?;
+    let is_ollama = provider.id == "ollama" || is_ollama_url(&provider.base_url);
+    let models = fetch_model_list(
+        &provider.base_url,
+        api_key_for_fetch.as_deref(),
+        backend,
+        &extra,
+        allow_local,
+        allow_private,
+        Duration::from_secs(10),
+    )
+    .await
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not reach provider at {} or /models probe failed; check the URL, API key, and network",
+            provider.base_url
         )
-        .await;
+    })?;
+
+    if provider.context_window.is_none() {
+        let model_in_list = models.iter().find(|m| m.id == provider.model);
+        let cw = if let Some(cw) = model_in_list.and_then(|m| m.context_window) {
+            Some(cw)
+        } else {
+            fetch_model_context_window(
+                &provider.base_url,
+                api_key_for_fetch.as_deref(),
+                backend,
+                &extra,
+                allow_local,
+                allow_private,
+                is_ollama,
+                &provider.model,
+            )
+            .await
+        };
         provider.context_window = cw
             .or_else(|| fallback_context_window(&provider.model))
             .or(Some(DEFAULT_CONTEXT_WINDOW));

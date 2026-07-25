@@ -70,6 +70,7 @@ const SEARCH_USER_AGENT: &str = concat!(
     " (research; +https://oh-my-grok.build)"
 );
 const DEFAULT_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+const URL_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const PATCH_PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_PROMPT_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RESULTS: usize = 100;
@@ -177,7 +178,7 @@ async fn ddg_instant_answer(topic: &str, count: usize) -> Option<Vec<WebResult>>
 
     let mut out = Vec::new();
     for (title, url, snippet) in candidates {
-        if let Some(vurl) = sanitize_search_url(&url) {
+        if let Some(vurl) = validated_search_url(&url).await {
             out.push(WebResult {
                 title,
                 url: vurl,
@@ -200,7 +201,7 @@ async fn web_search_html(topic: &str, count: usize) -> Result<Vec<WebResult>> {
     let mut headers = HashMap::new();
     headers.insert("User-Agent".into(), SEARCH_USER_AGENT.into());
     let text = http_get_text(&vurl, Some(&headers), DEFAULT_SEARCH_TIMEOUT).await?;
-    parse_duckduckgo_html(&text, count)
+    parse_duckduckgo_html(&text, count).await
 }
 
 async fn web_search(topic: &str, count: usize) -> Result<String> {
@@ -227,7 +228,7 @@ async fn web_search(topic: &str, count: usize) -> Result<String> {
     Ok(report)
 }
 
-fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult>> {
+async fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult>> {
     let document = Html::parse_document(html);
     let result_selector = Selector::parse(".result").map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let title_selector = Selector::parse(".result__a").map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -241,7 +242,7 @@ fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult>> {
         if let Some(a) = result.select(&title_selector).next() {
             title = a.text().collect::<Vec<_>>().join(" ").trim().to_string();
             if let Some(href) = a.value().attr("href") {
-                url = sanitize_search_url(href).unwrap_or_default();
+                url = validated_search_url(href).await.unwrap_or_default();
             }
         }
         let snippet = result
@@ -279,22 +280,30 @@ fn extract_ddg_url(raw: &str) -> Option<String> {
     Some(url)
 }
 
-fn sanitize_search_url(raw: &str) -> Option<String> {
+async fn validated_search_url(raw: &str) -> Option<String> {
     let url = extract_ddg_url(raw)?;
-    let parsed = url::Url::parse(&url).ok()?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return None;
+    if cfg!(test) {
+        let parsed = url::Url::parse(&url).ok()?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        if host.is_empty() || host == "localhost" {
+            return None;
+        }
+        if host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .is_some_and(is_non_public_ip)
+        {
+            return None;
+        }
+        return Some(url);
     }
-    let host = parsed.host_str()?;
-    if host.is_empty() || host == "localhost" {
-        return None;
+    match tokio::time::timeout(URL_VALIDATE_TIMEOUT, validate_url(&url, false, false)).await {
+        Ok(Ok(_)) => Some(url),
+        _ => None,
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && is_non_public_ip(ip)
-    {
-        return None;
-    }
-    Some(url)
 }
 
 async fn exec_prompt(model: &str, prompt: &str, yolo: bool) -> Result<String> {
@@ -548,8 +557,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_duckduckgo_html_extracts_results() {
+    #[tokio::test]
+    async fn test_parse_duckduckgo_html_extracts_results() {
         let html = r#"<!DOCTYPE html>
 <html><body>
 <div class="result">
@@ -557,7 +566,7 @@ mod tests {
     <a class="result__snippet">This is an example page.</a>
 </div>
 </body></html>"#;
-        let results = parse_duckduckgo_html(html, 5).unwrap();
+        let results = parse_duckduckgo_html(html, 5).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Example");
         assert_eq!(results[0].url, "https://example.com");

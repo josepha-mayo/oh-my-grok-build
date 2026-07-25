@@ -41,13 +41,37 @@ const COSTS: &[(&str, f64)] = &[
     // of the cloud providers they can reach.
     ("opencode", 5.0),      // multi-provider wrapper; defaults to Anthropic/OpenAI
     ("hermes", 5.0),        // OpenRouter-recommended multi-provider wrapper
-    ("pi", 5.0),            // oh-my-pi multi-provider wrapper
     ("omp", 5.0),           // oh-my-pi multi-provider wrapper
     ("github-models", 5.0), // Azure-hosted OpenAI models; free tier + paid
     ("nvidia", 1.5),        // NIM Llama endpoints (approximate)
     ("sambanova", 0.8),     // Llama endpoints (approximate)
     ("lepton", 2.0),        // approximate
     ("siliconflow", 0.5),   // approximate
+    ("aimlapi", 5.0),       // multi-provider aggregator
+    ("arliai", 5.0),        // multi-model aggregator
+    ("chutes", 5.0),        // multi-model decentralized host
+    ("kluster", 5.0),       // multi-model aggregator
+    ("speka", 5.0),         // multi-model gateway
+    ("featherless", 5.0),   // multi-model aggregator
+    ("aipower", 5.0),       // multi-model gateway
+    ("shuttleai", 5.0),     // multi-model gateway
+    ("lambda", 5.0),        // multi-model inference
+    ("requesty", 5.0),      // multi-model router
+    ("portkey", 5.0),       // multi-model gateway
+    ("baseten", 5.0),       // multi-model inference
+    ("arcee", 5.0),         // multi-model inference
+    ("nebius", 5.0),        // multi-model inference
+    ("inference", 5.0),     // multi-model inference
+    ("venice", 5.0),        // multi-model inference
+    ("glhf", 5.0),          // multi-model inference
+    ("scaleway", 5.0),      // multi-model inference
+    ("ovhcloud", 5.0),      // multi-model inference
+    ("akashml", 5.0),       // multi-model inference
+    ("inception", 5.0),     // multi-model inference
+    ("morph", 5.0),         // multi-model inference
+    ("aionlabs", 5.0),      // multi-model inference
+    ("cortecs", 5.0),       // multi-model gateway
+    ("ai302", 5.0),         // multi-model aggregator
     // Keyless local providers (cost is electricity, not API spend).
     ("ollama", 0.0),
     ("lmstudio", 0.0),
@@ -61,17 +85,10 @@ const COSTS: &[(&str, f64)] = &[
     ("koboldcpp", 0.0),
     ("mistral-rs", 0.0),
     ("sglang", 0.0),
-    ("tensorrt-llm", 0.0),
     ("mlc-llm", 0.0),
     ("xinference", 0.0),
-    ("faraday", 0.0),
-    ("aichat", 0.0),
-    ("ava", 0.0),
-    ("exllamav2", 0.0),
-    ("ctranslate2", 0.0),
-    ("ctransformers", 0.0),
-    ("candle", 0.0),
-    ("triton", 0.0),
+    ("aphrodite", 0.0),
+    ("litellm", 0.0),
     ("text-generation-inference", 0.0),
     ("lorax", 0.0),
 ];

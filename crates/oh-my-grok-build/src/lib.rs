@@ -1466,7 +1466,10 @@ async fn run_provider(args: ProviderArgs) -> Result<()> {
         }
         ProviderCommand::Catalog => {
             for t in catalog::TEMPLATES {
-                let key = t.env_key.unwrap_or("OMGB_<id>_API_KEY");
+                let key = t
+                    .env_key
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| crate::providers::env_var_name(t.id));
                 println!("{} - {} -> {} (key: {})", t.id, t.name, t.base_url, key);
             }
         }
