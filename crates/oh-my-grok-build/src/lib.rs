@@ -82,12 +82,25 @@ unsafe fn load_omg_env_into_process() -> Result<()> {
     Ok(())
 }
 
+fn set_default_env(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        // SAFETY: main starts before any other thread or signal handler.
+        unsafe { std::env::set_var(key, value) };
+    }
+}
+
 pub fn main() -> Result<()> {
     // Load valid *_API_KEY entries from ~/.omgb/.env before anything else can read
     // the process environment. This is safe because it is the very first
     // operation and runs before any other thread or signal handler is installed.
     // SAFETY: no other threads exist at this point.
     unsafe { load_omg_env_into_process() }?;
+
+    // omgb: opt out of upstream telemetry/feedback by default. Users can opt in
+    // by setting these env vars or [features] flags in ~/.grok/config.toml.
+    set_default_env("GROK_TELEMETRY_ENABLED", "false");
+    set_default_env("GROK_FEEDBACK_ENABLED", "false");
+    set_default_env("GROK_ERROR_REPORTING", "false");
 
     xai_grok_tools::registry::types::register_tool_pack(crate::tools::register);
 
@@ -248,12 +261,24 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Commit(args) => run_commit(args).await,
         OmgbCommand::Review => run_review().await,
         OmgbCommand::Undo(args) => run_undo(args).await,
+        OmgbCommand::Feedback(args) => run_feedback(args).await,
     }
 }
 
 pub(crate) fn build_agent_config(model: Option<String>) -> Result<AgentConfig> {
-    let raw = xai_grok_shell::config::load_effective_config_disk_only()
+    let mut raw = xai_grok_shell::config::load_effective_config_disk_only()
         .map_err(|e| anyhow::anyhow!("failed to load config: {e}"))?;
+    // omgb: force-disable upstream telemetry and feedback by default. Feedback
+    // is still accepted via `omgb feedback` which opens a GitHub issue.
+    if let toml::Value::Table(ref mut t) = raw {
+        let features = t
+            .entry("features")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if let toml::Value::Table(ft) = features {
+            ft.insert("feedback".into(), toml::Value::Boolean(false));
+            ft.insert("telemetry".into(), toml::Value::Boolean(false));
+        }
+    }
     let mut cfg = AgentConfig::new_from_toml_cfg(&raw)
         .map_err(|e| anyhow::anyhow!("failed to create agent config: {e}"))?;
     cfg.default_model_override = model;
@@ -1268,6 +1293,42 @@ async fn run_undo(args: UndoArgs) -> Result<()> {
     Ok(())
 }
 
+const FEEDBACK_REPO: &str = "josepha-mayo/oh-my-grok-build";
+
+async fn run_feedback(args: FeedbackArgs) -> Result<()> {
+    let body = args
+        .message
+        .as_deref()
+        .unwrap_or("<describe your issue or suggestion here>");
+    let title = "Feedback from omgb user";
+    let encoded_title = urlencoding::encode(title);
+    let encoded_body = urlencoding::encode(body);
+    let url = format!(
+        "https://github.com/{FEEDBACK_REPO}/issues/new?title={encoded_title}&body={encoded_body}"
+    );
+    if args.open {
+        let mut cmd;
+        if cfg!(target_os = "windows") {
+            cmd = std::process::Command::new("cmd");
+            cmd.args(["/c", "start", ""]);
+        } else if cfg!(target_os = "macos") {
+            cmd = std::process::Command::new("open");
+        } else {
+            cmd = std::process::Command::new("xdg-open");
+        }
+        cmd.arg(&url);
+        match cmd.status() {
+            Ok(s) if s.success() => {
+                println!("opened feedback page in browser");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    println!("Submit feedback at:\n{url}");
+    Ok(())
+}
+
 fn load_brief() -> Option<String> {
     const MAX_BRIEF_BYTES: u64 = 64 * 1024;
     let mut dirs = Vec::new();
@@ -1401,6 +1462,12 @@ async fn run_provider(args: ProviderArgs) -> Result<()> {
                     ""
                 };
                 println!("{}{} - {} -> {}", p.id, default, p.name, p.base_url);
+            }
+        }
+        ProviderCommand::Catalog => {
+            for t in catalog::TEMPLATES {
+                let key = t.env_key.unwrap_or("OMGB_<id>_API_KEY");
+                println!("{} - {} -> {} (key: {})", t.id, t.name, t.base_url, key);
             }
         }
         ProviderCommand::Add(add_args) => {

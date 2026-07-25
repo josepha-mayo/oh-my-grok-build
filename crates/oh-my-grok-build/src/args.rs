@@ -105,6 +105,8 @@ pub enum OmgbCommand {
     Review,
     /// Undo the last omgb commit
     Undo(UndoArgs),
+    /// Submit feedback or file an issue
+    Feedback(FeedbackArgs),
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -212,11 +214,13 @@ pub struct ProviderArgs {
 pub enum ProviderCommand {
     /// List configured providers
     List,
+    /// Show all built-in provider templates available to `omgb provider add`
+    Catalog,
     /// Add a provider from a built-in template or custom values
     Add(AddProviderArgs),
     /// Remove a provider
     Remove { id: String },
-    /// Discover local models (Ollama / LM Studio)
+    /// Discover local models (Ollama / LM Studio / vLLM / SGLang / llama.cpp)
     Discover(DiscoverArgs),
     /// Test a provider's connectivity
     Test { id: String },
@@ -261,6 +265,12 @@ pub struct DiscoverArgs {
     pub ollama_url: Option<String>,
     #[arg(long)]
     pub lmstudio_url: Option<String>,
+    #[arg(long)]
+    pub vllm_url: Option<String>,
+    #[arg(long)]
+    pub sglang_url: Option<String>,
+    #[arg(long)]
+    pub llama_cpp_url: Option<String>,
     #[arg(long)]
     pub add: bool,
 }
@@ -914,6 +924,15 @@ pub struct UndoArgs {
     /// Hard reset, discarding working tree changes
     #[arg(long)]
     pub hard: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct FeedbackArgs {
+    /// Feedback message to include in the issue body
+    pub message: Option<String>,
+    /// Open the issue page in a browser instead of printing the URL
+    #[arg(short, long)]
+    pub open: bool,
 }
 
 #[derive(Debug, Args, Clone)]

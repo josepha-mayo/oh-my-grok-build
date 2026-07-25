@@ -264,6 +264,9 @@ pub async fn select_provider_or_fallback(prompt: &str) -> Result<String> {
         let args = crate::args::DiscoverArgs {
             ollama_url: None,
             lmstudio_url: None,
+            vllm_url: None,
+            sglang_url: None,
+            llama_cpp_url: None,
             add: false,
         };
         let discovered = discover_local_models(&args).await?;

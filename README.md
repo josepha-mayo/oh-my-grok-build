@@ -35,6 +35,7 @@ omgb exec "explain this codebase"
 Use a BYOK provider:
 
 ```bash
+omgb provider catalog
 omgb provider add openai --api-key "$OPENAI_API_KEY" --default
 omgb exec "write a rust fibonacci" --model omgb-openai
 ```
@@ -66,7 +67,7 @@ omgb connect ws://127.0.0.1:9999
 | --- | --- |
 | `omgb exec "<prompt>"` | Run a single headless turn. Use `--output-file` to capture stdout, `--yolo` to auto-approve tools. |
 | `omgb tui` | Start the Grok pager UI. |
-| `omgb provider add|list|remove|discover|test` | Manage BYOK/local providers and keys. |
+| `omgb provider list|catalog|add|remove|discover|test` | Manage 100+ BYOK/local provider templates and keys, including Ollama, LM Studio, vLLM, and SGLang. |
 | `omgb model switch <provider>` | Set the default model (provider id or `omgb-<id>`). |
 | `omgb research "<topic>"` | Search arXiv and, if `--model` is given, generate a `.patch`. |
 | `omgb loop "<prompt>"` | Iterate until the git working tree is clean (anti-loop guard). |
@@ -79,25 +80,27 @@ omgb connect ws://127.0.0.1:9999
 | `omgb serve` / `omgb connect` | WebSocket relay server and client. |
 | `omgb harness` | Register and run cross-harness connectors. |
 | `omgb timeline` | Show recent session/job events. |
+| `omgb feedback "<message>"` | Open a GitHub issue to submit feedback (`--open` to launch browser). |
 
 ## Mobile app
 
 A separate React Native + Expo mobile app lives in the `grok-build-app` repository.
 It pairs with `omgb serve` over ACP/WebSocket using a QR code or manual URL/secret,
-and supports chat, tool approval, model switching, slash commands, message history
-paging, and a `/live` voice/text screen.
+and supports chat, tool approval, model switching, slash commands, `/help` for command
+discovery, message history paging, and a `/live` voice/text screen.
 
 ```bash
 cd grok-build-app
 npx expo start
 ```
 
-## Security notes
+## Security & privacy notes
 
 - Provider API keys are written to `~/.omgb/.env` with `0600` permissions on Unix.
 - Outgoing HTTP requests are pinned to resolved public IPs and redirects are disabled to mitigate SSRF.
 - `omgb use` and `omgb browser` require explicit desktop-control gating.
 - Shell commands passed through Grok's `run_terminal_cmd` are validated by `plugin/bin/safe-shell-guard`.
+- Telemetry and upstream feedback are disabled by default; use `omgb feedback` to submit issues via GitHub.
 
 ## Development
 

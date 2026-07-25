@@ -62,6 +62,7 @@ The `omgb` binary is produced at `target/release/omgb` (`target\release\omgb.exe
 2. **Grok-native**: use Grok's existing plugin, hook, skill, subagent, and MCP systems rather than reinventing them.
 3. **Incremental**: small, composable tools. The CLI should be useful with one command (`omgb serve`) and grow from there.
 4. **Industry-standard**: include tests, CI, type safety, clear docs, and secure credential handling.
+5. **No telemetry by default**: upstream telemetry and feedback are disabled; user feedback is submitted through `omgb feedback` to GitHub issues.
 
 ## Mobile app (separate `grok-build-app` repo)
 

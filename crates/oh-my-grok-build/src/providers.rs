@@ -17,6 +17,7 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LMSTUDIO_URL: &str = "http://localhost:1234/v1";
 const DEFAULT_VLLM_URL: &str = "http://localhost:8000/v1";
 const DEFAULT_LLAMA_CPP_URL: &str = "http://localhost:8080/v1";
+const DEFAULT_SGLANG_URL: &str = "http://localhost:30000/v1";
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
 const LOCAL_PROVIDER_IDS: &[&str] = &[
@@ -955,15 +956,22 @@ pub async fn discover_local_models(
 ) -> Result<Vec<(String, String, Vec<ModelListEntry>)>> {
     let ollama = args.ollama_url.as_deref().unwrap_or(DEFAULT_OLLAMA_URL);
     let lmstudio = args.lmstudio_url.as_deref().unwrap_or(DEFAULT_LMSTUDIO_URL);
+    let vllm = args.vllm_url.as_deref().unwrap_or(DEFAULT_VLLM_URL);
+    let sglang = args.sglang_url.as_deref().unwrap_or(DEFAULT_SGLANG_URL);
+    let llama_cpp = args
+        .llama_cpp_url
+        .as_deref()
+        .unwrap_or(DEFAULT_LLAMA_CPP_URL);
 
-    let (ollama, lmstudio, vllm, llama_cpp) = tokio::join!(
+    let (ollama, lmstudio, vllm, sglang, llama_cpp) = tokio::join!(
         discover_one(ollama, "ollama"),
         discover_one(lmstudio, "lmstudio"),
-        discover_one(DEFAULT_VLLM_URL, "vllm"),
-        discover_one(DEFAULT_LLAMA_CPP_URL, "llama-cpp"),
+        discover_one(vllm, "vllm"),
+        discover_one(sglang, "sglang"),
+        discover_one(llama_cpp, "llama-cpp"),
     );
 
-    Ok([ollama, lmstudio, vllm, llama_cpp]
+    Ok([ollama, lmstudio, vllm, sglang, llama_cpp]
         .into_iter()
         .flatten()
         .collect())
