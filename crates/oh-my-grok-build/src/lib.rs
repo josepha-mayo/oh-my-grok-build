@@ -3,12 +3,15 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::Parser;
+use tokio::io::AsyncWrite;
 use tokio::process::Command;
 
 use xai_grok_pager::app::{PagerArgs, run as pager_run};
@@ -440,6 +443,50 @@ pub(crate) async fn kill_child_and_reap(
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+/// AsyncWrite that keeps the first `limit` bytes and silently discards the rest.
+/// This lets a child keep writing without filling the pipe and blocking.
+pub(crate) struct BoundedCapture {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedCapture {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            limit,
+        }
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
+}
+
+impl AsyncWrite for BoundedCapture {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let remaining = this.limit.saturating_sub(this.buf.len());
+        let n = buf.len().min(remaining);
+        if n > 0 {
+            this.buf.extend_from_slice(&buf[..n]);
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 fn exe_stem() -> String {
@@ -1794,4 +1841,34 @@ async fn run_skill(args: SkillArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn noop_waker() -> Waker {
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+            fn wake_by_ref(self: &Arc<Self>) {}
+        }
+        Waker::from(Arc::new(Noop))
+    }
+
+    #[test]
+    fn bounded_capture_keeps_prefix_and_discards_rest() {
+        let mut capture = BoundedCapture::new(5);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let res = {
+            let mut pinned = Pin::new(&mut capture);
+            pinned.as_mut().poll_write(&mut cx, b"hello world")
+        };
+        assert!(matches!(res, Poll::Ready(Ok(11))));
+        assert_eq!(capture.into_string(), "hello");
+    }
 }

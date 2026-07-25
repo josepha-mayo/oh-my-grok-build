@@ -5,12 +5,16 @@
 //! model, tools, and expected outcomes are pinned.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+const SHELL_STEP_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_CAPTURE_BYTES: u64 = 2 * 1024 * 1024;
 
 use xai_grok_pager::headless::OutputFormat;
 
@@ -105,7 +109,7 @@ fn step_name(step: &Step) -> &'static str {
 async fn run_step(step: &Step) -> Result<()> {
     match step {
         Step::Exec(s) => run_exec(s).await,
-        Step::Shell(s) => run_shell(s).await,
+        Step::Shell(s) => run_shell_step(&s.command, &s.args, s.expect_exit).await,
         Step::AssertFile(s) => run_assert_file(s),
         Step::GitCommit(s) => crate::git_commit_all(&s.message, false, None).await,
     }
@@ -130,18 +134,138 @@ async fn run_exec(step: &ExecStep) -> Result<()> {
     Ok(())
 }
 
-async fn run_shell(step: &ShellStep) -> Result<()> {
-    guard_shell_command(&step.command, &step.args).await?;
-    let mut cmd = Command::new(&step.command);
-    cmd.args(&step.args);
-    let status = cmd.status().await?;
-    if let Some(expected) = step.expect_exit {
+pub(crate) fn resolve_shell_command(command: &str) -> Result<PathBuf> {
+    if command.is_empty() {
+        bail!("shell command is empty");
+    }
+    if command.contains('/') || command.contains('\\') {
+        bail!("shell command must be a single executable name without path separators");
+    }
+    let filtered_path = match std::env::var_os("PATH") {
+        Some(p) => {
+            let paths: Vec<_> = std::env::split_paths(&p)
+                .filter(|d| d.is_absolute())
+                .collect();
+            if paths.is_empty() {
+                bail!("PATH contains no absolute directories");
+            }
+            std::env::join_paths(paths)
+                .map_err(|_| anyhow::anyhow!("PATH contains invalid entries"))?
+        }
+        None => bail!("PATH is not set"),
+    };
+    let mut candidates = which::which_in_global(command, Some(&filtered_path))
+        .with_context(|| format!("failed to resolve command {command}"))?;
+    let resolved = candidates
+        .next()
+        .with_context(|| format!("command not found in PATH: {command}"))?;
+
+    // Resolve symlinks and verify the real path is a regular file in a
+    // directory not writable by group or others so a PATH/symlink swap cannot
+    // redirect us to a malicious executable.
+    let resolved = dunce::canonicalize(&resolved).with_context(|| {
+        format!(
+            "failed to canonicalize {resolved}",
+            resolved = resolved.display()
+        )
+    })?;
+    let meta = std::fs::symlink_metadata(&resolved)
+        .with_context(|| format!("metadata for {resolved}", resolved = resolved.display()))?;
+    if !meta.is_file() {
+        bail!(
+            "resolved command {resolved} is not a regular file",
+            resolved = resolved.display()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            bail!(
+                "resolved command {resolved} is writable by group or others",
+                resolved = resolved.display()
+            );
+        }
+        if let Some(parent) = resolved.parent() {
+            let parent_meta = std::fs::symlink_metadata(parent)
+                .with_context(|| format!("metadata for {parent}", parent = parent.display()))?;
+            if !parent_meta.is_dir() {
+                bail!(
+                    "parent of {resolved} is not a directory",
+                    resolved = resolved.display()
+                );
+            }
+            let parent_mode = parent_meta.permissions().mode() & 0o777;
+            if parent_mode & 0o022 != 0 {
+                bail!(
+                    "parent directory {parent} is writable by group or others",
+                    parent = parent.display()
+                );
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+pub(crate) async fn run_shell_step(
+    command: &str,
+    args: &[String],
+    expect_exit: Option<i32>,
+) -> Result<()> {
+    guard_shell_command(command, args).await?;
+    let exe = resolve_shell_command(command)?;
+    let mut cmd = Command::new(exe.as_os_str());
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let (mut child, group) = crate::spawn_with_process_group(cmd)?;
+    let mut stdout = child.stdout.take().context("stdout not piped")?;
+    let mut stderr = child.stderr.take().context("stderr not piped")?;
+    let mut out_capture = crate::BoundedCapture::new(MAX_CAPTURE_BYTES as usize);
+    let mut err_capture = crate::BoundedCapture::new(MAX_CAPTURE_BYTES as usize);
+
+    let out_handle = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut stdout, &mut out_capture).await;
+        out_capture.into_string()
+    });
+    let err_handle = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut stderr, &mut err_capture).await;
+        err_capture.into_string()
+    });
+
+    let status = match tokio::time::timeout(SHELL_STEP_TIMEOUT, child.wait()).await {
+        Ok(s) => s?,
+        Err(_) => {
+            crate::kill_child_and_reap(&mut child, group.as_ref()).await;
+            out_handle.abort();
+            err_handle.abort();
+            bail!(
+                "shell step timed out after {}s",
+                SHELL_STEP_TIMEOUT.as_secs()
+            );
+        }
+    };
+    crate::kill_process_group(group.as_ref());
+
+    let out = out_handle.await.unwrap_or_default();
+    let err = err_handle.await.unwrap_or_default();
+    if !out.is_empty() {
+        println!("{out}");
+    }
+    if let Some(expected) = expect_exit {
         let code = status.code().unwrap_or(-1);
         if code != expected {
-            bail!("shell exited {code}, expected {expected}");
+            bail!("shell exited {code}, expected {expected}; stderr: {err}");
         }
     } else if !status.success() {
-        bail!("shell exited with {}", status.code().unwrap_or(-1));
+        bail!(
+            "shell exited with {}; stderr: {err}",
+            status.code().unwrap_or(-1)
+        );
     }
     Ok(())
 }
@@ -299,5 +423,16 @@ exists = true
             exists: Some(true),
         };
         assert!(run_assert_file(&step).is_err());
+    }
+
+    #[test]
+    fn resolve_shell_command_rejects_empty() {
+        assert!(resolve_shell_command("").is_err());
+    }
+
+    #[test]
+    fn resolve_shell_command_rejects_path_separators() {
+        assert!(resolve_shell_command("foo/bar").is_err());
+        assert!(resolve_shell_command("foo\\bar").is_err());
     }
 }

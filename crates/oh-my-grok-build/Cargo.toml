@@ -19,6 +19,7 @@ dunce = { workspace = true }
 fs2 = { workspace = true }
 gethostname = { workspace = true }
 futures = { workspace = true }
+libc = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

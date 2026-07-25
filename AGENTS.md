@@ -62,3 +62,16 @@ The `omgb` binary is produced at `target/release/omgb` (`target\release\omgb.exe
 2. **Grok-native**: use Grok's existing plugin, hook, skill, subagent, and MCP systems rather than reinventing them.
 3. **Incremental**: small, composable tools. The CLI should be useful with one command (`omgb serve`) and grow from there.
 4. **Industry-standard**: include tests, CI, type safety, clear docs, and secure credential handling.
+
+## Mobile app (separate `grok-build-app` repo)
+
+The React Native + Expo mobile app lives in its own repository and is not part of the Rust workspace. When working on it, run these checks before committing:
+
+```bash
+npm run lint
+npm test -- --watchAll=false
+npx expo-doctor
+npm audit
+```
+
+After dependency changes, use `npx expo install <package>` to keep versions aligned with the installed Expo SDK and add any missing peer dependencies.

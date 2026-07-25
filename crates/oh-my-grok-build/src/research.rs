@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use scraper::{Html, Selector};
 
-use crate::net::{http_get_text, validate_url};
+use crate::net::{http_get_text, is_non_public_ip, validate_url};
 
 fn safe_filename(input: &str) -> String {
     let mut out = String::new();
@@ -70,6 +70,8 @@ const SEARCH_USER_AGENT: &str = concat!(
     " (research; +https://oh-my-grok.build)"
 );
 const DEFAULT_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+const PATCH_PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_PROMPT_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RESULTS: usize = 100;
 
 pub async fn research(topic: &str, count: usize) -> Result<String> {
@@ -175,7 +177,7 @@ async fn ddg_instant_answer(topic: &str, count: usize) -> Option<Vec<WebResult>>
 
     let mut out = Vec::new();
     for (title, url, snippet) in candidates {
-        if let Some(vurl) = validated_search_url(&url).await {
+        if let Some(vurl) = sanitize_search_url(&url) {
             out.push(WebResult {
                 title,
                 url: vurl,
@@ -198,7 +200,7 @@ async fn web_search_html(topic: &str, count: usize) -> Result<Vec<WebResult>> {
     let mut headers = HashMap::new();
     headers.insert("User-Agent".into(), SEARCH_USER_AGENT.into());
     let text = http_get_text(&vurl, Some(&headers), DEFAULT_SEARCH_TIMEOUT).await?;
-    parse_duckduckgo_html(&text, count).await
+    parse_duckduckgo_html(&text, count)
 }
 
 async fn web_search(topic: &str, count: usize) -> Result<String> {
@@ -225,7 +227,7 @@ async fn web_search(topic: &str, count: usize) -> Result<String> {
     Ok(report)
 }
 
-async fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult>> {
+fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult>> {
     let document = Html::parse_document(html);
     let result_selector = Selector::parse(".result").map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let title_selector = Selector::parse(".result__a").map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -239,7 +241,7 @@ async fn parse_duckduckgo_html(html: &str, count: usize) -> Result<Vec<WebResult
         if let Some(a) = result.select(&title_selector).next() {
             title = a.text().collect::<Vec<_>>().join(" ").trim().to_string();
             if let Some(href) = a.value().attr("href") {
-                url = validated_search_url(href).await.unwrap_or_default();
+                url = sanitize_search_url(href).unwrap_or_default();
             }
         }
         let snippet = result
@@ -277,9 +279,22 @@ fn extract_ddg_url(raw: &str) -> Option<String> {
     Some(url)
 }
 
-async fn validated_search_url(raw: &str) -> Option<String> {
+fn sanitize_search_url(raw: &str) -> Option<String> {
     let url = extract_ddg_url(raw)?;
-    validate_url(&url, false, false).await.ok().map(|_| url)
+    let parsed = url::Url::parse(&url).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if host.is_empty() || host == "localhost" {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && is_non_public_ip(ip)
+    {
+        return None;
+    }
+    Some(url)
 }
 
 async fn exec_prompt(model: &str, prompt: &str, yolo: bool) -> Result<String> {
@@ -296,17 +311,47 @@ async fn exec_prompt(model: &str, prompt: &str, yolo: bool) -> Result<String> {
         .arg("read_file,grep,list_dir,web_search,web_fetch")
         .arg("--prompt-file")
         .arg(&prompt_file)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if yolo {
         cmd.arg("--yolo");
     }
-    let out = cmd.output().await?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("failed to generate patch: {stderr}");
+    let (mut child, group) = crate::spawn_with_process_group(cmd)?;
+    let mut stdout = child.stdout.take().context("stdout not piped")?;
+    let mut stderr = child.stderr.take().context("stderr not piped")?;
+    let mut out_capture = crate::BoundedCapture::new(MAX_PROMPT_OUTPUT_BYTES as usize);
+    let mut err_capture = crate::BoundedCapture::new(MAX_PROMPT_OUTPUT_BYTES as usize);
+
+    let out_handle = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut stdout, &mut out_capture).await;
+        out_capture.into_string()
+    });
+    let err_handle = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut stderr, &mut err_capture).await;
+        err_capture.into_string()
+    });
+
+    let status = match tokio::time::timeout(PATCH_PROMPT_TIMEOUT, child.wait()).await {
+        Ok(s) => s?,
+        Err(_) => {
+            crate::kill_child_and_reap(&mut child, group.as_ref()).await;
+            out_handle.abort();
+            err_handle.abort();
+            bail!(
+                "patch generation timed out after {}s",
+                PATCH_PROMPT_TIMEOUT.as_secs()
+            );
+        }
+    };
+    crate::kill_process_group(group.as_ref());
+
+    let out = out_handle.await.unwrap_or_default();
+    let err = err_handle.await.unwrap_or_default();
+    if !status.success() {
+        bail!("failed to generate patch: {err}");
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(out)
 }
 
 pub async fn run_research(
@@ -503,8 +548,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_parse_duckduckgo_html_extracts_results() {
+    #[test]
+    fn test_parse_duckduckgo_html_extracts_results() {
         let html = r#"<!DOCTYPE html>
 <html><body>
 <div class="result">
@@ -512,7 +557,7 @@ mod tests {
     <a class="result__snippet">This is an example page.</a>
 </div>
 </body></html>"#;
-        let results = parse_duckduckgo_html(html, 5).await.unwrap();
+        let results = parse_duckduckgo_html(html, 5).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Example");
         assert_eq!(results[0].url, "https://example.com");

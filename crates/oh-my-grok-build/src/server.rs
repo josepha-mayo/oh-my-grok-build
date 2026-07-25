@@ -5,6 +5,7 @@
 //! constant-time secret verification without modifying the upstream crate.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +43,63 @@ fn omg_dir() -> anyhow::Result<std::path::PathBuf> {
 fn generate_secret() -> String {
     // Use the full UUIDv4 hex string (32 chars, 128 bits) for the pairing secret.
     uuid::Uuid::new_v4().to_string().replace('-', "")
+}
+
+fn read_persisted_secret(path: &std::path::Path) -> Option<String> {
+    // Open without following symlinks so an attacker cannot swap the path to a
+    // different file between the metadata check and the read.
+    let file = open_secret_file(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return None;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return None;
+        }
+    }
+    if meta.len() > 1024 {
+        return None;
+    }
+    let mut file = file.take(1024);
+    let mut raw = String::new();
+    file.read_to_string(&mut raw).ok()?;
+    let s = raw.trim();
+    if s.len() >= 16 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn open_secret_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_secret_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 fn is_link_local(ip: &IpAddr) -> bool {
@@ -139,17 +197,27 @@ fn token_hash_eq(token: &str, secret_hash: &[u8; 32]) -> bool {
 
 async fn validate_auth(
     headers: &HeaderMap,
-    query: &xai_grok_shell::agent::server::WsQueryParams,
+    _query: &xai_grok_shell::agent::server::WsQueryParams,
     state: &ProxyState,
 ) -> bool {
-    let tokens: Vec<String> = headers
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(token) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .into_iter()
-        .chain(query.server_key.iter().map(|s| s.as_str()))
-        .map(|s| s.to_string())
-        .collect();
+    {
+        tokens.push(token.to_string());
+    }
+    if let Some(protos) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+    {
+        for proto in protos.split(',').map(str::trim) {
+            if !proto.is_empty() {
+                tokens.push(proto.to_string());
+            }
+        }
+    }
 
     tokens
         .iter()
@@ -334,6 +402,7 @@ async fn spawn_upstream_agent(
 
 struct ProxyState {
     secret_hash: [u8; 32],
+    public_secret: String,
     allowed_origins: Option<Vec<String>>,
     rate_limit_per_minute: Option<u32>,
     rate_limiter: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
@@ -368,6 +437,11 @@ async fn ws_handler(
     }
 
     info!("Authenticated WebSocket connection from {}", addr);
+    let ws = if headers.get("sec-websocket-protocol").is_some() {
+        ws.protocols([state.public_secret.clone()])
+    } else {
+        ws
+    };
     ws.on_upgrade(move |socket| handle_proxy(socket, state))
 }
 
@@ -486,9 +560,13 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
             let dir = omg_dir()?;
             std::fs::create_dir_all(&dir)?;
             let path = dir.join("serve.secret");
-            let s = generate_secret();
-            crate::providers::write_file_atomic(&path, &s, true)?;
-            (s, Some(path), false)
+            if let Some(s) = read_persisted_secret(&path) {
+                (s, Some(path), false)
+            } else {
+                let s = generate_secret();
+                crate::providers::write_file_atomic(&path, &s, true)?;
+                (s, Some(path), false)
+            }
         }
     };
 
@@ -529,6 +607,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     let upstream_url = format!("ws://127.0.0.1:{}/ws", upstream_addr.port());
     let state = Arc::new(ProxyState {
         secret_hash,
+        public_secret: public_secret.clone(),
         allowed_origins,
         rate_limit_per_minute,
         rate_limiter: Arc::new(Mutex::new(HashMap::new())),
@@ -748,6 +827,7 @@ mod tests {
     fn test_state(secret: &str) -> Arc<ProxyState> {
         Arc::new(ProxyState {
             secret_hash: *blake3::hash(secret.as_bytes()).as_bytes(),
+            public_secret: secret.to_string(),
             allowed_origins: None,
             rate_limit_per_minute: None,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
@@ -766,12 +846,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_auth_query() {
+    async fn test_validate_auth_protocol() {
+        let state = test_state("my-token");
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-websocket-protocol", "my-token".parse().unwrap());
+        let query = xai_grok_shell::agent::server::WsQueryParams::default();
+        assert!(validate_auth(&headers, &query, &state).await);
+    }
+
+    #[tokio::test]
+    async fn test_validate_auth_rejects_missing_token() {
         let state = test_state("my-token");
         let headers = HeaderMap::new();
-        let query = xai_grok_shell::agent::server::WsQueryParams {
-            server_key: Some("my-token".into()),
-        };
-        assert!(validate_auth(&headers, &query, &state).await);
+        let query = xai_grok_shell::agent::server::WsQueryParams::default();
+        assert!(!validate_auth(&headers, &query, &state).await);
+    }
+
+    #[test]
+    fn read_persisted_secret_accepts_valid_file() {
+        let tmp = std::env::temp_dir().join(format!("omgb-secret-valid-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, "deadbeefcafebabe1122334455667788\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            read_persisted_secret(&tmp).unwrap(),
+            "deadbeefcafebabe1122334455667788"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_persisted_secret_rejects_non_hex() {
+        let tmp = std::env::temp_dir().join(format!("omgb-secret-nonhex-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, "not a secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(read_persisted_secret(&tmp).is_none());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_persisted_secret_rejects_too_large() {
+        let tmp = std::env::temp_dir().join(format!("omgb-secret-large-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, "a".repeat(2000)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(read_persisted_secret(&tmp).is_none());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_persisted_secret_rejects_world_readable() {
+        let tmp = std::env::temp_dir().join(format!("omgb-secret-perm-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, "deadbeefcafebabe1122334455667788\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(read_persisted_secret(&tmp).is_none());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_persisted_secret_rejects_symlink() {
+        let tmp =
+            std::env::temp_dir().join(format!("omgb-secret-symlink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("target");
+        let link = tmp.join("link");
+        std::fs::write(&target, "deadbeefcafebabe1122334455667788").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_persisted_secret(&link).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

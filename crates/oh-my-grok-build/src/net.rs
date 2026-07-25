@@ -74,7 +74,7 @@ fn is_non_public_ipv6(ip: Ipv6Addr) -> bool {
         || ip.is_unicast_link_local()
 }
 
-fn is_non_public_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_non_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_non_public_ipv4(v4),
         IpAddr::V6(v6) => is_non_public_ipv6(v6),

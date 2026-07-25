@@ -55,11 +55,10 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     };
 
     let conversation = handle.chat_state_handle.get_conversation().await;
-    let messages: Vec<PageMessage> = conversation
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, item)| to_page_message(idx, item))
-        .collect();
+    let mut messages: Vec<PageMessage> = conversation.iter().filter_map(to_page_message).collect();
+    for (i, msg) in messages.iter_mut().enumerate() {
+        msg.id = i.to_string();
+    }
 
     let result = paginate(&messages, req.before_id.as_deref(), req.limit).map(
         |(messages, next_before_id)| PageResponse {
@@ -97,10 +96,7 @@ fn paginate(
     Ok((page, next_before_id))
 }
 
-fn to_page_message(
-    idx: usize,
-    item: &xai_grok_sampling_types::ConversationItem,
-) -> Option<PageMessage> {
+fn to_page_message(item: &xai_grok_sampling_types::ConversationItem) -> Option<PageMessage> {
     use xai_grok_sampling_types::{ContentPart, ConversationItem};
 
     let (role, text) = match item {
@@ -126,7 +122,7 @@ fn to_page_message(
     }
 
     Some(PageMessage {
-        id: idx.to_string(),
+        id: String::new(),
         role: role.to_string(),
         text,
     })

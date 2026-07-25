@@ -3187,7 +3187,7 @@ impl acp::Agent for MvpAgent {
             "x.ai/session/updates" => {
                 crate::extensions::session_updates::handle(&args, &self.gateway).await
             }
-            "x.ai/session/load_history" => {
+            "x.ai/session/load_history" | "x.ai/session/page" => {
                 crate::extensions::chat_conversation_history::handle(self, &args).await
             }
             "x.ai/session/search" => {

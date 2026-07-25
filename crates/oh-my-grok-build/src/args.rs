@@ -966,6 +966,9 @@ pub struct WorkflowRunArgs {
     /// Allow workflow steps to execute arbitrary shell commands
     #[arg(long)]
     pub allow_shell: bool,
+    /// Auto-approve tool use for exec/fan_out steps (required for non-interactive use)
+    #[arg(long)]
+    pub yolo: bool,
 }
 
 #[derive(Debug, Args, Clone)]

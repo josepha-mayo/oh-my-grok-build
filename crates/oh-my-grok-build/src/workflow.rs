@@ -1,16 +1,12 @@
-use std::path::PathBuf;
-use std::time::Duration;
-
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use std::path::PathBuf;
 
 use crate::args::{WorkflowArgs, WorkflowCommand, WorkflowNewArgs, WorkflowRunArgs};
 use crate::{SessionParams, run_single_turn_with};
 use xai_grok_pager::headless::OutputFormat;
 
 const MAX_WORKFLOW_SIZE: u64 = 10 * 1024 * 1024;
-const SHELL_STEP_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Workflow {
@@ -75,6 +71,15 @@ fn resolve_workflow_path(name: &str) -> Result<PathBuf> {
     resolve_workflow_path_in(&workflows_dir()?, name)
 }
 
+fn reject_symlink(path: &std::path::Path) -> Result<()> {
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("metadata {}", path.display()))?;
+    if meta.is_symlink() {
+        bail!("workflow path {} is a symlink", path.display());
+    }
+    Ok(())
+}
+
 fn resolve_workflow_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf> {
     let safe = slugify(name);
     if safe.is_empty() {
@@ -82,17 +87,23 @@ fn resolve_workflow_path_in(dir: &std::path::Path, name: &str) -> Result<PathBuf
     }
     let json = dir.join(format!("{safe}.json"));
     if json.exists() {
+        reject_symlink(&json)?;
         return Ok(json);
     }
     let toml = dir.join(format!("{safe}.toml"));
     if toml.exists() {
+        reject_symlink(&toml)?;
         return Ok(toml);
     }
     bail!("workflow '{name}' not found in {}", dir.display())
 }
 
 fn load_workflow(path: &std::path::Path) -> Result<Workflow> {
-    let meta = std::fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("metadata {}", path.display()))?;
+    if !meta.is_file() || meta.is_symlink() {
+        bail!("workflow {} is not a regular file", path.display());
+    }
     if meta.len() > MAX_WORKFLOW_SIZE {
         bail!("workflow {} exceeds size limit", path.display());
     }
@@ -130,7 +141,7 @@ async fn run(args: &WorkflowRunArgs) -> Result<()> {
         if args.dry_run {
             continue;
         }
-        run_step(step, args.allow_shell)
+        run_step(step, args.allow_shell, args.yolo)
             .await
             .with_context(|| format!("step {i}"))?;
     }
@@ -177,7 +188,7 @@ fn new(args: &WorkflowNewArgs) -> Result<()> {
         step: vec![WorkflowStep::Exec(ExecStep {
             prompt: args.description.clone(),
             model: None,
-            yolo: Some(true),
+            yolo: None,
             tools: None,
             max_turns: None,
         })],
@@ -196,20 +207,21 @@ fn step_name(step: &WorkflowStep) -> &'static str {
     }
 }
 
-async fn run_step(step: &WorkflowStep, allow_shell: bool) -> Result<()> {
+async fn run_step(step: &WorkflowStep, allow_shell: bool, run_yolo: bool) -> Result<()> {
     match step {
-        WorkflowStep::Exec(s) => run_exec(s).await,
-        WorkflowStep::FanOut(s) => run_fan_out(s).await,
+        WorkflowStep::Exec(s) => run_exec(s, run_yolo).await,
+        WorkflowStep::FanOut(s) => run_fan_out(s, run_yolo).await,
         WorkflowStep::Shell(s) => run_shell(s, allow_shell).await,
     }
 }
 
-async fn run_exec(step: &ExecStep) -> Result<()> {
+async fn run_exec(step: &ExecStep, run_yolo: bool) -> Result<()> {
     let session = SessionParams::default();
+    let yolo = run_yolo && step.yolo.unwrap_or(true);
     run_single_turn_with(
         &step.prompt,
         step.model.clone(),
-        step.yolo.unwrap_or(true),
+        yolo,
         OutputFormat::Plain,
         step.max_turns,
         step.tools.clone(),
@@ -222,18 +234,19 @@ async fn run_exec(step: &ExecStep) -> Result<()> {
     .await
 }
 
-async fn run_fan_out(step: &FanOutStep) -> Result<()> {
+async fn run_fan_out(step: &FanOutStep, run_yolo: bool) -> Result<()> {
     const MAX_FAN_OUT: usize = 20;
     if step.count == 0 || step.count > MAX_FAN_OUT {
         bail!("fan_out count must be between 1 and {MAX_FAN_OUT}");
     }
+    let yolo = run_yolo && step.yolo.unwrap_or(true);
     for i in 0..step.count {
         let prompt = format!("{}\n\nSubtask {}/{}", step.prompt, i + 1, step.count);
         let session = SessionParams::default();
         run_single_turn_with(
             &prompt,
             step.model.clone(),
-            true,
+            yolo,
             OutputFormat::Plain,
             step.max_turns,
             step.tools.clone(),
@@ -250,7 +263,7 @@ async fn run_fan_out(step: &FanOutStep) -> Result<()> {
         run_single_turn_with(
             aggregate,
             step.model.clone(),
-            true,
+            yolo,
             OutputFormat::Plain,
             step.max_turns,
             step.tools.clone(),
@@ -269,63 +282,9 @@ async fn run_shell(step: &ShellStep, allow_shell: bool) -> Result<()> {
     if !allow_shell {
         bail!("shell step blocked: rerun with --allow-shell to execute arbitrary commands");
     }
-    if step.command.is_empty() {
-        bail!("shell step has no command");
-    }
-    if step.command.contains('/') || step.command.contains('\\') {
-        bail!("shell command must be a single executable name without path separators");
-    }
-    crate::playbook::guard_shell_command(&step.command, &step.args)
+    crate::playbook::run_shell_step(&step.command, &step.args, step.expect_exit)
         .await
-        .context("workflow shell step")?;
-
-    let mut cmd = tokio::process::Command::new(&step.command);
-    cmd.args(&step.args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let (mut child, group) = crate::spawn_with_process_group(cmd)?;
-    let mut stdout = child.stdout.take().context("stdout not piped")?;
-    let mut stderr = child.stderr.take().context("stderr not piped")?;
-
-    let out_handle = tokio::spawn(async move {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s).await;
-        s
-    });
-    let err_handle = tokio::spawn(async move {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s).await;
-        s
-    });
-
-    let status = match tokio::time::timeout(SHELL_STEP_TIMEOUT, child.wait()).await {
-        Ok(s) => s?,
-        Err(_) => {
-            crate::kill_child_and_reap(&mut child, group.as_ref()).await;
-            out_handle.abort();
-            err_handle.abort();
-            bail!(
-                "shell step timed out after {}s",
-                SHELL_STEP_TIMEOUT.as_secs()
-            );
-        }
-    };
-    crate::kill_process_group(group.as_ref());
-
-    let out = out_handle.await.unwrap_or_default();
-    let err = err_handle.await.unwrap_or_default();
-    if let Some(expected) = step.expect_exit {
-        if status.code() != Some(expected) {
-            bail!("shell step exited {status}; stderr: {err}");
-        }
-    } else if !status.success() {
-        bail!("shell step failed: {err}");
-    }
-    if !out.is_empty() {
-        println!("{out}");
-    }
-    Ok(())
+        .context("workflow shell step")
 }
 
 fn slugify(s: &str) -> String {
@@ -368,6 +327,24 @@ mod tests {
 
         // Missing workflows are reported, not silently resolved outside the dir.
         assert!(resolve_workflow_path_in(&tmp, "missing").is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_workflow_path_rejects_symlink() {
+        let tmp = std::env::temp_dir().join(format!("omgb-wf-symlink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("real.json");
+        std::fs::File::create(&target)
+            .unwrap()
+            .write_all(b"{}")
+            .unwrap();
+        let link = tmp.join("good.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(resolve_workflow_path_in(&tmp, "good").is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

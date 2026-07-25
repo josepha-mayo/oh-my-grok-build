@@ -6942,6 +6942,7 @@ dependencies = [
  "futures",
  "gethostname",
  "http 1.4.0",
+ "libc",
  "qrcode",
  "quick-xml 0.38.3",
  "ratatui",
