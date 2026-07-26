@@ -1061,12 +1061,13 @@ pub(crate) async fn run_single_turn_capture(
         session_id: Some(session_id.clone()),
         ..Default::default()
     };
-    // run_single_turn_capture is used for one-shot text/json capture; if no
-    // tool allowlist is supplied, build an empty tool allowlist so the model
-    // returns final text instead of making a tool call within the single turn.
-    let cli_tools = match tools.as_deref().map(str::trim) {
-        Some(s) if !s.is_empty() => tools.clone(),
-        _ => Some(NO_TOOLS_SENTINEL.to_string()),
+    // run_single_turn_capture is used for one-shot text/json capture. If the
+    // caller did not supply a tool allowlist, disallow every registered tool so
+    // the model returns final text instead of making a tool call in the single
+    // capped turn.
+    let (cli_tools, cli_disallowed_tools) = match tools.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => (tools.clone(), None),
+        _ => (None, Some(all_tool_ids_csv().clone())),
     };
     run_single_turn_with(
         prompt,
@@ -1075,7 +1076,7 @@ pub(crate) async fn run_single_turn_capture(
         OutputFormat::Plain,
         max_turns,
         cli_tools,
-        None,
+        cli_disallowed_tools,
         None,
         None,
         &session,
@@ -1119,10 +1120,17 @@ async fn last_assistant_text_for_session(session_id: &str) -> Result<String> {
 
 const TURN_SENTINEL_NAME: &str = "__omgb_turn__";
 
-/// Sentinel tool name used to build an empty tool allowlist for one-shot
-/// text/json capture in `run_single_turn_capture`. It intentionally does not
-/// match any real tool, so the resulting agent gets no function tools.
-const NO_TOOLS_SENTINEL: &str = "__omgb_no_tools__";
+static ALL_TOOL_IDS: OnceLock<String> = OnceLock::new();
+
+fn all_tool_ids_csv() -> &'static String {
+    ALL_TOOL_IDS.get_or_init(|| {
+        let ids: Vec<String> = xai_grok_tools::bridge::ToolBridge::get_builder()
+            .known_tool_ids()
+            .into_iter()
+            .collect();
+        ids.join(",")
+    })
+}
 
 /// Extract the first top-level JSON object from `text`, respecting quoted
 /// strings so braces inside string values are not counted. Returns `None` if

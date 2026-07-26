@@ -608,10 +608,18 @@ async fn group_info_handler(
     Path(id): Path<String>,
     Query(query): Query<GroupTokenQuery>,
     headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<GroupInfo>, (StatusCode, &'static str)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, msg);
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg));
+    }
     let token = extract_group_token(&query, &headers);
-    let group =
-        crate::group::load_group(&id).map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
     if !group_token_valid(&group, &token) {
         return Err((StatusCode::UNAUTHORIZED, "invalid token"));
     }
@@ -629,14 +637,23 @@ async fn group_list_messages_handler(
     Path(id): Path<String>,
     Query(query): Query<GroupTokenQuery>,
     headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<Vec<crate::group::GroupMessage>>, (StatusCode, &'static str)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, msg);
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg));
+    }
     let token = extract_group_token(&query, &headers);
-    let group =
-        crate::group::load_group(&id).map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
     if !group_token_valid(&group, &token) {
         return Err((StatusCode::UNAUTHORIZED, "invalid token"));
     }
-    let messages = crate::group::load_messages(&id)
+    let messages = crate::group::load_messages_async(&id)
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed to load messages"))?;
     Ok(Json(messages))
 }
@@ -645,12 +662,19 @@ async fn group_post_message_handler(
     Path(id): Path<String>,
     Query(query): Query<GroupTokenQuery>,
     headers: HeaderMap,
-    State(_state): State<Arc<ProxyState>>,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<GroupMessagePayload>,
 ) -> Result<StatusCode, (StatusCode, &'static str)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, msg);
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg));
+    }
     let token = extract_group_token(&query, &headers);
-    let group =
-        crate::group::load_group(&id).map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
     if !group_token_valid(&group, &token) {
         return Err((StatusCode::UNAUTHORIZED, "invalid token"));
     }
@@ -681,12 +705,14 @@ async fn group_post_message_handler(
         content: payload.content,
         kind: payload.kind,
     };
-    crate::group::add_message(&id, &message)
+    crate::group::add_message_async(&id, &message)
+        .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed to save message"))?;
 
-    // Trigger agent dispatch off the response path. We clone the small in-memory
-    // state and run it on a blocking thread so the HTTP response returns
-    // immediately without tying up an async task during model calls.
+    // Trigger agent dispatch off the response path. We run it on a blocking
+    // thread with block_on so the HTTP response returns immediately without
+    // tying up an async task; the future is not Send because the upstream
+    // headless turn uses non-Send auth state.
     let runtime_handle = tokio::runtime::Handle::current();
     let group_for_dispatch = group.clone();
     let trigger_for_dispatch = message.clone();

@@ -93,6 +93,13 @@ pub(crate) fn load_group(id: &str) -> Result<Group> {
     serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+pub(crate) async fn load_group_async(id: &str) -> Result<Group> {
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || load_group(&id))
+        .await
+        .context("load group task failed")?
+}
+
 pub(crate) fn load_messages(id: &str) -> Result<Vec<GroupMessage>> {
     let path = messages_path(id)?;
     if !path.exists() {
@@ -109,6 +116,13 @@ pub(crate) fn load_messages(id: &str) -> Result<Vec<GroupMessage>> {
         .filter(|l| !l.is_empty())
         .map(|l| serde_json::from_str(l).with_context(|| format!("parse message line: {l}")))
         .collect()
+}
+
+pub(crate) async fn load_messages_async(id: &str) -> Result<Vec<GroupMessage>> {
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || load_messages(&id))
+        .await
+        .context("load messages task failed")?
 }
 
 pub(crate) fn add_message(id: &str, message: &GroupMessage) -> Result<()> {
@@ -130,6 +144,14 @@ pub(crate) fn add_message(id: &str, message: &GroupMessage) -> Result<()> {
         crate::providers::restrict_omg_file_permissions(&path)?;
     }
     Ok(())
+}
+
+pub(crate) async fn add_message_async(id: &str, message: &GroupMessage) -> Result<()> {
+    let id = id.to_string();
+    let message = message.clone();
+    tokio::task::spawn_blocking(move || add_message(&id, &message))
+        .await
+        .context("add message task failed")?
 }
 
 pub async fn run_group(args: &GroupArgs) -> Result<()> {
@@ -309,7 +331,7 @@ fn invite(id: &str) -> Result<()> {
 }
 
 async fn send(args: &GroupSendArgs) -> Result<()> {
-    let group = load_group(&args.id)?;
+    let group = load_group_async(&args.id).await?;
     validate_token(&group, args.token.as_deref())?;
     let sender = args.human_name.clone().unwrap_or_else(default_human_name);
     let message = GroupMessage {
@@ -319,7 +341,7 @@ async fn send(args: &GroupSendArgs) -> Result<()> {
         content: args.message.clone(),
         kind: MessageKind::Human,
     };
-    add_message(&group.id, &message)?;
+    add_message_async(&group.id, &message).await?;
     let sender = message.sender.clone();
     let group_for_dispatch = group.clone();
     let runtime_handle = tokio::runtime::Handle::current();
@@ -331,7 +353,7 @@ async fn send(args: &GroupSendArgs) -> Result<()> {
 }
 
 async fn chat(args: &GroupChatArgs) -> Result<()> {
-    let group = load_group(&args.id)?;
+    let group = load_group_async(&args.id).await?;
     validate_token(&group, args.token.as_deref())?;
     let human_name = args.human_name.clone().unwrap_or_else(default_human_name);
     let yolo = args.yolo || group.yolo;
@@ -348,7 +370,7 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
     );
     println!("type a message and press Enter. /quit or /exit to leave.\n");
 
-    let initial = load_messages(&group.id)?;
+    let initial = load_messages_async(&group.id).await?;
     let mut seen: HashSet<String> = initial.iter().map(|m| m.id.clone()).collect();
     for m in &initial {
         print_message(m);
@@ -364,7 +386,7 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
         input.clear();
         tokio::select! {
             _ = interval.tick() => {
-                let fresh = load_messages(&group.id)?;
+                let fresh = load_messages_async(&group.id).await?;
                 let new_messages: Vec<GroupMessage> = fresh
                     .iter()
                     .filter(|m| !seen.contains(&m.id))
@@ -402,7 +424,7 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
                     content: text.into(),
                     kind: MessageKind::User,
                 };
-                add_message(&group.id, &message)?;
+                add_message_async(&group.id, &message).await?;
                 print_message(&message);
                 seen.insert(message.id.clone());
                 dispatch_turn(&group, &message, &human_name, yolo, &mut seen).await?;
@@ -595,7 +617,7 @@ async fn dispatch_turn(
         return Ok(());
     };
 
-    let mut messages = load_messages(&group.id)?;
+    let mut messages = load_messages_async(&group.id).await?;
     let Some(idx) = messages.iter().position(|m| m.id == trigger.id) else {
         return Ok(());
     };
@@ -636,7 +658,7 @@ async fn dispatch_turn(
             content,
             kind: MessageKind::Agent,
         };
-        add_message(&group.id, &message)?;
+        add_message_async(&group.id, &message).await?;
         messages.push(message.clone());
         print_message(&message);
         seen.insert(message.id.clone());
@@ -700,7 +722,7 @@ async fn dispatch_turn(
                 content: trimmed.into(),
                 kind: MessageKind::Agent,
             };
-            add_message(&group.id, &message)?;
+            add_message_async(&group.id, &message).await?;
             messages.push(message.clone());
             print_message(&message);
             seen.insert(message.id.clone());
