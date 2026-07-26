@@ -1,6 +1,7 @@
 ---
 name: create-workflow
-description: Generate a reusable multi-agent workflow from a plain-English task, smoke-check it, and save it.allowed-tools: run_terminal_cmd
+description: Generate a reusable multi-agent workflow from a plain-English task, smoke-check it, and save it.
+allowed-tools: run_terminal_cmd
 ---
 
 # /create-workflow — generate a reusable workflow

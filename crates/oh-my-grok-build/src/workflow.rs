@@ -5,12 +5,14 @@ use std::path::PathBuf;
 use crate::args::{
     WorkflowArgs, WorkflowCommand, WorkflowCreateArgs, WorkflowNewArgs, WorkflowRunArgs,
 };
+use crate::group::normalize_model;
 use crate::{SessionParams, run_single_turn_with};
 use xai_grok_pager::headless::OutputFormat;
 
 const MAX_WORKFLOW_SIZE: u64 = 10 * 1024 * 1024;
+const MAX_FAN_OUT: usize = 1024;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Workflow {
     #[serde(default)]
     name: Option<String>,
@@ -19,7 +21,7 @@ struct Workflow {
     step: Vec<WorkflowStep>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WorkflowStep {
     Exec(ExecStep),
@@ -27,7 +29,7 @@ enum WorkflowStep {
     Shell(ShellStep),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExecStep {
     prompt: String,
     #[serde(default)]
@@ -40,7 +42,7 @@ struct ExecStep {
     max_turns: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FanOutStep {
     prompt: String,
     count: usize,
@@ -56,7 +58,7 @@ struct FanOutStep {
     aggregate: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShellStep {
     command: String,
     #[serde(default)]
@@ -160,7 +162,14 @@ async fn run(args: &WorkflowRunArgs) -> Result<()> {
     } else {
         bail!("workflow run requires --file or a workflow name");
     };
-    let workflow = load_workflow(&path)?;
+    let mut workflow = load_workflow(&path)?;
+    if !args.args.is_empty() {
+        workflow.step = workflow
+            .step
+            .iter()
+            .map(|s| substitute_step_args(s, &args.args))
+            .collect();
+    }
     if let Some(name) = &workflow.name {
         println!("workflow: {name}");
     }
@@ -229,7 +238,7 @@ fn new(args: &WorkflowNewArgs) -> Result<()> {
 
 async fn create(args: &WorkflowCreateArgs) -> Result<()> {
     let model = match &args.model {
-        Some(m) => m.clone(),
+        Some(m) => normalize_model(m),
         None => {
             let provider = crate::moe::select_provider_or_fallback(&args.prompt).await?;
             format!("omgb-{provider}")
@@ -253,13 +262,14 @@ async fn create(args: &WorkflowCreateArgs) -> Result<()> {
          Output strictly valid JSON matching this shape (no markdown, no code fences):\n\
          {{\"name\":\"Workflow Name\",\"description\":\"...\",\"step\":[{{\"type\":\"exec\",\"prompt\":\"...\"}},{{\"type\":\"fan_out\",\"prompt\":\"...\",\"count\":3}},{{\"type\":\"shell\",\"command\":\"echo\",\"args\":[\"ok\"]}}]}}\n\n\
          The 'exec' step may include optional fields: model, yolo (bool), tools (comma-separated string), max_turns (u32). \
-         The 'fan_out' step may include the same plus count (required, 1-20) and aggregate (string prompt). \
+         The 'fan_out' step may include the same plus count (required, 1-1024) and aggregate (string prompt). \
          The 'shell' step may include args (array of strings) and expect_exit (i32).",
         prompt = args.prompt
     );
 
-    let reply = crate::run_single_turn_capture(&prompt, Some(model), args.yolo).await?;
-    let value = extract_json_object(&reply)
+    let reply =
+        crate::run_single_turn_capture(&prompt, Some(model), args.yolo, Some(1), None).await?;
+    let value = crate::extract_json_object(&reply)
         .ok_or_else(|| anyhow::anyhow!("workflow create did not return valid JSON"))?;
     let mut workflow: Workflow = serde_json::from_value(value)
         .with_context(|| format!("generated workflow is not valid: {reply}"))?;
@@ -271,7 +281,10 @@ async fn create(args: &WorkflowCreateArgs) -> Result<()> {
     workflow.name = Some(workflow.name.unwrap_or(name));
     workflow.description = Some(workflow.description.unwrap_or_else(|| args.prompt.clone()));
 
+    let summary = smoke_check_workflow(&workflow)?;
+
     if args.dry_run {
+        println!("{summary}\n");
         println!("{}", serde_json::to_string_pretty(&workflow)?);
         return Ok(());
     }
@@ -283,17 +296,59 @@ async fn create(args: &WorkflowCreateArgs) -> Result<()> {
         bail!("workflow '{safe_name}' already exists");
     }
     crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(&workflow)?, true)?;
+    println!("{summary}");
     println!("created workflow {safe_name} at {}", path.display());
     Ok(())
 }
 
-fn extract_json_object(text: &str) -> Option<serde_json::Value> {
-    let start = text.find('{')?;
-    let end = text.rfind('}').map(|i| i + 1)?;
-    if end <= start {
-        return None;
+fn smoke_check_workflow(workflow: &Workflow) -> Result<String> {
+    let mut summary = format!(
+        "Workflow '{}'",
+        workflow.name.as_deref().unwrap_or("unnamed")
+    );
+    if let Some(desc) = workflow.description.as_deref() {
+        summary.push_str(&format!(": {desc}"));
     }
-    serde_json::from_str(&text[start..end]).ok()
+    summary.push_str(&format!(" — {} step(s)", workflow.step.len()));
+
+    for (i, step) in workflow.step.iter().enumerate() {
+        match step {
+            WorkflowStep::Exec(s) => {
+                if s.prompt.trim().is_empty() {
+                    bail!("step {i}: exec prompt must not be empty");
+                }
+                let preview: String = s
+                    .prompt
+                    .split_whitespace()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                summary.push_str(&format!("\n  {i}: exec — {preview}"));
+            }
+            WorkflowStep::FanOut(s) => {
+                if s.count == 0 || s.count > MAX_FAN_OUT {
+                    bail!("step {i}: fan_out count must be between 1 and {MAX_FAN_OUT}");
+                }
+                if s.prompt.trim().is_empty() {
+                    bail!("step {i}: fan_out prompt must not be empty");
+                }
+                let agg = if s.aggregate.is_some() {
+                    " + aggregate"
+                } else {
+                    ""
+                };
+                summary.push_str(&format!("\n  {i}: fan_out x{}{agg}", s.count));
+            }
+            WorkflowStep::Shell(s) => {
+                if s.command.trim().is_empty() {
+                    bail!("step {i}: shell command must not be empty");
+                }
+                let args = s.args.join(" ");
+                summary.push_str(&format!("\n  {i}: shell {} {args}", s.command));
+            }
+        }
+    }
+    Ok(summary)
 }
 
 fn derive_workflow_name(prompt: &str) -> String {
@@ -307,6 +362,39 @@ fn derive_workflow_name(prompt: &str) -> String {
         .replace("--", "-")
         .trim_matches('-')
         .to_string()
+}
+
+fn substitute_args(template: &str, args: &[String]) -> String {
+    let mut out = template.to_string();
+    for (i, a) in args.iter().enumerate() {
+        out = out.replace(&format!("{{{{{}}}}}", i), a);
+    }
+    if !args.is_empty() {
+        out = out.replace("{{args}}", &args.join(" "));
+    }
+    out
+}
+
+fn substitute_step_args(step: &WorkflowStep, args: &[String]) -> WorkflowStep {
+    match step {
+        WorkflowStep::Exec(s) => {
+            let mut s = s.clone();
+            s.prompt = substitute_args(&s.prompt, args);
+            WorkflowStep::Exec(s)
+        }
+        WorkflowStep::FanOut(s) => {
+            let mut s = s.clone();
+            s.prompt = substitute_args(&s.prompt, args);
+            s.aggregate = s.aggregate.as_deref().map(|a| substitute_args(a, args));
+            WorkflowStep::FanOut(s)
+        }
+        WorkflowStep::Shell(s) => {
+            let mut s = s.clone();
+            s.command = substitute_args(&s.command, args);
+            s.args = s.args.iter().map(|a| substitute_args(a, args)).collect();
+            WorkflowStep::Shell(s)
+        }
+    }
 }
 
 fn step_name(step: &WorkflowStep) -> &'static str {
@@ -328,9 +416,10 @@ async fn run_step(step: &WorkflowStep, allow_shell: bool, run_yolo: bool) -> Res
 async fn run_exec(step: &ExecStep, run_yolo: bool) -> Result<()> {
     let session = SessionParams::default();
     let yolo = run_yolo && step.yolo.unwrap_or(true);
+    let model = step.model.as_deref().map(normalize_model);
     run_single_turn_with(
         &step.prompt,
-        step.model.clone(),
+        model,
         yolo,
         OutputFormat::Plain,
         step.max_turns,
@@ -345,45 +434,56 @@ async fn run_exec(step: &ExecStep, run_yolo: bool) -> Result<()> {
 }
 
 async fn run_fan_out(step: &FanOutStep, run_yolo: bool) -> Result<()> {
-    const MAX_FAN_OUT: usize = 20;
+    const MAX_CONCURRENT: usize = 20;
     if step.count == 0 || step.count > MAX_FAN_OUT {
         bail!("fan_out count must be between 1 and {MAX_FAN_OUT}");
     }
     let yolo = run_yolo && step.yolo.unwrap_or(true);
-    for i in 0..step.count {
-        let prompt = format!("{}\n\nSubtask {}/{}", step.prompt, i + 1, step.count);
-        let session = SessionParams::default();
-        run_single_turn_with(
-            &prompt,
-            step.model.clone(),
-            yolo,
-            OutputFormat::Plain,
-            step.max_turns,
-            step.tools.clone(),
-            None,
-            None,
-            None,
-            &session,
-            false,
-        )
-        .await?;
+    let model = step.model.as_deref().map(normalize_model);
+    let mut outputs: Vec<(usize, String)> = Vec::with_capacity(step.count);
+
+    let mut i = 0;
+    while i < step.count {
+        let end = (i + MAX_CONCURRENT).min(step.count);
+        let futures = (i..end).map(|j| {
+            let prompt = format!(
+                "{}\n\nSubtask {}/{}\n\nProduce a concise result for this subtask.",
+                step.prompt,
+                j + 1,
+                step.count
+            );
+            let m = model.clone();
+            let tools = step.tools.clone();
+            let max_turns = step.max_turns;
+            async move { crate::run_single_turn_capture(&prompt, m, yolo, max_turns, tools).await }
+        });
+        let results = futures::future::join_all(futures).await;
+        for (offset, res) in results.into_iter().enumerate() {
+            let n = i + offset + 1;
+            match res {
+                Ok(text) => outputs.push((n, text)),
+                Err(e) => eprintln!("warning: fan_out subtask {n} failed: {e}"),
+            }
+        }
+        i = end;
     }
+
     if let Some(aggregate) = &step.aggregate {
-        let session = SessionParams::default();
-        run_single_turn_with(
-            aggregate,
-            step.model.clone(),
+        let context = outputs
+            .iter()
+            .map(|(i, text)| format!("--- Subtask {i} result ---\n{text}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let prompt = format!("{aggregate}\n\n{context}");
+        let _ = crate::run_single_turn_capture(
+            &prompt,
+            model,
             yolo,
-            OutputFormat::Plain,
             step.max_turns,
             step.tools.clone(),
-            None,
-            None,
-            None,
-            &session,
-            false,
         )
-        .await?;
+        .await
+        .map_err(|e| eprintln!("warning: fan_out aggregate failed: {e}"));
     }
     Ok(())
 }

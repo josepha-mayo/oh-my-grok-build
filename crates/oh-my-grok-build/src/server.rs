@@ -14,13 +14,16 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Router,
     extract::{
-        ConnectInfo, Query, State, ws::CloseFrame, ws::Message, ws::WebSocket, ws::WebSocketUpgrade,
+        ConnectInfo, Json, Path, Query, State, ws::CloseFrame, ws::Message, ws::WebSocket,
+        ws::WebSocketUpgrade,
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Mutex;
@@ -556,6 +559,148 @@ async fn handle_proxy(client_ws: WebSocket, state: Arc<ProxyState>) {
     info!("WebSocket proxy connection ended");
 }
 
+#[derive(Deserialize)]
+struct GroupTokenQuery {
+    token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GroupInfo {
+    id: String,
+    name: String,
+    description: String,
+    model: String,
+    yolo: bool,
+    agents: Vec<crate::group::Agent>,
+}
+
+#[derive(Deserialize)]
+struct GroupMessagePayload {
+    sender: String,
+    content: String,
+    kind: crate::group::MessageKind,
+}
+
+fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
+    if let Some(t) = query.token.as_deref()
+        && !t.is_empty()
+    {
+        return t.to_string();
+    }
+    if let Some(t) = headers.get("x-group-token").and_then(|v| v.to_str().ok()) {
+        return t.to_string();
+    }
+    if let Some(t) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return t.to_string();
+    }
+    String::new()
+}
+
+fn group_token_valid(group: &crate::group::Group, token: &str) -> bool {
+    constant_time_eq::constant_time_eq(group.invite_token.as_bytes(), token.as_bytes())
+}
+
+async fn group_info_handler(
+    Path(id): Path<String>,
+    Query(query): Query<GroupTokenQuery>,
+    headers: HeaderMap,
+) -> Result<Json<GroupInfo>, (StatusCode, &'static str)> {
+    let token = extract_group_token(&query, &headers);
+    let group =
+        crate::group::load_group(&id).map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
+    if !group_token_valid(&group, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token"));
+    }
+    Ok(Json(GroupInfo {
+        id: group.id,
+        name: group.name,
+        description: group.description,
+        model: group.model,
+        yolo: group.yolo,
+        agents: group.agents,
+    }))
+}
+
+async fn group_list_messages_handler(
+    Path(id): Path<String>,
+    Query(query): Query<GroupTokenQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::group::GroupMessage>>, (StatusCode, &'static str)> {
+    let token = extract_group_token(&query, &headers);
+    let group =
+        crate::group::load_group(&id).map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
+    if !group_token_valid(&group, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token"));
+    }
+    let messages = crate::group::load_messages(&id)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed to load messages"))?;
+    Ok(Json(messages))
+}
+
+async fn group_post_message_handler(
+    Path(id): Path<String>,
+    Query(query): Query<GroupTokenQuery>,
+    headers: HeaderMap,
+    State(_state): State<Arc<ProxyState>>,
+    Json(payload): Json<GroupMessagePayload>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    let token = extract_group_token(&query, &headers);
+    let group =
+        crate::group::load_group(&id).map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
+    if !group_token_valid(&group, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token"));
+    }
+    if !matches!(
+        payload.kind,
+        crate::group::MessageKind::User | crate::group::MessageKind::Human
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "message kind must be user or human",
+        ));
+    }
+    let sender = payload.sender.trim().to_string();
+    if sender.is_empty()
+        || sender.eq_ignore_ascii_case("all")
+        || group
+            .agents
+            .iter()
+            .any(|a| a.name.eq_ignore_ascii_case(&sender))
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid sender"));
+    }
+    let sender_for_dispatch = sender.clone();
+    let message = crate::group::GroupMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: Utc::now(),
+        sender,
+        content: payload.content,
+        kind: payload.kind,
+    };
+    crate::group::add_message(&id, &message)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed to save message"))?;
+
+    // Trigger agent dispatch off the response path. We clone the small in-memory
+    // state and run it on a blocking thread so the HTTP response returns
+    // immediately without tying up an async task during model calls.
+    let runtime_handle = tokio::runtime::Handle::current();
+    let group_for_dispatch = group.clone();
+    let trigger_for_dispatch = message.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = runtime_handle.block_on(crate::group::dispatch_for_message(
+            group_for_dispatch,
+            trigger_for_dispatch,
+            sender_for_dispatch,
+        ));
+    });
+
+    Ok(StatusCode::CREATED)
+}
+
 pub async fn serve(args: &ServeArgs) -> Result<()> {
     let mut agent_config = crate::build_agent_config(args.model.clone())?;
     agent_config.default_yolo_mode = args.yolo;
@@ -633,6 +778,11 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/acp", get(ws_handler))
+        .route("/group/{id}", get(group_info_handler))
+        .route(
+            "/group/{id}/messages",
+            get(group_list_messages_handler).post(group_post_message_handler),
+        )
         .with_state(state);
     let listener = TcpListener::bind(bind_addr).await?;
     let actual_addr = listener.local_addr()?;

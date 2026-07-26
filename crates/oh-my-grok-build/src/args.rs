@@ -1099,6 +1099,9 @@ pub struct WorkflowRunArgs {
     /// Auto-approve tool use for exec/fan_out steps (required for non-interactive use)
     #[arg(long)]
     pub yolo: bool,
+    /// Arguments to substitute into workflow placeholders ({{0}}, {{1}}, {{args}})
+    #[arg(long, value_name = "ARG")]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1163,11 +1166,14 @@ pub struct GroupNewArgs {
     #[arg(short, long)]
     pub model: Option<String>,
     /// Comma-separated agent names
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long)]
     pub names: Option<String>,
     /// Comma-separated agent roles (defaults to generalist)
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long)]
     pub roles: Option<String>,
+    /// Comma-separated per-agent models (defaults to --model)
+    #[arg(long)]
+    pub models: Option<String>,
     /// Auto-approve tool use for agents
     #[arg(long)]
     pub yolo: bool,
@@ -1178,11 +1184,17 @@ pub struct GroupChatArgs {
     /// Group id
     pub id: String,
     /// Human display name in the chat
-    #[arg(short, long)]
+    #[arg(short = 'n', long)]
     pub human_name: Option<String>,
+    /// Invite token for the group
+    #[arg(long)]
+    pub token: Option<String>,
     /// Auto-approve tool use for agents
     #[arg(long)]
     pub yolo: bool,
+    /// Remote server base URL
+    #[arg(long, value_name = "URL")]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1192,6 +1204,12 @@ pub struct GroupSendArgs {
     /// Message text
     pub message: String,
     /// Human display name
-    #[arg(short, long)]
+    #[arg(short = 'n', long)]
     pub human_name: Option<String>,
+    /// Invite token for the group
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Remote server base URL
+    #[arg(long, value_name = "URL")]
+    pub remote: Option<String>,
 }

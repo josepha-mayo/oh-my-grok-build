@@ -87,13 +87,13 @@ fn save_group(group: &Group) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
-fn load_group(id: &str) -> Result<Group> {
+pub(crate) fn load_group(id: &str) -> Result<Group> {
     let path = group_path(id)?;
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn load_messages(id: &str) -> Result<Vec<GroupMessage>> {
+pub(crate) fn load_messages(id: &str) -> Result<Vec<GroupMessage>> {
     let path = messages_path(id)?;
     if !path.exists() {
         return Ok(Vec::new());
@@ -111,11 +111,12 @@ fn load_messages(id: &str) -> Result<Vec<GroupMessage>> {
         .collect()
 }
 
-fn add_message(id: &str, message: &GroupMessage) -> Result<()> {
+pub(crate) fn add_message(id: &str, message: &GroupMessage) -> Result<()> {
     let path = messages_path(id)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let existed = path.exists();
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -125,6 +126,9 @@ fn add_message(id: &str, message: &GroupMessage) -> Result<()> {
     let line = serde_json::to_string(message)?;
     writeln!(file, "{line}")?;
     drop(file);
+    if !existed {
+        crate::providers::restrict_omg_file_permissions(&path)?;
+    }
     Ok(())
 }
 
@@ -133,14 +137,45 @@ pub async fn run_group(args: &GroupArgs) -> Result<()> {
         GroupCommand::New(args) => new_group(args).await,
         GroupCommand::List => list_groups(),
         GroupCommand::Show { id } => show_group(id),
-        GroupCommand::Chat(args) => chat(args).await,
-        GroupCommand::Send(args) => send(args).await,
+        GroupCommand::Chat(args) => {
+            let human_name = args.human_name.clone().unwrap_or_else(default_human_name);
+            if let Some(remote) = args.remote.as_deref() {
+                let token = args
+                    .token
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--token is required for remote group chat"))?;
+                chat_remote(&args.id, token, &human_name, remote).await
+            } else {
+                chat(args).await
+            }
+        }
+        GroupCommand::Send(args) => {
+            if let Some(remote) = args.remote.as_deref() {
+                let token = args
+                    .token
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--token is required for remote group send"))?;
+                let sender = args.human_name.clone().unwrap_or_else(default_human_name);
+                let message = GroupMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: Utc::now(),
+                    sender,
+                    content: args.message.clone(),
+                    kind: MessageKind::Human,
+                };
+                send_remote(&args.id, token, &message, remote).await?;
+                println!("sent message to remote group {}", args.id);
+                Ok(())
+            } else {
+                send(args).await
+            }
+        }
         GroupCommand::Invite { id } => invite(id),
     }
 }
 
 async fn new_group(args: &GroupNewArgs) -> Result<()> {
-    let (_count, names, roles) = parse_agent_specs(args)?;
+    let (count, names, roles) = parse_agent_specs(args)?;
 
     let model = match &args.model {
         Some(m) => normalize_model(m),
@@ -151,13 +186,15 @@ async fn new_group(args: &GroupNewArgs) -> Result<()> {
         }
     };
 
+    let agent_models = parse_agent_models(args, count, &model);
+
     let mut agents = Vec::with_capacity(names.len());
-    for (name, role) in names.iter().zip(roles.iter()) {
+    for ((name, role), m) in names.iter().zip(roles.iter()).zip(agent_models.iter()) {
         agents.push(Agent {
             id: slugify(name),
             name: name.clone(),
             role: role.clone(),
-            model: model.clone(),
+            model: m.clone(),
         });
     }
 
@@ -179,12 +216,25 @@ async fn new_group(args: &GroupNewArgs) -> Result<()> {
     for a in &group.agents {
         println!("    {} ({}) — {}", a.name, a.model, a.role);
     }
-    println!("\nhost chat:    omgb group chat {}", group.id);
-    println!("send message: omgb group send {} \"<message>\"", group.id);
+    println!(
+        "\nhost chat:    omgb group chat {} --token {}",
+        group.id, group.invite_token
+    );
+    println!(
+        "send message: omgb group send {} \"<message>\" --token {}",
+        group.id, group.invite_token
+    );
     println!(
         "invite link:  omgb://group/{}?token={}",
         group.id, group.invite_token
     );
+    if let Ok(remote) = std::env::var("OMGB_REMOTE") {
+        let remote = remote.trim_end_matches('/');
+        println!(
+            "http invite:  {remote}/group/{}?token={}",
+            group.id, group.invite_token
+        );
+    }
     Ok(())
 }
 
@@ -245,30 +295,46 @@ fn invite(id: &str) -> Result<()> {
         "share this with humans/agents to join group {}:\n",
         group.name
     );
-    println!("  omgb group chat {id}");
-    println!("  omgb group send {id} \"<message>\"");
+    println!("  omgb group chat {id} --token {}", group.invite_token);
+    println!(
+        "  omgb group send {id} \"<message>\" --token {}",
+        group.invite_token
+    );
     println!("  omgb://group/{id}?token={}", group.invite_token);
+    if let Ok(remote) = std::env::var("OMGB_REMOTE") {
+        let remote = remote.trim_end_matches('/');
+        println!("  {remote}/group/{id}?token={}", group.invite_token);
+    }
     Ok(())
 }
 
 async fn send(args: &GroupSendArgs) -> Result<()> {
     let group = load_group(&args.id)?;
-    let sender = args.human_name.as_deref().unwrap_or("human");
+    validate_token(&group, args.token.as_deref())?;
+    let sender = args.human_name.clone().unwrap_or_else(default_human_name);
     let message = GroupMessage {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: Utc::now(),
-        sender: sender.into(),
+        sender,
         content: args.message.clone(),
         kind: MessageKind::Human,
     };
     add_message(&group.id, &message)?;
+    let sender = message.sender.clone();
+    let group_for_dispatch = group.clone();
+    let runtime_handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _ = runtime_handle.block_on(dispatch_for_message(group_for_dispatch, message, sender));
+    });
     println!("sent message to group {} ({})", group.id, group.name);
     Ok(())
 }
 
 async fn chat(args: &GroupChatArgs) -> Result<()> {
     let group = load_group(&args.id)?;
-    let human_name = args.human_name.as_deref().unwrap_or("you");
+    validate_token(&group, args.token.as_deref())?;
+    let human_name = args.human_name.clone().unwrap_or_else(default_human_name);
+    let yolo = args.yolo || group.yolo;
 
     println!("group: {} ({})", group.name, group.id);
     println!(
@@ -282,9 +348,9 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
     );
     println!("type a message and press Enter. /quit or /exit to leave.\n");
 
-    let mut messages = load_messages(&group.id)?;
-    let mut processed: HashSet<String> = messages.iter().map(|m| m.id.clone()).collect();
-    for m in &messages {
+    let initial = load_messages(&group.id)?;
+    let mut seen: HashSet<String> = initial.iter().map(|m| m.id.clone()).collect();
+    for m in &initial {
         print_message(m);
     }
 
@@ -299,20 +365,21 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
         tokio::select! {
             _ = interval.tick() => {
                 let fresh = load_messages(&group.id)?;
-                if fresh.len() > messages.len() {
-                    let old_len = messages.len();
-                    messages = fresh;
-                    let new_messages: Vec<GroupMessage> = messages[old_len..].to_vec();
-                    for m in &new_messages {
-                        print_message(m);
+                let new_messages: Vec<GroupMessage> = fresh
+                    .iter()
+                    .filter(|m| !seen.contains(&m.id))
+                    .cloned()
+                    .collect();
+                for m in &new_messages {
+                    print_message(m);
+                }
+                for m in &new_messages {
+                    if seen.contains(&m.id) {
+                        continue;
                     }
-                    for m in &new_messages {
-                        if !processed.contains(&m.id) && !matches!(m.kind, MessageKind::Agent) {
-                            if m.sender != human_name {
-                                dispatch_turn(&group, &mut messages, m, human_name).await?;
-                            }
-                            processed.insert(m.id.clone());
-                        }
+                    seen.insert(m.id.clone());
+                    if !matches!(m.kind, MessageKind::Agent) && m.sender != human_name {
+                        dispatch_turn(&group, m, &human_name, yolo, &mut seen).await?;
                     }
                 }
             }
@@ -331,15 +398,14 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
                 let message = GroupMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     timestamp: Utc::now(),
-                    sender: human_name.into(),
+                    sender: human_name.clone(),
                     content: text.into(),
                     kind: MessageKind::User,
                 };
                 add_message(&group.id, &message)?;
-                messages.push(message.clone());
                 print_message(&message);
-                dispatch_turn(&group, &mut messages, &message, human_name).await?;
-                processed.insert(message.id);
+                seen.insert(message.id.clone());
+                dispatch_turn(&group, &message, &human_name, yolo, &mut seen).await?;
             }
         }
     }
@@ -348,15 +414,211 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct RemoteGroupInfo {
+    name: String,
+    #[serde(default)]
+    description: String,
+    model: String,
+    #[serde(default)]
+    yolo: bool,
+    agents: Vec<Agent>,
+}
+
+pub(crate) async fn chat_remote(
+    id: &str,
+    token: &str,
+    human_name: &str,
+    remote: &str,
+) -> Result<()> {
+    let remote = remote.trim_end_matches('/');
+    let info_url = format!("{remote}/group/{id}?token={token}");
+    let messages_url = format!("{remote}/group/{id}/messages?token={token}");
+
+    let client = reqwest::Client::new();
+    let group: Group = match client.get(&info_url).send().await {
+        Ok(res) if res.status().is_success() => {
+            let info = res
+                .json::<RemoteGroupInfo>()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to parse group info: {e}"))?;
+            Group {
+                id: id.to_string(),
+                name: info.name,
+                description: info.description,
+                created_at: Utc::now(),
+                model: info.model,
+                yolo: info.yolo,
+                invite_token: token.to_string(),
+                agents: info.agents,
+            }
+        }
+        Ok(res) => bail!("failed to fetch group info: {}", res.status()),
+        Err(e) => bail!("failed to fetch group info: {e}"),
+    };
+
+    println!("group: {} ({})", group.name, group.id);
+    println!(
+        "agents: {}",
+        group
+            .agents
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("type a message and press Enter. /quit or /exit to leave.\n");
+
+    let mut seen: HashSet<String> = HashSet::new();
+    match client.get(&messages_url).send().await {
+        Ok(res) if res.status().is_success() => {
+            if let Ok(initial) = res.json::<Vec<GroupMessage>>().await {
+                for m in &initial {
+                    print_message(m);
+                    seen.insert(m.id.clone());
+                }
+            }
+        }
+        Ok(res) => eprintln!("warning: failed to fetch messages: {}", res.status()),
+        Err(e) => eprintln!("warning: failed to fetch messages: {e}"),
+    }
+
+    let stdin = tokio::io::stdin();
+    let mut reader = tokio::io::BufReader::new(stdin);
+    let mut input = String::new();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        input.clear();
+        tokio::select! {
+            _ = interval.tick() => {
+                match client.get(&messages_url).send().await {
+                    Ok(res) if res.status().is_success() => {
+                        if let Ok(fresh) = res.json::<Vec<GroupMessage>>().await {
+                            for m in fresh {
+                                if seen.insert(m.id.clone()) {
+                                    print_message(&m);
+                                }
+                            }
+                        }
+                    }
+                    Ok(res) => eprintln!("warning: failed to poll messages: {}", res.status()),
+                    Err(e) => eprintln!("warning: failed to poll messages: {e}"),
+                }
+            }
+            res = reader.read_line(&mut input) => {
+                if res.is_err() || res? == 0 {
+                    break;
+                }
+                let text = input.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if text == "/quit" || text == "/exit" {
+                    break;
+                }
+
+                let message = GroupMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: Utc::now(),
+                    sender: human_name.to_string(),
+                    content: text.to_string(),
+                    kind: MessageKind::User,
+                };
+                if let Err(e) = send_remote(id, token, &message, remote).await {
+                    eprintln!("warning: failed to send message: {e}");
+                } else {
+                    print_message(&message);
+                    seen.insert(message.id.clone());
+                }
+            }
+        }
+    }
+
+    println!("\nleft group {}", id);
+    Ok(())
+}
+
+pub(crate) async fn send_remote(
+    id: &str,
+    token: &str,
+    message: &GroupMessage,
+    remote: &str,
+) -> Result<()> {
+    let remote = remote.trim_end_matches('/');
+    let url = format!("{remote}/group/{id}/messages?token={token}");
+    let client = reqwest::Client::new();
+    let res = client.post(&url).json(message).send().await?;
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        bail!("failed to post message: {text}");
+    }
+    Ok(())
+}
+
 async fn dispatch_turn(
     group: &Group,
-    messages: &mut Vec<GroupMessage>,
     trigger: &GroupMessage,
     human_name: &str,
+    yolo: bool,
+    seen: &mut HashSet<String>,
 ) -> Result<()> {
-    let prompt = build_routing_prompt(group, messages, trigger, human_name);
-    let reply = match crate::run_single_turn_capture(&prompt, Some(group.model.clone()), group.yolo)
-        .await
+    let lock = tokio::task::spawn_blocking({
+        let id = group.id.clone();
+        move || -> Result<Option<std::fs::File>> {
+            let path = dispatch_lock_path(&id)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)?;
+            match file.try_lock_exclusive() {
+                Ok(()) => Ok(Some(file)),
+                Err(e) => {
+                    if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+                        Ok(None)
+                    } else {
+                        Err(e.into())
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("dispatch lock join failed: {e}"))??;
+
+    let Some(_lock) = lock else {
+        return Ok(());
+    };
+
+    let mut messages = load_messages(&group.id)?;
+    let Some(idx) = messages.iter().position(|m| m.id == trigger.id) else {
+        return Ok(());
+    };
+    if messages
+        .iter()
+        .skip(idx + 1)
+        .any(|m| matches!(m.kind, MessageKind::Agent))
+    {
+        seen.insert(trigger.id.clone());
+        return Ok(());
+    }
+
+    seen.insert(trigger.id.clone());
+
+    let prompt = build_routing_prompt(group, &messages[..=idx], trigger, human_name);
+    let reply = match crate::run_single_turn_capture(
+        &prompt,
+        Some(group.model.clone()),
+        yolo,
+        Some(1),
+        None,
+    )
+    .await
     {
         Ok(t) => t,
         Err(e) => {
@@ -377,6 +639,7 @@ async fn dispatch_turn(
         add_message(&group.id, &message)?;
         messages.push(message.clone());
         print_message(&message);
+        seen.insert(message.id.clone());
     }
 
     // One round of @mention routing so agents can ask each other directly.
@@ -411,23 +674,21 @@ async fn dispatch_turn(
                  Reply concisely. Do not ask follow-up questions unless essential.",
                 agent.name,
                 agent.role,
-                format_history(messages, HISTORY_LIMIT),
+                format_history(&messages, HISTORY_LIMIT),
                 sender,
                 context
             );
-            let content = match crate::run_single_turn_capture(
-                &prompt,
-                Some(group.model.clone()),
-                group.yolo,
-            )
-            .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("warning: mention reply failed: {e}");
-                    continue;
-                }
-            };
+            let model = agent_model(group, &agent.name);
+            let content =
+                match crate::run_single_turn_capture(&prompt, Some(model), yolo, Some(1), None)
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("warning: mention reply failed: {e}");
+                        continue;
+                    }
+                };
             let trimmed = content.trim();
             if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NO_REPLY") {
                 continue;
@@ -442,10 +703,23 @@ async fn dispatch_turn(
             add_message(&group.id, &message)?;
             messages.push(message.clone());
             print_message(&message);
+            seen.insert(message.id.clone());
         }
     }
 
     Ok(())
+}
+
+/// Dispatch agent replies for a single message without a shared `seen` set.
+/// Intended for server-side POST handlers.
+pub(crate) async fn dispatch_for_message(
+    group: Group,
+    trigger: GroupMessage,
+    human_name: String,
+) -> Result<()> {
+    let yolo = group.yolo;
+    let mut seen = HashSet::new();
+    dispatch_turn(&group, &trigger, &human_name, yolo, &mut seen).await
 }
 
 fn build_routing_prompt(
@@ -475,12 +749,15 @@ fn build_routing_prompt(
 
     prompt.push_str("Conversation history:\n");
     prompt.push_str(&format_history(messages, HISTORY_LIMIT));
-    prompt.push_str(&format!(
-        "\n[{}] {}: {}\n\nJSON replies:\n",
-        trigger.timestamp.format("%Y-%m-%d %H:%M UTC"),
-        trigger.sender,
-        trigger.content
-    ));
+    if messages.last().is_none_or(|m| m.id != trigger.id) {
+        prompt.push_str(&format!(
+            "\n[{}] {}: {}\n",
+            trigger.timestamp.format("%Y-%m-%d %H:%M UTC"),
+            trigger.sender,
+            trigger.content
+        ));
+    }
+    prompt.push_str("\nJSON replies:\n");
     prompt
 }
 
@@ -501,7 +778,7 @@ fn format_history(messages: &[GroupMessage], limit: usize) -> String {
 }
 
 fn parse_replies(text: &str, agents: &[Agent]) -> Vec<(String, String)> {
-    let value = match extract_json_object(text) {
+    let value = match crate::extract_json_object(text) {
         Some(v) => v,
         None => {
             eprintln!("warning: group routing did not return valid JSON: {text}");
@@ -522,15 +799,6 @@ fn parse_replies(text: &str, agents: &[Agent]) -> Vec<(String, String)> {
         }
     }
     out
-}
-
-fn extract_json_object(text: &str) -> Option<serde_json::Value> {
-    let start = text.find('{')?;
-    let end = text.rfind('}').map(|i| i + 1)?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str(&text[start..end]).ok()
 }
 
 fn parse_mentions(text: &str, agents: &[Agent]) -> Vec<String> {
@@ -601,12 +869,6 @@ fn parse_agent_specs(args: &GroupNewArgs) -> Result<(usize, Vec<String>, Vec<Str
         .unwrap_or_default();
 
     let count = if let Some(n) = args.count {
-        if n > names.len() && !names.is_empty() {
-            bail!(
-                "--count {n} is larger than the number of --names provided ({})",
-                names.len()
-            );
-        }
         n.max(names.len()).max(MIN_AGENTS)
     } else if names.is_empty() {
         3
@@ -661,7 +923,7 @@ fn default_agent_names() -> Vec<String> {
     .collect()
 }
 
-fn normalize_model(model: &str) -> String {
+pub(crate) fn normalize_model(model: &str) -> String {
     if model.contains('-') && model.starts_with("omgb-") {
         model.to_string()
     } else if model.contains('-')
@@ -673,6 +935,59 @@ fn normalize_model(model: &str) -> String {
     } else {
         model.to_string()
     }
+}
+
+fn default_human_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "human".to_string())
+}
+
+fn validate_token(group: &Group, token: Option<&str>) -> Result<()> {
+    let t = token.unwrap_or("");
+    if t.is_empty() || t != group.invite_token {
+        bail!(
+            "group {} requires a valid invite token; use --token <token>",
+            group.id
+        );
+    }
+    Ok(())
+}
+
+fn dispatch_lock_path(id: &str) -> Result<PathBuf> {
+    crate::threads::validate_id(id)?;
+    Ok(groups_dir()?.join(format!("{id}.dispatch.lock")))
+}
+
+fn agent_model(group: &Group, name: &str) -> String {
+    group
+        .agents
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(name))
+        .and_then(|a| {
+            let m = a.model.trim();
+            if m.is_empty() {
+                None
+            } else {
+                Some(m.to_string())
+            }
+        })
+        .unwrap_or_else(|| group.model.clone())
+}
+
+fn parse_agent_models(args: &GroupNewArgs, count: usize, fallback: &str) -> Vec<String> {
+    let mut models: Vec<String> = args
+        .models
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(|s| normalize_model(s.trim()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    models.resize(count, fallback.to_string());
+    models
 }
 
 fn slugify(s: &str) -> String {
@@ -710,7 +1025,7 @@ mod tests {
     #[test]
     fn extract_json_object_finds_object() {
         let text = "Some text before {\"replies\":{\"Alice\":\"ok\"}} after";
-        let value = extract_json_object(text).unwrap();
+        let value = crate::extract_json_object(text).unwrap();
         assert!(value.get("replies").is_some());
     }
 
@@ -736,6 +1051,7 @@ mod tests {
             model: None,
             names: Some("alice,bob".into()),
             roles: Some("coder,reviewer".into()),
+            models: None,
             yolo: false,
         };
         let (count, names, roles) = parse_agent_specs(&args).unwrap();

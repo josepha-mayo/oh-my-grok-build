@@ -106,6 +106,11 @@ pub fn main() -> Result<()> {
     set_default_env("GROK_FEEDBACK_ENABLED", "false");
     set_default_env("GROK_ERROR_REPORTING", "false");
 
+    // omgb: enable upstream slash features that are otherwise gated off by default.
+    set_default_env("GROK_VOICE_MODE", "true");
+    set_default_env("GROK_SESSION_RECAP", "true");
+    set_default_env("GROK_MEMORY", "1");
+
     xai_grok_tools::registry::types::register_tool_pack(crate::tools::register);
 
     let cli = OmgbArgs::parse();
@@ -1048,19 +1053,28 @@ pub(crate) async fn run_single_turn_capture(
     prompt: &str,
     model: Option<String>,
     yolo: bool,
+    max_turns: Option<u32>,
+    tools: Option<String>,
 ) -> Result<String> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let session = SessionParams {
         session_id: Some(session_id.clone()),
         ..Default::default()
     };
+    // run_single_turn_capture is used for one-shot text/json capture; if no
+    // tool allowlist is supplied, build an empty tool allowlist so the model
+    // returns final text instead of making a tool call within the single turn.
+    let cli_tools = match tools.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => tools.clone(),
+        _ => Some(NO_TOOLS_SENTINEL.to_string()),
+    };
     run_single_turn_with(
         prompt,
         model,
         yolo,
         OutputFormat::Plain,
-        Some(1),
-        None,
+        max_turns,
+        cli_tools,
         None,
         None,
         None,
@@ -1104,6 +1118,53 @@ async fn last_assistant_text_for_session(session_id: &str) -> Result<String> {
 }
 
 const TURN_SENTINEL_NAME: &str = "__omgb_turn__";
+
+/// Sentinel tool name used to build an empty tool allowlist for one-shot
+/// text/json capture in `run_single_turn_capture`. It intentionally does not
+/// match any real tool, so the resulting agent gets no function tools.
+const NO_TOOLS_SENTINEL: &str = "__omgb_no_tools__";
+
+/// Extract the first top-level JSON object from `text`, respecting quoted
+/// strings so braces inside string values are not counted. Returns `None` if
+/// no valid object is found.
+pub(crate) fn extract_json_object(text: &str) -> Option<serde_json::Value> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let start = i;
+            let mut depth = 1;
+            i += 1;
+            let mut in_string = false;
+            let mut escape = false;
+            while i < bytes.len() && depth > 0 {
+                let c = bytes[i];
+                if in_string {
+                    if escape {
+                        escape = false;
+                    } else if c == b'\\' {
+                        escape = true;
+                    } else if c == b'"' {
+                        in_string = false;
+                    }
+                } else if c == b'"' {
+                    in_string = true;
+                } else if c == b'{' {
+                    depth += 1;
+                } else if c == b'}' {
+                    depth -= 1;
+                }
+                i += 1;
+                if depth == 0 {
+                    return serde_json::from_str(&text[start..i]).ok();
+                }
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
 
 fn is_turn_sentinel(call: &xai_grok_shell::sampling::ToolCall) -> bool {
     call.name == TURN_SENTINEL_NAME
@@ -2038,5 +2099,14 @@ mod tests {
         };
         assert!(matches!(res, Poll::Ready(Ok(11))));
         assert_eq!(capture.into_string(), "hello");
+    }
+
+    #[test]
+    fn extract_json_object_respects_quoted_braces() {
+        let text = r#"prefix {"replies":{"Alice":"ok {not closed","Bob":"hi"}} suffix"#;
+        let value = extract_json_object(text).unwrap();
+        let replies = value.get("replies").unwrap().as_object().unwrap();
+        assert_eq!(replies["Alice"].as_str().unwrap(), "ok {not closed");
+        assert_eq!(replies["Bob"].as_str().unwrap(), "hi");
     }
 }

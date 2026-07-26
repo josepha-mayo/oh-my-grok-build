@@ -40,6 +40,9 @@ pub mod mcps;
 pub mod model;
 pub mod multiline;
 pub mod new;
+pub mod omgb_create_workflow;
+pub mod omgb_dream;
+pub mod omgb_group;
 pub mod personas;
 pub mod plan;
 pub mod plugin;
@@ -122,6 +125,9 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(voice::VoiceCommand),
         Arc::new(live::LiveCommand),
         Arc::new(workflow::WorkflowCommand),
+        Arc::new(omgb_create_workflow::CreateWorkflowCommand),
+        Arc::new(omgb_group::GroupCommand),
+        Arc::new(omgb_dream::DreamCommand),
         Arc::new(loop_cmd::LoopCommand),
         Arc::new(imagine::ImagineCommand),
         Arc::new(imagine_video::ImagineVideoCommand),
