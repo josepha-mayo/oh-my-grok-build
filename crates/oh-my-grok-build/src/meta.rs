@@ -35,6 +35,8 @@ pub struct Subtask {
     pub thread_id: Option<String>,
     pub model: Option<String>,
     pub status: SubtaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +140,7 @@ async fn build_plan(goal: &str, model: Option<String>, yolo: bool) -> Result<Met
             thread_id: None,
             model: model.clone(),
             status: SubtaskStatus::Pending,
+            result: None,
         })
         .collect();
     Ok(MetaPlan {
@@ -165,12 +168,43 @@ async fn execute_plan(plan: &mut MetaPlan) -> Result<()> {
         save_plan(plan)?;
         let desc = plan.subtasks[i].description.clone();
         let model = plan.subtasks[i].model.clone();
-        match crate::threads::create(&desc, model, plan.yolo, None).await {
-            Ok(thread_id) => {
+        let yolo = plan.yolo;
+        match crate::threads::create(&desc, model.clone(), yolo, None).await {
+            Ok((thread_id, used_model)) => {
+                let verification = match crate::threads::last_assistant_text(&thread_id).await {
+                    Ok(output) => {
+                        verify_subtask(&desc, &output, Some(used_model.clone()), yolo).await
+                    }
+                    Err(e) => Err(e),
+                };
+                let mut incomplete = None;
                 {
                     let subtask = &mut plan.subtasks[i];
                     subtask.thread_id = Some(thread_id);
-                    subtask.status = SubtaskStatus::Completed;
+                    subtask.model = Some(used_model);
+                    match verification {
+                        Ok((completed, summary)) => {
+                            subtask.status = if completed {
+                                SubtaskStatus::Completed
+                            } else {
+                                SubtaskStatus::Failed
+                            };
+                            subtask.result = Some(summary.clone());
+                            if !completed {
+                                incomplete = Some((subtask.id.clone(), summary));
+                            }
+                        }
+                        Err(e) => {
+                            subtask.status = SubtaskStatus::Failed;
+                            subtask.result = Some(format!("verification failed: {e}"));
+                            let _ = save_plan(plan);
+                            return Err(e);
+                        }
+                    }
+                }
+                if let Some((id, summary)) = incomplete {
+                    let _ = save_plan(plan);
+                    bail!("subtask {} not completed: {}", id, summary);
                 }
                 save_plan(plan)?;
             }
@@ -178,6 +212,7 @@ async fn execute_plan(plan: &mut MetaPlan) -> Result<()> {
                 {
                     let subtask = &mut plan.subtasks[i];
                     subtask.status = SubtaskStatus::Failed;
+                    subtask.result = Some(format!("thread creation failed: {e}"));
                 }
                 let _ = save_plan(plan);
                 return Err(e);
@@ -185,6 +220,36 @@ async fn execute_plan(plan: &mut MetaPlan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn verify_subtask(
+    description: &str,
+    output: &str,
+    model: Option<String>,
+    yolo: bool,
+) -> Result<(bool, String)> {
+    let prompt = format!(
+        "You are checking whether a subtask was completed.\n\n\
+         Subtask: {description}\n\n\
+         Worker output:\n{output}\n\n\
+         If the subtask is completed, start your reply with:\n\
+         COMPLETED: <one-sentence summary>\n\n\
+         If the subtask is not completed, start your reply with:\n\
+         INCOMPLETE: <reason>"
+    );
+    let verdict =
+        crate::swarm::exec_plain(&prompt, model, yolo, Some("read_file,grep,list_dir")).await?;
+    let first = verdict.lines().next().unwrap_or("").trim();
+    if let Some(summary) = first.strip_prefix("COMPLETED:") {
+        return Ok((true, summary.trim().to_string()));
+    }
+    if let Some(reason) = first.strip_prefix("INCOMPLETE:") {
+        return Ok((false, reason.trim().to_string()));
+    }
+    if output.trim().is_empty() {
+        return Ok((false, "worker produced no output".into()));
+    }
+    Ok((false, format!("verifier did not follow format: {first}")))
 }
 
 async fn resume(id: &str) -> Result<()> {
@@ -228,9 +293,10 @@ fn show(id: &str) -> Result<()> {
     println!("goal: {}", plan.goal);
     for s in &plan.subtasks {
         let thread = s.thread_id.as_deref().unwrap_or("-");
+        let result = s.result.as_deref().unwrap_or("-");
         println!(
-            "  {} [{:?}] thread={} {}",
-            s.id, s.status, thread, s.description
+            "  {} [{:?}] thread={} result={} {}",
+            s.id, s.status, thread, result, s.description
         );
     }
     Ok(())
@@ -325,6 +391,7 @@ mod tests {
                 thread_id: None,
                 model: None,
                 status: SubtaskStatus::Pending,
+                result: None,
             }],
         };
         save_plan(&plan).unwrap();

@@ -197,7 +197,7 @@ fn token_hash_eq(token: &str, secret_hash: &[u8; 32]) -> bool {
 
 async fn validate_auth(
     headers: &HeaderMap,
-    _query: &xai_grok_shell::agent::server::WsQueryParams,
+    query: &xai_grok_shell::agent::server::WsQueryParams,
     state: &ProxyState,
 ) -> Option<String> {
     let mut tokens: Vec<String> = Vec::new();
@@ -217,6 +217,9 @@ async fn validate_auth(
                 tokens.push(proto.to_string());
             }
         }
+    }
+    if let Some(ref key) = query.server_key {
+        tokens.push(key.clone());
     }
 
     tokens
@@ -860,6 +863,19 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("sec-websocket-protocol", "my-token".parse().unwrap());
         let query = xai_grok_shell::agent::server::WsQueryParams::default();
+        assert_eq!(
+            validate_auth(&headers, &query, &state).await.as_deref(),
+            Some("my-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_auth_query() {
+        let state = test_state("my-token");
+        let headers = HeaderMap::new();
+        let query = xai_grok_shell::agent::server::WsQueryParams {
+            server_key: Some("my-token".into()),
+        };
         assert_eq!(
             validate_auth(&headers, &query, &state).await.as_deref(),
             Some("my-token")

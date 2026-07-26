@@ -25,7 +25,7 @@ impl ApiBackend {
     name = "oh-my-grok-build",
     about = "Oh My Grok Build harness",
     version,
-    after_help = "Plugin slash commands in the TUI:\n  /autonomous, /browser, /btw, /byok, /live, /loop, /plan, /research, /schedule, /taste, /use, /workflow, /yolo"
+    after_help = "Plugin slash commands in the TUI:\n  /autonomous, /browser, /btw, /byok, /create-workflow, /dream, /group, /live, /loop, /plan, /recap, /research, /schedule, /taste, /use, /voice, /workflow, /yolo"
 )]
 pub struct OmgbArgs {
     #[command(subcommand)]
@@ -96,6 +96,8 @@ pub enum OmgbCommand {
     Playbook(PlaybookArgs),
     /// Run or manage reusable agent workflows
     Workflow(WorkflowArgs),
+    /// Multi-agent group chat with humans and agents
+    Group(GroupArgs),
     /// Computer use prompt
     Use(UseArgs),
     /// Browser use prompt
@@ -1077,6 +1079,8 @@ pub enum WorkflowCommand {
     Show { name: String },
     /// Create a new workflow stub
     New(WorkflowNewArgs),
+    /// Generate a workflow from a plain-English task
+    Create(WorkflowCreateArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1103,4 +1107,91 @@ pub struct WorkflowNewArgs {
     pub name: String,
     /// Initial task description
     pub description: String,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct WorkflowCreateArgs {
+    /// Plain-English task the workflow should accomplish
+    pub prompt: String,
+    /// Workflow display name (defaults to a slug of the prompt)
+    #[arg(short, long)]
+    pub name: Option<String>,
+    /// Model to use for planning (defaults to cheapest available)
+    #[arg(short, long)]
+    pub model: Option<String>,
+    /// Print the generated workflow instead of saving it
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Auto-approve tool use during planning
+    #[arg(long)]
+    pub yolo: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupArgs {
+    #[command(subcommand)]
+    pub command: GroupCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum GroupCommand {
+    /// Create a new multi-agent group chat
+    New(GroupNewArgs),
+    /// List saved groups
+    List,
+    /// Show group details and recent messages
+    Show { id: String },
+    /// Host a group chat REPL
+    Chat(GroupChatArgs),
+    /// Send a message to a group as a human participant
+    Send(GroupSendArgs),
+    /// Print an invite command/link for a group
+    Invite { id: String },
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupNewArgs {
+    /// Group display name
+    pub name: String,
+    /// Short description / purpose
+    #[arg(short, long)]
+    pub description: Option<String>,
+    /// Number of agents (2-20; defaults to 3 or names.len())
+    #[arg(short, long)]
+    pub count: Option<usize>,
+    /// Model for all agents (provider id or omgb-<provider>)
+    #[arg(short, long)]
+    pub model: Option<String>,
+    /// Comma-separated agent names
+    #[arg(long, value_delimiter = ',')]
+    pub names: Option<String>,
+    /// Comma-separated agent roles (defaults to generalist)
+    #[arg(long, value_delimiter = ',')]
+    pub roles: Option<String>,
+    /// Auto-approve tool use for agents
+    #[arg(long)]
+    pub yolo: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupChatArgs {
+    /// Group id
+    pub id: String,
+    /// Human display name in the chat
+    #[arg(short, long)]
+    pub human_name: Option<String>,
+    /// Auto-approve tool use for agents
+    #[arg(long)]
+    pub yolo: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupSendArgs {
+    /// Group id
+    pub id: String,
+    /// Message text
+    pub message: String,
+    /// Human display name
+    #[arg(short, long)]
+    pub human_name: Option<String>,
 }

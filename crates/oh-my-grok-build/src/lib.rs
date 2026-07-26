@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use tokio::io::AsyncWrite;
 use tokio::process::Command;
@@ -21,6 +21,7 @@ use xai_grok_shell::agent::config::Config as AgentConfig;
 mod approvals;
 mod args;
 mod doctor;
+mod group;
 mod harness;
 mod hashline;
 mod lsp;
@@ -254,6 +255,7 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Playbook(args) => playbook::run_playbook(&args).await,
         OmgbCommand::Workflow(args) => workflow::run_workflow(&args).await,
         OmgbCommand::Timeline(args) => timeline::list_events(args.limit, args.json),
+        OmgbCommand::Group(args) => group::run_group(&args).await,
         OmgbCommand::Harness(args) => run_harness(args).await,
         OmgbCommand::Serve(args) => server::serve(&args).await,
         OmgbCommand::Connect(args) => server::connect(&args).await,
@@ -1034,6 +1036,69 @@ pub(crate) async fn run_single_turn_with(
     }
 
     last_result
+}
+
+/// Run a single headless turn and return the assistant's text response.
+///
+/// This is a convenience wrapper for callers that only need the model's final
+/// output (e.g. JSON planning or group-chat routing). It creates a throwaway
+/// session, caps the turn at one model response, and reads the assistant message
+/// back from the session's chat history.
+pub(crate) async fn run_single_turn_capture(
+    prompt: &str,
+    model: Option<String>,
+    yolo: bool,
+) -> Result<String> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let session = SessionParams {
+        session_id: Some(session_id.clone()),
+        ..Default::default()
+    };
+    run_single_turn_with(
+        prompt,
+        model,
+        yolo,
+        OutputFormat::Plain,
+        Some(1),
+        None,
+        None,
+        None,
+        None,
+        &session,
+        false,
+    )
+    .await?;
+    last_assistant_text_for_session(&session_id)
+        .await
+        .with_context(|| "failed to capture assistant text")
+}
+
+async fn last_assistant_text_for_session(session_id: &str) -> Result<String> {
+    let path = xai_grok_shell::session::persistence::find_session_dir_by_id(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session '{session_id}' not found"))?
+        .join("chat_history.jsonl");
+    if !path.is_file() {
+        bail!("session '{session_id}' has no chat history");
+    }
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut text = String::new();
+    for line in raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l: &&str| !l.is_empty())
+    {
+        if let Ok(xai_grok_shell::sampling::ConversationItem::Assistant(a)) =
+            serde_json::from_str::<xai_grok_shell::sampling::ConversationItem>(line)
+        {
+            text = a.content.as_ref().to_string();
+        }
+    }
+    if text.is_empty() {
+        bail!("no assistant response in session '{session_id}'");
+    }
+    Ok(text)
 }
 
 const TURN_SENTINEL_NAME: &str = "__omgb_turn__";

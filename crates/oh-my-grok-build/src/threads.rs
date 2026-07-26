@@ -85,8 +85,9 @@ fn with_records<T>(f: impl FnOnce(Vec<ThreadRecord>) -> Result<T>) -> Result<T> 
         .open(&lock)?;
     file.lock_shared()?;
     let records = load_records_unlocked()?;
+    let result = f(records);
     drop(file);
-    f(records)
+    result
 }
 
 fn with_records_mut<T>(f: impl FnOnce(&mut Vec<ThreadRecord>) -> Result<T>) -> Result<T> {
@@ -131,6 +132,38 @@ fn chat_history_path(record: &ThreadRecord) -> Option<PathBuf> {
         .map(|p| p.join("chat_history.jsonl"))
 }
 
+/// Returns the text of the last assistant message in the thread's session.
+pub(crate) async fn last_assistant_text(thread_id: &str) -> Result<String> {
+    let session_id = with_records(|records| {
+        records
+            .into_iter()
+            .find(|r| r.id == thread_id)
+            .map(|r| r.session_id)
+            .ok_or_else(|| anyhow::anyhow!("thread '{thread_id}' not found"))
+    })?;
+    let path = xai_grok_shell::session::persistence::find_session_dir_by_id(&session_id)
+        .ok_or_else(|| anyhow::anyhow!("session for thread '{thread_id}' not found"))?
+        .join("chat_history.jsonl");
+    if !path.is_file() {
+        bail!("thread '{thread_id}' has no chat history");
+    }
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut text = String::new();
+    for line in raw.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        if let Ok(xai_grok_shell::sampling::ConversationItem::Assistant(a)) =
+            serde_json::from_str::<xai_grok_shell::sampling::ConversationItem>(line)
+        {
+            text = a.content.as_ref().to_string();
+        }
+    }
+    if text.is_empty() {
+        bail!("no assistant response in thread '{thread_id}'");
+    }
+    Ok(text)
+}
+
 pub async fn run_thread(args: ThreadArgs) -> Result<()> {
     match args.command {
         ThreadCommand::New(args) => run_new(args).await,
@@ -150,7 +183,7 @@ pub async fn create(
     model: Option<String>,
     yolo: bool,
     requested_id: Option<String>,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let model = match model {
         Some(m) => m,
         None => pick_model_for_task(prompt).await?,
@@ -191,7 +224,7 @@ pub async fn create(
     };
     run_single_turn_with(
         prompt,
-        Some(model),
+        Some(model.clone()),
         yolo,
         OutputFormat::Plain,
         None,
@@ -203,11 +236,11 @@ pub async fn create(
         false,
     )
     .await?;
-    Ok(id)
+    Ok((id, model))
 }
 
 async fn run_new(args: ThreadNewArgs) -> Result<()> {
-    let id = create(&args.prompt, args.model, args.yolo, args.id).await?;
+    let (id, _) = create(&args.prompt, args.model, args.yolo, args.id).await?;
     println!("created thread {id}");
     Ok(())
 }

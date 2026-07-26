@@ -17,3 +17,5 @@ __pycache__/
 /guard_input.json
 /guard_output.json
 /*.rcgu.o
+# Nested mobile app checkout (separate git history)
+/grok-build-app/

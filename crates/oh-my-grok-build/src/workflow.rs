@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::args::{WorkflowArgs, WorkflowCommand, WorkflowNewArgs, WorkflowRunArgs};
+use crate::args::{
+    WorkflowArgs, WorkflowCommand, WorkflowCreateArgs, WorkflowNewArgs, WorkflowRunArgs,
+};
 use crate::{SessionParams, run_single_turn_with};
 use xai_grok_pager::headless::OutputFormat;
 
@@ -121,6 +123,7 @@ pub async fn run_workflow(args: &WorkflowArgs) -> Result<()> {
         WorkflowCommand::List => list(),
         WorkflowCommand::Show { name } => show(name),
         WorkflowCommand::New(new_args) => new(new_args),
+        WorkflowCommand::Create(create_args) => create(create_args).await,
     }
 }
 
@@ -222,6 +225,88 @@ fn new(args: &WorkflowNewArgs) -> Result<()> {
     crate::providers::write_file_atomic(&path, raw, true)?;
     println!("created workflow {name} at {}", path.display());
     Ok(())
+}
+
+async fn create(args: &WorkflowCreateArgs) -> Result<()> {
+    let model = match &args.model {
+        Some(m) => m.clone(),
+        None => {
+            let provider = crate::moe::select_provider_or_fallback(&args.prompt).await?;
+            format!("omgb-{provider}")
+        }
+    };
+
+    let name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| derive_workflow_name(&args.prompt));
+    let safe_name = slugify(&name);
+    if safe_name.is_empty() {
+        bail!("invalid workflow name '{name}'");
+    }
+
+    let prompt = format!(
+        "Create an `omgb` workflow JSON for the following task. \
+         The workflow may use 'exec' (run a model prompt), 'fan_out' (spawn parallel agents), \
+         and 'shell' (run a command) step types. Include verification or aggregation steps where sensible.\n\n\
+         Task: {prompt}\n\n\
+         Output strictly valid JSON matching this shape (no markdown, no code fences):\n\
+         {{\"name\":\"Workflow Name\",\"description\":\"...\",\"step\":[{{\"type\":\"exec\",\"prompt\":\"...\"}},{{\"type\":\"fan_out\",\"prompt\":\"...\",\"count\":3}},{{\"type\":\"shell\",\"command\":\"echo\",\"args\":[\"ok\"]}}]}}\n\n\
+         The 'exec' step may include optional fields: model, yolo (bool), tools (comma-separated string), max_turns (u32). \
+         The 'fan_out' step may include the same plus count (required, 1-20) and aggregate (string prompt). \
+         The 'shell' step may include args (array of strings) and expect_exit (i32).",
+        prompt = args.prompt
+    );
+
+    let reply = crate::run_single_turn_capture(&prompt, Some(model), args.yolo).await?;
+    let value = extract_json_object(&reply)
+        .ok_or_else(|| anyhow::anyhow!("workflow create did not return valid JSON"))?;
+    let mut workflow: Workflow = serde_json::from_value(value)
+        .with_context(|| format!("generated workflow is not valid: {reply}"))?;
+
+    if workflow.step.is_empty() {
+        bail!("generated workflow has no steps");
+    }
+
+    workflow.name = Some(workflow.name.unwrap_or(name));
+    workflow.description = Some(workflow.description.unwrap_or_else(|| args.prompt.clone()));
+
+    if args.dry_run {
+        println!("{}", serde_json::to_string_pretty(&workflow)?);
+        return Ok(());
+    }
+
+    let dir = workflows_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{safe_name}.json"));
+    if path.exists() {
+        bail!("workflow '{safe_name}' already exists");
+    }
+    crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(&workflow)?, true)?;
+    println!("created workflow {safe_name} at {}", path.display());
+    Ok(())
+}
+
+fn extract_json_object(text: &str) -> Option<serde_json::Value> {
+    let start = text.find('{')?;
+    let end = text.rfind('}').map(|i| i + 1)?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&text[start..end]).ok()
+}
+
+fn derive_workflow_name(prompt: &str) -> String {
+    prompt
+        .split_whitespace()
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase()
+        .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-")
+        .replace("--", "-")
+        .trim_matches('-')
+        .to_string()
 }
 
 fn step_name(step: &WorkflowStep) -> &'static str {

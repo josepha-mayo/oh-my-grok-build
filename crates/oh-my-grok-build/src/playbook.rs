@@ -110,6 +110,7 @@ fn resolve_playbook_file(path: &Path) -> Result<PathBuf> {
 pub async fn run_playbook(args: &PlaybookArgs) -> Result<()> {
     let file = resolve_playbook_file(&args.file)?;
     let playbook = load_playbook(&file)?;
+    let cwd = std::env::current_dir()?;
     if let Some(name) = &playbook.name {
         println!("playbook: {name}");
     }
@@ -118,7 +119,9 @@ pub async fn run_playbook(args: &PlaybookArgs) -> Result<()> {
         if args.dry_run {
             continue;
         }
-        run_step(step).await.with_context(|| format!("step {i}"))?;
+        run_step(step, &cwd)
+            .await
+            .with_context(|| format!("step {i}"))?;
     }
     Ok(())
 }
@@ -132,11 +135,11 @@ fn step_name(step: &Step) -> &'static str {
     }
 }
 
-async fn run_step(step: &Step) -> Result<()> {
+async fn run_step(step: &Step, cwd: &std::path::Path) -> Result<()> {
     match step {
         Step::Exec(s) => run_exec(s).await,
         Step::Shell(s) => run_shell_step(&s.command, &s.args, s.expect_exit).await,
-        Step::AssertFile(s) => run_assert_file(s),
+        Step::AssertFile(s) => run_assert_file(s, cwd),
         Step::GitCommit(s) => crate::git_commit_all(&s.message, false, None).await,
     }
 }
@@ -365,21 +368,50 @@ pub(crate) async fn guard_shell_command(command: &str, args: &[String]) -> Resul
     Ok(())
 }
 
-fn run_assert_file(step: &AssertFileStep) -> Result<()> {
+fn resolve_assert_path(cwd: &std::path::Path, raw: &std::path::Path) -> Result<std::path::PathBuf> {
+    if raw.is_absolute() {
+        bail!("assert_file path must be relative");
+    }
+    for comp in raw.components() {
+        if !matches!(
+            comp,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        ) {
+            bail!("assert_file path must not contain '..' or absolute components");
+        }
+    }
+    let resolved = cwd.join(raw);
+    if let Ok(canonical) = dunce::canonicalize(&resolved) {
+        let base_canonical =
+            dunce::canonicalize(cwd).unwrap_or_else(|_| dunce::simplified(cwd).to_path_buf());
+        if !canonical.starts_with(&base_canonical) {
+            bail!("assert_file path escapes the playbook directory");
+        }
+        let meta = std::fs::symlink_metadata(&resolved)
+            .with_context(|| format!("metadata {}", resolved.display()))?;
+        if meta.is_symlink() {
+            bail!("assert_file path must not be a symlink");
+        }
+    }
+    Ok(resolved)
+}
+
+fn run_assert_file(step: &AssertFileStep, cwd: &std::path::Path) -> Result<()> {
+    let path = resolve_assert_path(cwd, &step.path)?;
     if let Some(expected_exists) = step.exists {
-        let actual = step.path.exists();
+        let actual = path.exists();
         if actual != expected_exists {
             bail!(
                 "{} exists={actual}, expected={expected_exists}",
-                step.path.display()
+                path.display()
             );
         }
     }
     if let Some(needle) = &step.contains {
-        let haystack = std::fs::read_to_string(&step.path)
-            .with_context(|| format!("read {}", step.path.display()))?;
+        let haystack =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         if !haystack.contains(needle) {
-            bail!("{} does not contain: {needle}", step.path.display());
+            bail!("{} does not contain: {needle}", path.display());
         }
     }
     Ok(())
@@ -422,33 +454,54 @@ exists = true
 
     #[test]
     fn assert_file_contains_fails_when_missing() {
-        let tmp = std::env::temp_dir().join(format!("playbook-test-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&tmp, "hello world").unwrap();
+        let dir = std::env::temp_dir().join(format!("playbook-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, "hello world").unwrap();
         let step = AssertFileStep {
-            path: tmp.clone(),
+            path: std::path::PathBuf::from("hello.txt"),
             contains: Some("missing".into()),
             exists: None,
         };
-        assert!(run_assert_file(&step).is_err());
+        assert!(run_assert_file(&step, &dir).is_err());
 
         let step = AssertFileStep {
-            path: tmp,
+            path: std::path::PathBuf::from("hello.txt"),
             contains: Some("hello".into()),
             exists: None,
         };
-        assert!(run_assert_file(&step).is_ok());
+        assert!(run_assert_file(&step, &dir).is_ok());
     }
 
     #[test]
     fn assert_file_exists_check() {
-        let missing =
-            std::env::temp_dir().join(format!("playbook-missing-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("playbook-missing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
         let step = AssertFileStep {
-            path: missing,
+            path: std::path::PathBuf::from("missing.txt"),
             contains: None,
             exists: Some(true),
         };
-        assert!(run_assert_file(&step).is_err());
+        assert!(run_assert_file(&step, &dir).is_err());
+    }
+
+    #[test]
+    fn assert_file_rejects_absolute_and_traversal() {
+        let dir = std::env::temp_dir().join(format!("playbook-traversal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let step = AssertFileStep {
+            path: std::path::PathBuf::from("/etc/passwd"),
+            contains: None,
+            exists: Some(true),
+        };
+        assert!(run_assert_file(&step, &dir).is_err());
+
+        let step = AssertFileStep {
+            path: std::path::PathBuf::from("../hello"),
+            contains: None,
+            exists: Some(true),
+        };
+        assert!(run_assert_file(&step, &dir).is_err());
     }
 
     #[test]

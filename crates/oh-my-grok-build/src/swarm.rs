@@ -10,7 +10,7 @@ pub async fn run_swarm_task_splitting(
     count: usize,
 ) -> Result<String> {
     if count <= 1 {
-        return exec_plain(prompt, model, yolo).await;
+        return exec_plain(prompt, model, yolo, None).await;
     }
 
     let subtasks = match fetch_subtasks(prompt, model.clone(), yolo, count).await {
@@ -27,7 +27,7 @@ pub async fn run_swarm_task_splitting(
 
     let results = run_subtasks(&subtasks, model.clone(), yolo).await?;
     let combined = build_combine_prompt(&results, prompt);
-    exec_plain(&combined, model, yolo).await
+    exec_plain(&combined, model, yolo, None).await
 }
 
 pub(crate) async fn run_swarm_ensemble(
@@ -46,7 +46,7 @@ pub(crate) async fn run_swarm_ensemble(
         );
         let model = model.clone();
         handles.push(tokio::spawn(async move {
-            exec_plain(&member_prompt, model, yolo).await
+            exec_plain(&member_prompt, model, yolo, None).await
         }));
     }
 
@@ -73,7 +73,12 @@ pub(crate) async fn run_swarm_ensemble(
     Ok(winner)
 }
 
-async fn exec_plain(prompt: &str, model: Option<String>, yolo: bool) -> Result<String> {
+pub(crate) async fn exec_plain(
+    prompt: &str,
+    model: Option<String>,
+    yolo: bool,
+    tools: Option<&str>,
+) -> Result<String> {
     let prompt_file = crate::write_prompt_temp(prompt).await?;
     let _prompt_guard = crate::PromptFileGuard(prompt_file.clone());
     let output_file =
@@ -93,6 +98,9 @@ async fn exec_plain(prompt: &str, model: Option<String>, yolo: bool) -> Result<S
     }
     if yolo {
         cmd.arg("--yolo");
+    }
+    if let Some(t) = tools {
+        cmd.arg("--tools").arg(t);
     }
 
     let status = cmd.status().await?;
@@ -149,7 +157,7 @@ async fn run_subtasks(
         let subtask = subtask.clone();
         let model = model.clone();
         handles.push(tokio::spawn(async move {
-            exec_plain(&subtask, model, yolo).await
+            exec_plain(&subtask, model, yolo, None).await
         }));
     }
 
