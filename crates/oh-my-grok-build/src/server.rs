@@ -199,7 +199,7 @@ async fn validate_auth(
     headers: &HeaderMap,
     _query: &xai_grok_shell::agent::server::WsQueryParams,
     state: &ProxyState,
-) -> bool {
+) -> Option<String> {
     let mut tokens: Vec<String> = Vec::new();
     if let Some(token) = headers
         .get("authorization")
@@ -220,8 +220,8 @@ async fn validate_auth(
     }
 
     tokens
-        .iter()
-        .any(|token| token_hash_eq(token, &state.secret_hash))
+        .into_iter()
+        .find(|token| token_hash_eq(token, &state.secret_hash))
 }
 
 /// Normalize an Origin-like URL so scheme and host are lower-case and the port
@@ -402,7 +402,6 @@ async fn spawn_upstream_agent(
 
 struct ProxyState {
     secret_hash: [u8; 32],
-    public_secret: String,
     allowed_origins: Option<Vec<String>>,
     rate_limit_per_minute: Option<u32>,
     rate_limiter: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
@@ -427,18 +426,27 @@ async fn ws_handler(
         return (StatusCode::FORBIDDEN, msg).into_response();
     }
 
-    if !validate_auth(&headers, &query, &state).await {
+    let Some(matched_token) = validate_auth(&headers, &query, &state).await else {
         warn!("Unauthorized connection attempt from {}", addr);
         return (
             StatusCode::UNAUTHORIZED,
             "Invalid or missing authorization token",
         )
             .into_response();
-    }
+    };
+
+    let from_protocol = headers.get("sec-websocket-protocol").is_some_and(|v| {
+        v.to_str().ok().is_some_and(|protos| {
+            protos
+                .split(',')
+                .map(str::trim)
+                .any(|p| p == matched_token.as_str())
+        })
+    });
 
     info!("Authenticated WebSocket connection from {}", addr);
-    let ws = if headers.get("sec-websocket-protocol").is_some() {
-        ws.protocols([state.public_secret.clone()])
+    let ws = if from_protocol {
+        ws.protocols([matched_token])
     } else {
         ws
     };
@@ -607,7 +615,6 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     let upstream_url = format!("ws://127.0.0.1:{}/ws", upstream_addr.port());
     let state = Arc::new(ProxyState {
         secret_hash,
-        public_secret: public_secret.clone(),
         allowed_origins,
         rate_limit_per_minute,
         rate_limiter: Arc::new(Mutex::new(HashMap::new())),
@@ -827,7 +834,6 @@ mod tests {
     fn test_state(secret: &str) -> Arc<ProxyState> {
         Arc::new(ProxyState {
             secret_hash: *blake3::hash(secret.as_bytes()).as_bytes(),
-            public_secret: secret.to_string(),
             allowed_origins: None,
             rate_limit_per_minute: None,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
@@ -842,7 +848,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer my-token".parse().unwrap());
         let query = xai_grok_shell::agent::server::WsQueryParams::default();
-        assert!(validate_auth(&headers, &query, &state).await);
+        assert_eq!(
+            validate_auth(&headers, &query, &state).await.as_deref(),
+            Some("my-token")
+        );
     }
 
     #[tokio::test]
@@ -851,7 +860,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("sec-websocket-protocol", "my-token".parse().unwrap());
         let query = xai_grok_shell::agent::server::WsQueryParams::default();
-        assert!(validate_auth(&headers, &query, &state).await);
+        assert_eq!(
+            validate_auth(&headers, &query, &state).await.as_deref(),
+            Some("my-token")
+        );
     }
 
     #[tokio::test]
@@ -859,7 +871,7 @@ mod tests {
         let state = test_state("my-token");
         let headers = HeaderMap::new();
         let query = xai_grok_shell::agent::server::WsQueryParams::default();
-        assert!(!validate_auth(&headers, &query, &state).await);
+        assert!(validate_auth(&headers, &query, &state).await.is_none());
     }
 
     #[test]

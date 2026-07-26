@@ -606,6 +606,46 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
     false
 }
 
+fn append_exec_common_args(cmd: &mut Command, args: &ExecArgs) {
+    if let Some(m) = &args.model {
+        cmd.arg("--model").arg(m);
+    }
+    if args.yolo {
+        cmd.arg("--yolo");
+    }
+    if args.json {
+        cmd.arg("--json");
+    }
+    if let Some(t) = &args.tools {
+        cmd.arg("--tools").arg(t);
+    }
+    if let Some(dt) = &args.disallowed_tools {
+        cmd.arg("--disallowed-tools").arg(dt);
+    }
+    if let Some(n) = args.max_turns {
+        cmd.arg("--max-turns").arg(n.to_string());
+    }
+    if args.memory {
+        cmd.arg("--memory");
+    }
+    if let Some(r) = &args.session.resume {
+        if r.is_empty() {
+            cmd.arg("--resume");
+        } else {
+            cmd.arg("--resume").arg(r);
+        }
+    }
+    if args.session.continue_last {
+        cmd.arg("--continue");
+    }
+    if let Some(sid) = &args.session.session_id {
+        cmd.arg("--session-id").arg(sid);
+    }
+    if args.session.fork_session {
+        cmd.arg("--fork-session");
+    }
+}
+
 async fn run_exec(args: ExecArgs) -> Result<()> {
     let output_path = args.output_file.as_deref().map(resolve_path).transpose()?;
     let prompt_file = if let Some(p) = &args.prompt_file {
@@ -652,21 +692,7 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
             .arg(&child_prompt_file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(m) = &args.model {
-            cmd.arg("--model").arg(m);
-        }
-        if args.yolo {
-            cmd.arg("--yolo");
-        }
-        if args.json {
-            cmd.arg("--json");
-        }
-        if let Some(t) = &args.tools {
-            cmd.arg("--tools").arg(t);
-        }
-        if let Some(dt) = &args.disallowed_tools {
-            cmd.arg("--disallowed-tools").arg(dt);
-        }
+        append_exec_common_args(&mut cmd, &args);
         let out = cmd.output().await?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
