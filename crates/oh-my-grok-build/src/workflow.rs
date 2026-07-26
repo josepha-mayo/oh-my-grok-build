@@ -124,9 +124,34 @@ pub async fn run_workflow(args: &WorkflowArgs) -> Result<()> {
     }
 }
 
+fn resolve_user_workflow_file(path: &std::path::Path) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let workflows = workflows_dir()?;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let canonical = dunce::canonicalize(&abs)
+        .with_context(|| format!("workflow file not found: {}", abs.display()))?;
+    let cwd_canonical =
+        dunce::canonicalize(&cwd).unwrap_or_else(|_| dunce::simplified(&cwd).to_path_buf());
+    let workflows_canonical = dunce::canonicalize(&workflows)
+        .unwrap_or_else(|_| dunce::simplified(&workflows).to_path_buf());
+    if !canonical.starts_with(&cwd_canonical) && !canonical.starts_with(&workflows_canonical) {
+        bail!(
+            "workflow --file must be under the current directory ({}) or {}",
+            cwd_canonical.display(),
+            workflows_canonical.display()
+        );
+    }
+    reject_symlink(&abs)?;
+    Ok(canonical)
+}
+
 async fn run(args: &WorkflowRunArgs) -> Result<()> {
     let path = if let Some(file) = &args.file {
-        file.clone()
+        resolve_user_workflow_file(file)?
     } else if let Some(name) = &args.name {
         resolve_workflow_path(name)?
     } else {

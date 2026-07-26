@@ -172,10 +172,14 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
             "{exe} exec --prompt-file <prompt>{}",
             if yolo { " --yolo" } else { "" }
         ),
-        parent_id,
+        parent_id: parent_id.clone(),
         depth: parent_depth + 1,
     };
     append_record(&record)?;
+    let _ = crate::notifications::push(
+        "subagent_spawned",
+        serde_json::json!({"subagent_id": id, "parent_id": parent_id, "depth": parent_depth + 1}),
+    );
     println!("spawned subagent {id} (pid {pid})");
     tokio::spawn(async move {
         // Reap the detached child once it exits so it does not become a zombie.

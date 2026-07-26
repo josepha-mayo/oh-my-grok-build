@@ -82,8 +82,34 @@ fn load_playbook(path: &Path) -> Result<Playbook> {
     }
 }
 
+fn resolve_playbook_file(path: &Path) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let canonical = dunce::canonicalize(&abs)
+        .with_context(|| format!("playbook not found: {}", abs.display()))?;
+    let cwd_canonical =
+        dunce::canonicalize(&cwd).unwrap_or_else(|_| dunce::simplified(&cwd).to_path_buf());
+    if !canonical.starts_with(&cwd_canonical) {
+        bail!(
+            "playbook must be under the current directory ({})",
+            cwd_canonical.display()
+        );
+    }
+    let meta =
+        std::fs::symlink_metadata(&abs).with_context(|| format!("metadata {}", abs.display()))?;
+    if meta.is_symlink() {
+        bail!("playbook path {} is a symlink", abs.display());
+    }
+    Ok(canonical)
+}
+
 pub async fn run_playbook(args: &PlaybookArgs) -> Result<()> {
-    let playbook = load_playbook(&args.file)?;
+    let file = resolve_playbook_file(&args.file)?;
+    let playbook = load_playbook(&file)?;
     if let Some(name) = &playbook.name {
         println!("playbook: {name}");
     }

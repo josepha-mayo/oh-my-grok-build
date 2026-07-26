@@ -186,7 +186,7 @@ pub(crate) fn build_combine_prompt(results: &[String], original: &str) -> String
     prompt
 }
 
-pub(crate) fn parse_subtasks(raw: &str) -> Option<Vec<String>> {
+pub fn parse_subtasks(raw: &str) -> Option<Vec<String>> {
     let trimmed = raw.trim();
 
     fn try_array(s: &str) -> Option<Vec<String>> {

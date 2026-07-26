@@ -26,8 +26,10 @@ mod hashline;
 mod lsp;
 mod marketplace;
 mod memory;
+mod meta;
 mod moe;
 mod net;
+mod notifications;
 mod playbook;
 mod pr;
 mod prompt_guard;
@@ -40,6 +42,7 @@ mod skill;
 mod subagents;
 mod swarm;
 mod taste;
+mod threads;
 mod timeline;
 mod tool_overrides;
 mod tools;
@@ -235,6 +238,8 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Team(args) => run_team(args).await,
         OmgbCommand::Swarm(args) => run_swarm(args).await,
         OmgbCommand::Subagent(args) => run_subagent(args).await,
+        OmgbCommand::Thread(args) => threads::run_thread(args).await,
+        OmgbCommand::Meta(args) => meta::run_meta(args).await,
         OmgbCommand::Research(args) => {
             research::run_research(&args.topic, args.count, args.model, args.yolo, args.output)
                 .await
@@ -293,7 +298,7 @@ fn config_sandbox_profile() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn run_tui(args: TuiArgs) -> Result<()> {
+pub(crate) async fn run_tui(args: TuiArgs) -> Result<()> {
     let mut argv = vec!["omgb".to_string()];
     if let Some(m) = args.model {
         argv.push("--model".to_string());
@@ -809,8 +814,8 @@ async fn resolve_model_candidates(prompt: &str, explicit: Option<String>) -> Res
         .filter(|id| providers::is_local_provider_id(id))
         .collect();
     locals.sort_by(|a, b| {
-        moe::provider_cost(a)
-            .partial_cmp(&moe::provider_cost(b))
+        moe::provider_cost(a, None)
+            .partial_cmp(&moe::provider_cost(b, None))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.cmp(b))
     });

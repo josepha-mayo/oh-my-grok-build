@@ -1,0 +1,3 @@
+# Built guard binary — copy from target/{debug,release}/safe-shell-guard*
+safe-shell-guard
+safe-shell-guard.exe

@@ -21,7 +21,12 @@ impl ApiBackend {
 }
 
 #[derive(Debug, Parser, Clone)]
-#[command(name = "oh-my-grok-build", about = "Oh My Grok Build harness", version)]
+#[command(
+    name = "oh-my-grok-build",
+    about = "Oh My Grok Build harness",
+    version,
+    after_help = "Plugin slash commands in the TUI:\n  /autonomous, /browser, /btw, /byok, /live, /loop, /plan, /research, /schedule, /taste, /use, /workflow, /yolo"
+)]
 pub struct OmgbArgs {
     #[command(subcommand)]
     pub command: Option<OmgbCommand>,
@@ -52,6 +57,10 @@ pub enum OmgbCommand {
     Swarm(SwarmArgs),
     /// Spawn/list/kill/logs/trace subagents
     Subagent(SubagentArgs),
+    /// Multi-agent thread orchestration (cross-session visibility, prompting, model pick)
+    Thread(ThreadArgs),
+    /// Meta-harness: autonomous multi-agent planning, execution, and learning
+    Meta(MetaArgs),
     /// Deep arXiv / web research and patch proposal
     Research(ResearchArgs),
     /// Show recent session/job events
@@ -387,6 +396,104 @@ pub enum SubagentCommand {
     Logs { id: String },
     /// Trace subagent execution
     Trace { id: String },
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ThreadArgs {
+    #[command(subcommand)]
+    pub command: ThreadCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum ThreadCommand {
+    /// Create a new thread with an initial prompt
+    New(ThreadNewArgs),
+    /// List all visible threads
+    List,
+    /// Send a prompt to an existing thread
+    Prompt(ThreadPromptArgs),
+    /// Open a thread in the TUI
+    Chat { id: String },
+    /// Show the latest messages in a thread
+    Peek(ThreadPeekArgs),
+    /// Send a message from one thread to another's inbox
+    Send(ThreadSendArgs),
+    /// Show unread messages for a thread
+    Inbox { id: String },
+    /// List models the user has configured
+    Models,
+    /// Pick the best available model for a task
+    PickModel { task: String },
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ThreadSendArgs {
+    pub from: String,
+    pub to: String,
+    pub content: String,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ThreadNewArgs {
+    pub prompt: String,
+    #[arg(short, long)]
+    pub id: Option<String>,
+    #[arg(short, long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub yolo: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ThreadPromptArgs {
+    pub id: String,
+    pub prompt: String,
+    #[arg(short, long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub yolo: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ThreadPeekArgs {
+    pub id: String,
+    #[arg(short, long, default_value = "10")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct MetaArgs {
+    #[command(subcommand)]
+    pub command: MetaCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum MetaCommand {
+    /// Run a goal through the meta harness (plan, spawn threads, execute)
+    Run(MetaRunArgs),
+    /// List persisted meta plans
+    List,
+    /// Show a meta plan and its subtask status
+    Show { id: String },
+    /// Resume an existing meta plan
+    Resume { id: String },
+    /// Show recent meta-harness notifications
+    Notifications(MetaNotificationsArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct MetaRunArgs {
+    pub goal: String,
+    #[arg(short, long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub yolo: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct MetaNotificationsArgs {
+    #[arg(short, long, default_value = "20")]
+    pub limit: usize,
 }
 
 #[derive(Debug, Args, Clone)]

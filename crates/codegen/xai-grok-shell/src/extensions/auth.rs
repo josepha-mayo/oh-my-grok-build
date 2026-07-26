@@ -55,7 +55,7 @@ async fn handle_get_bearer_token(agent: &MvpAgent) -> ExtResult {
             .borrow()
             .api_key
             .clone()
-            .or_else(|| agent.auth_manager.current().map(|a| a.key)),
+            .or_else(|| agent.auth_manager.current_wire_valid().map(|a| a.key)),
     };
     ExtMethodResult::success(serde_json::json!({ "token": token }))
         .to_ext_response()

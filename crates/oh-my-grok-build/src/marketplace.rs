@@ -22,13 +22,16 @@ fn plugin_dir() -> Result<PathBuf> {
 }
 
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() {
+    if name.trim().is_empty() {
         bail!("plugin name must not be empty");
+    }
+    if name != name.trim() {
+        bail!("plugin name must not contain leading or trailing whitespace");
     }
     if name == "." || name == ".." {
         bail!("plugin name cannot be '.' or '..'");
     }
-    if name.contains(['/', '\\', ':', '\0']) {
+    if name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0']) {
         bail!("plugin name contains invalid characters: {name}");
     }
     Ok(())

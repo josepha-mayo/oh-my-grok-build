@@ -12,6 +12,7 @@ use anyhow::{Result, bail};
 use crate::providers::{
     ProviderConfig, add_discovered_providers, discover_local_models, env_var_name,
     is_local_provider_id, is_provider_reachable, is_valid_env_key, load_env_file, load_omg_config,
+    provider_template,
 };
 
 /// Approximate cost index per 1M tokens (input+output average) for known
@@ -123,12 +124,12 @@ const CODE_IDS: &[&str] = &[
     "cohere",
 ];
 
-pub fn provider_cost(id: &str) -> f64 {
+pub fn provider_cost(id: &str, base_url: Option<&str>) -> f64 {
+    if is_local_provider_id(id) || base_url.is_some_and(crate::net::is_url_host_loopback) {
+        return 0.0;
+    }
     if let Some((_, cost)) = COSTS.iter().find(|(k, _)| *k == id) {
         return *cost;
-    }
-    if is_local_provider_id(id) {
-        return 0.0;
     }
     5.0
 }
@@ -234,13 +235,23 @@ pub fn select_provider_from(available: &[String], task: &str) -> Result<String> 
         bail!("no providers available (set *_API_KEY or use a loopback local server)");
     }
 
+    let cfg = load_omg_config().unwrap_or_default();
     let task_lower = task.to_ascii_lowercase();
     let mut scored: Vec<(&String, f64, i32)> = available
         .iter()
         .map(|id| {
-            let cost = provider_cost(id);
+            let base_url = cfg
+                .providers
+                .get(id)
+                .map(|p| p.base_url.clone())
+                .or_else(|| provider_template(id).map(|t| t.base_url));
+            let cost = provider_cost(id, base_url.as_deref());
+            let is_local = is_local_provider_id(id)
+                || base_url
+                    .as_deref()
+                    .is_some_and(crate::net::is_url_host_loopback);
             let mut tie = 0;
-            if task_contains_word(&task_lower, "local") && is_local_provider_id(id) {
+            if task_contains_word(&task_lower, "local") && is_local {
                 tie += 3;
             }
             if task_contains_word(&task_lower, "fast") && is_fast_provider(id) {
@@ -335,29 +346,31 @@ mod tests {
 
     #[test]
     fn test_provider_cost_known_cloud() {
-        assert!((provider_cost("openai") - 6.25).abs() < 1e-9);
-        assert!((provider_cost("anthropic") - 9.0).abs() < 1e-9);
-        assert!((provider_cost("groq") - 0.69).abs() < 1e-9);
+        assert!((provider_cost("openai", None) - 6.25).abs() < 1e-9);
+        assert!((provider_cost("anthropic", None) - 9.0).abs() < 1e-9);
+        assert!((provider_cost("groq", None) - 0.69).abs() < 1e-9);
     }
 
     #[test]
     fn test_provider_cost_local_is_free() {
-        assert!((provider_cost("ollama") - 0.0).abs() < 1e-9);
-        assert!((provider_cost("jan") - 0.0).abs() < 1e-9);
+        assert!((provider_cost("ollama", None) - 0.0).abs() < 1e-9);
+        assert!((provider_cost("jan", None) - 0.0).abs() < 1e-9);
+        // Custom loopback endpoints are also treated as local regardless of id.
+        assert!((provider_cost("my-local", Some("http://localhost:8000/v1")) - 0.0).abs() < 1e-9);
     }
 
     #[test]
     fn test_provider_cost_unknown_defaults_to_five() {
-        assert!((provider_cost("some-unknown-cloud") - 5.0).abs() < 1e-9);
+        assert!((provider_cost("some-unknown-cloud", None) - 5.0).abs() < 1e-9);
     }
 
     #[test]
     fn test_provider_cost_cloud_harness_not_local() {
-        assert!((provider_cost("codex") - 3.75).abs() < 1e-9);
-        assert!((provider_cost("claude-code") - 9.0).abs() < 1e-9);
-        assert!((provider_cost("hermes") - 5.0).abs() < 1e-9);
-        assert!((provider_cost("opencode") - 5.0).abs() < 1e-9);
-        assert!((provider_cost("pi") - 5.0).abs() < 1e-9);
+        assert!((provider_cost("codex", None) - 3.75).abs() < 1e-9);
+        assert!((provider_cost("claude-code", None) - 9.0).abs() < 1e-9);
+        assert!((provider_cost("hermes", None) - 5.0).abs() < 1e-9);
+        assert!((provider_cost("opencode", None) - 5.0).abs() < 1e-9);
+        assert!((provider_cost("pi", None) - 5.0).abs() < 1e-9);
     }
 
     #[test]
