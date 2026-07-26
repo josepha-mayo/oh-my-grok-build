@@ -1074,10 +1074,11 @@ pub(crate) async fn run_single_turn_capture(
 }
 
 async fn last_assistant_text_for_session(session_id: &str) -> Result<String> {
-    let path = xai_grok_shell::session::persistence::find_session_dir_by_id(session_id)
-        .ok_or_else(|| anyhow::anyhow!("session '{session_id}' not found"))?
-        .join("chat_history.jsonl");
+    let session_dir = xai_grok_shell::session::persistence::find_session_dir_by_id(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session '{session_id}' not found"))?;
+    let path = session_dir.join("chat_history.jsonl");
     if !path.is_file() {
+        let _ = tokio::fs::remove_dir_all(&session_dir).await;
         bail!("session '{session_id}' has no chat history");
     }
     let raw = tokio::fs::read_to_string(&path)
@@ -1095,6 +1096,7 @@ async fn last_assistant_text_for_session(session_id: &str) -> Result<String> {
             text = a.content.as_ref().to_string();
         }
     }
+    let _ = tokio::fs::remove_dir_all(&session_dir).await;
     if text.is_empty() {
         bail!("no assistant response in session '{session_id}'");
     }

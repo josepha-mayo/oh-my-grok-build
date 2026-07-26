@@ -8,7 +8,7 @@
 //! agents ask each other directly without spawning reply loops.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -98,9 +98,11 @@ fn load_messages(id: &str) -> Result<Vec<GroupMessage>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let file = std::fs::OpenOptions::new().read(true).open(&path)?;
+    let mut file = std::fs::OpenOptions::new().read(true).open(&path)?;
     file.lock_shared()?;
-    let raw = std::fs::read_to_string(&path)?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .with_context(|| format!("read {}", path.display()))?;
     drop(file);
     raw.lines()
         .map(|l| l.trim())
