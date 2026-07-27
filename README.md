@@ -49,8 +49,8 @@ omgb research "quantum error correction" --count 5 --model omgb-openai
 Start the WebSocket relay server:
 
 ```bash
-omgb serve --bind 0.0.0.0:9999
-omgb connect ws://127.0.0.1:9999
+omgb serve --bind 0.0.0.0:9999 --insecure-allow-lan
+omgb connect ws://127.0.0.1:9999 --secret <pairing-secret>
 ```
 
 ## Configuration
@@ -68,7 +68,7 @@ omgb connect ws://127.0.0.1:9999
 | `omgb exec "<prompt>"` | Run a single headless turn. Use `--output-file` to capture stdout, `--yolo` to auto-approve tools. |
 | `omgb tui` | Start the Grok pager UI. |
 | `omgb provider list|catalog|add|remove|discover|test` | Manage 100+ BYOK/local provider templates and keys, including Ollama, LM Studio, vLLM, and SGLang. |
-| `omgb model switch <provider>` | Set the default model (provider id or `omgb-<id>`). |
+| `omgb model switch <model>` | Set the default model (provider id or `omgb-<id>`). |
 | `omgb research "<topic>"` | Search arXiv and, if `--model` is given, generate a `.patch`. |
 | `omgb loop "<prompt>"` | Iterate until the git working tree is clean (anti-loop guard). |
 | `omgb swarm "<prompt>"` | Parallel subagents with task splitting and majority-vote fallback. |
@@ -98,7 +98,7 @@ npx expo start
 
 - Provider API keys are written to `~/.omgb/.env` with `0600` permissions on Unix.
 - Outgoing HTTP requests are pinned to resolved public IPs and redirects are disabled to mitigate SSRF.
-- `omgb use` and `omgb browser` require explicit desktop-control gating.
+- `omgb use` and `omgb browser` require explicit desktop-control gating (`--yolo` and `OMGB_ALLOW_DESKTOP_CONTROL=1`).
 - Shell commands passed through Grok's `run_terminal_cmd` are validated by `plugin/bin/safe-shell-guard`.
 - Telemetry and upstream feedback are disabled by default; use `omgb feedback` to submit issues via GitHub.
 

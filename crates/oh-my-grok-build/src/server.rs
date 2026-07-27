@@ -674,10 +674,15 @@ fn extract_server_token(query: &ServerTokenQuery, headers: &HeaderMap) -> String
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty())
     {
         return t.to_string();
     }
-    if let Some(t) = headers.get("x-server-token").and_then(|v| v.to_str().ok()) {
+    if let Some(t) = headers
+        .get("x-server-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
         return t.to_string();
     }
     if let Some(t) = query.server_key.as_deref()
@@ -690,7 +695,11 @@ fn extract_server_token(query: &ServerTokenQuery, headers: &HeaderMap) -> String
 
 fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
     for header in ["x-member-token", "x-group-token"] {
-        if let Some(t) = headers.get(header).and_then(|v| v.to_str().ok()) {
+        if let Some(t) = headers
+            .get(header)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+        {
             return t.to_string();
         }
     }
@@ -698,6 +707,7 @@ fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty())
     {
         return t.to_string();
     }
@@ -707,6 +717,11 @@ fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
         return t.to_string();
     }
     String::new()
+}
+
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn group_token_valid(group: &crate::group::Group, token: &str) -> bool {
@@ -1031,6 +1046,9 @@ async fn group_list_joins_handler(
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg.to_string()));
     }
+    if let Err(e) = crate::threads::validate_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
     let token = extract_group_token(&query, &headers);
     let group = crate::group::load_group_async(&id)
         .await
@@ -1061,6 +1079,9 @@ async fn group_request_join_handler(
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg.to_string()));
     }
+    if let Err(e) = crate::threads::validate_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
     let token = extract_group_token(&query, &headers);
     let group = crate::group::load_group_async(&id)
         .await
@@ -1074,52 +1095,79 @@ async fn group_request_join_handler(
         .as_deref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    if name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "missing name".to_string()));
+    if let Err(e) = crate::group::validate_human_name(&name) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
     }
 
-    let result = crate::group::modify_group_async(&id, move |group| {
-        if group.members.is_empty() {
+    let result = if group.members.is_empty() {
+        let name = name.clone();
+        let github = github.clone();
+        crate::group::modify_group_async(&id, move |group| {
             let token = crate::group::ensure_local_member(group, &name)?;
-            return Ok(crate::group::JoinResult {
+            Ok(crate::group::JoinResult {
                 id: String::new(),
                 status: "approved".to_string(),
                 name: name.clone(),
                 github: github.clone(),
                 member_token: Some(token),
                 pre_auth_token: None,
-            });
-        }
-        if crate::group::is_member(group, &name) {
-            return Ok(crate::group::JoinResult {
-                id: String::new(),
-                status: "member".to_string(),
-                name: name.clone(),
-                github: github.clone(),
-                member_token: None,
-                pre_auth_token: None,
-            });
-        }
-        let request_id = crate::group::add_join_request(group, &name, github.as_deref())?;
-        let pre_auth = group
-            .pending_joins
-            .iter()
-            .find(|r| r.id == request_id)
-            .and_then(|r| r.pre_auth_token.clone());
-        Ok(crate::group::JoinResult {
-            id: request_id,
-            status: "pending".to_string(),
-            name: name.clone(),
-            github,
-            member_token: None,
-            pre_auth_token: pre_auth,
+            })
         })
-    })
-    .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    } else if crate::group::is_member(&group, &name) {
+        crate::group::JoinResult {
+            id: String::new(),
+            status: "member".to_string(),
+            name: name.clone(),
+            github: github.clone(),
+            member_token: None,
+            pre_auth_token: None,
+        }
+    } else {
+        let name = name.clone();
+        let github = github.clone();
+        crate::group::modify_group_async(&id, move |group| {
+            let request_id = crate::group::add_join_request(group, &name, github.as_deref())?;
+            let pre_auth = group
+                .pending_joins
+                .iter()
+                .find(|r| r.id == request_id)
+                .and_then(|r| r.pre_auth_token.clone());
+            Ok(crate::group::JoinResult {
+                id: request_id,
+                status: "pending".to_string(),
+                name: name.clone(),
+                github,
+                member_token: None,
+                pre_auth_token: pre_auth,
+            })
+        })
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    };
 
     Ok(Json(result))
 }
+
+#[derive(Debug)]
+enum ApproveJoinError {
+    InvalidToken,
+    RequestNotFound,
+    BadRequest(String),
+}
+
+impl std::fmt::Display for ApproveJoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidToken => f.write_str("a valid member token is required to approve"),
+            Self::RequestNotFound => f.write_str("join request not found"),
+            Self::BadRequest(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for ApproveJoinError {}
 
 async fn group_approve_join_handler(
     Path((id, request_id)): Path<(String, String)>,
@@ -1137,35 +1185,52 @@ async fn group_approve_join_handler(
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg.to_string()));
     }
-    let token = extract_group_token(&query, &headers);
-    let group = crate::group::load_group_async(&id)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
-    let _approver = crate::group::validate_member_token(&group, &token).ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            "a valid member token is required to approve".to_string(),
-        )
-    })?;
+    if let Err(e) = crate::threads::validate_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
+    if let Err(e) = crate::threads::validate_id(&request_id) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
 
-    let pre_auth = group
-        .pending_joins
-        .iter()
-        .find(|r| r.id == request_id)
-        .and_then(|r| r.pre_auth_token.clone())
-        .unwrap_or_default();
+    let token = extract_group_token(&query, &headers);
 
     let modify_request_id = request_id.clone();
     let (name, member_token) = crate::group::modify_group_async(&id, move |group| {
-        crate::group::approve_join_request(group, &modify_request_id, &pre_auth)
+        if crate::group::validate_member_token(group, &token).is_none() {
+            return Err(ApproveJoinError::InvalidToken.into());
+        }
+        let pre_auth = group
+            .pending_joins
+            .iter()
+            .find(|r| r.id == modify_request_id)
+            .and_then(|r| r.pre_auth_token.clone())
+            .unwrap_or_default();
+        crate::group::approve_join_request(group, &modify_request_id, &pre_auth).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                ApproveJoinError::RequestNotFound.into()
+            } else {
+                ApproveJoinError::BadRequest(msg).into()
+            }
+        })
     })
     .await
     .map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            (StatusCode::NOT_FOUND, msg)
+        if is_not_found(&e) {
+            return (StatusCode::NOT_FOUND, "group not found".to_string());
+        }
+        if let Some(ae) = e.downcast_ref::<ApproveJoinError>() {
+            match ae {
+                ApproveJoinError::InvalidToken => (StatusCode::UNAUTHORIZED, ae.to_string()),
+                ApproveJoinError::RequestNotFound => (StatusCode::NOT_FOUND, ae.to_string()),
+                ApproveJoinError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            }
         } else {
-            (StatusCode::BAD_REQUEST, msg)
+            warn!("approve join request failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to approve join request".to_string(),
+            )
         }
     })?;
 
@@ -1213,6 +1278,12 @@ async fn group_join_status_handler(
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg.to_string()));
     }
+    if let Err(e) = crate::threads::validate_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
+    if let Err(e) = crate::threads::validate_id(&request_id) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
 
     let pre_auth = extract_pre_auth(&headers).ok_or_else(|| {
         (
@@ -1225,52 +1296,65 @@ async fn group_join_status_handler(
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
-    if group.approved_member_tokens.contains_key(&pre_auth) {
+    if let Some(token) = group.approved_member_tokens.get(&pre_auth) {
+        let token = token.clone();
+        let name = group
+            .member_token_index
+            .get(&token)
+            .cloned()
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "member token index inconsistent".to_string(),
+                )
+            })?;
         let pre_auth_for_modify = pre_auth.clone();
-        let (member_name, member_token) = crate::group::modify_group_async(&id, move |g| {
-            let token = g.approved_member_tokens.remove(&pre_auth_for_modify);
-            let name = token
-                .as_ref()
-                .and_then(|t| g.member_token_index.get(t))
-                .cloned()
-                .unwrap_or_default();
-            Ok((name, token))
+        crate::group::modify_group_async(&id, move |g| {
+            if g.approved_member_tokens
+                .remove(&pre_auth_for_modify)
+                .is_none()
+            {
+                bail!("join request not found")
+            }
+            Ok(())
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to consume approval".to_string(),
-            )
+        .map_err(|e| {
+            if e.to_string().contains("join request not found") {
+                (StatusCode::NOT_FOUND, "join request not found".to_string())
+            } else {
+                warn!("group join status failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to consume approval".to_string(),
+                )
+            }
         })?;
-        if let Some(token) = member_token {
-            return Ok(Json(crate::group::JoinResult {
-                id: request_id,
-                status: "approved".to_string(),
-                name: member_name,
-                github: None,
-                member_token: Some(token),
-                pre_auth_token: None,
-            }));
-        }
-    }
-
-    if let Some(req) = group
+        Ok(Json(crate::group::JoinResult {
+            id: request_id,
+            status: "approved".to_string(),
+            name,
+            github: None,
+            member_token: Some(token),
+            pre_auth_token: None,
+        }))
+    } else if let Some(req) = group
         .pending_joins
         .iter()
-        .find(|r| r.id == request_id && r.pre_auth_token.as_deref() == Some(&pre_auth))
+        .find(|r| r.id == request_id && r.pre_auth_token.as_deref() == Some(pre_auth.as_str()))
     {
-        return Ok(Json(crate::group::JoinResult {
+        Ok(Json(crate::group::JoinResult {
             id: request_id,
             status: "pending".to_string(),
             name: req.name.clone(),
-            github: None,
+            github: req.github.clone(),
             member_token: None,
             pre_auth_token: None,
-        }));
+        }))
+    } else {
+        Err((StatusCode::NOT_FOUND, "join request not found".to_string()))
     }
-
-    Err((StatusCode::NOT_FOUND, "join request not found".to_string()))
 }
 
 #[derive(Deserialize)]
@@ -1879,5 +1963,52 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(read_persisted_secret(&link).is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extract_group_token_ignores_empty_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-member-token", "".parse().unwrap());
+        headers.insert("authorization", "Bearer bearer-token".parse().unwrap());
+        let query = GroupTokenQuery { token: None };
+        assert_eq!(extract_group_token(&query, &headers), "bearer-token");
+    }
+
+    #[test]
+    fn extract_group_token_falls_back_to_query() {
+        let headers = HeaderMap::new();
+        let query = GroupTokenQuery {
+            token: Some("query-token".into()),
+        };
+        assert_eq!(extract_group_token(&query, &headers), "query-token");
+    }
+
+    #[test]
+    fn extract_pre_auth_from_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer pre-auth-token".parse().unwrap());
+        assert_eq!(
+            extract_pre_auth(&headers),
+            Some("pre-auth-token".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_group_token_skips_empty_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        let query = GroupTokenQuery {
+            token: Some("query-token".into()),
+        };
+        assert_eq!(extract_group_token(&query, &headers), "query-token");
+    }
+
+    #[test]
+    fn is_not_found_detects_io_not_found() {
+        let path = std::env::temp_dir().join(format!("omgb-missing-{}", uuid::Uuid::new_v4()));
+        let err = std::fs::read_to_string(&path)
+            .context("read temp")
+            .unwrap_err();
+        assert!(is_not_found(&err));
     }
 }

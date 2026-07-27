@@ -1621,7 +1621,7 @@ async fn approve_local(id: &str, request_id: &str, args: &GroupApproveArgs) -> R
     let (name, member_token) = modify_group_async(id, move |group| {
         if let Some(member_name) = validate_member_token(group, &token) {
             if !name_eq(&approver, &member_name) {
-                bail!("token belongs to member '{member_name}', not '{approver}'");
+                bail!("token does not match approver '{approver}'");
             }
         } else {
             bail!("invalid member token");

@@ -88,6 +88,9 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/josepha-mayo/oh-my-grok-build"
+homepage = "https://github.com/josepha-mayo/oh-my-grok-build"
+documentation = "https://github.com/josepha-mayo/oh-my-grok-build#readme"
 
 [workspace.dependencies]
 agent-client-protocol = { version = "0.10.4", features = ["unstable"] }

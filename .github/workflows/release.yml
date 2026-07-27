@@ -6,33 +6,40 @@ on:
       - 'v*'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: omgb
-            guard: safe-shell-guard
+            ext: ""
+            archive: omgb-x86_64-unknown-linux-gnu.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            binary: omgb
-            guard: safe-shell-guard
+            ext: ""
+            archive: omgb-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: omgb.exe
-            guard: safe-shell-guard.exe
+            ext: ".exe"
+            archive: omgb-x86_64-pc-windows-msvc.tar.gz
 
     steps:
       - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.92.0"
           targets: ${{ matrix.target }}
       - uses: swatinem/rust-cache@v2
 
@@ -43,21 +50,31 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release-dist/${{ matrix.binary }} dist/omgb-${{ matrix.target }}${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}
-          cp target/${{ matrix.target }}/release-dist/${{ matrix.guard }} dist/safe-shell-guard-${{ matrix.target }}${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}
-          cp -r plugin dist/plugin-${{ matrix.target }}
-          mkdir -p dist/plugin-${{ matrix.target }}/bin
-          cp target/${{ matrix.target }}/release-dist/${{ matrix.guard }} dist/plugin-${{ matrix.target }}/bin/safe-shell-guard${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}
+          cp "target/${{ matrix.target }}/release-dist/omgb${{ matrix.ext }}" "dist/omgb-${{ matrix.target }}${{ matrix.ext }}"
+          cp "target/${{ matrix.target }}/release-dist/safe-shell-guard${{ matrix.ext }}" "dist/safe-shell-guard-${{ matrix.target }}${{ matrix.ext }}"
+          cp -r plugin "dist/plugin-${{ matrix.target }}"
+          mkdir -p "dist/plugin-${{ matrix.target }}/bin"
+          cp "target/${{ matrix.target }}/release-dist/safe-shell-guard${{ matrix.ext }}" "dist/plugin-${{ matrix.target }}/bin/safe-shell-guard${{ matrix.ext }}"
+          cd dist
+          tar czf "${{ matrix.archive }}" "omgb-${{ matrix.target }}${{ matrix.ext }}" "safe-shell-guard-${{ matrix.target }}${{ matrix.ext }}" "plugin-${{ matrix.target }}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/${{ matrix.archive }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: omgb-${{ matrix.target }}
-          path: dist/*
+          path: dist/${{ matrix.archive }}
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
@@ -65,6 +82,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: omgb-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum -b omgb-*.tar.gz > checksums-sha256.txt
+          sha512sum -b omgb-*.tar.gz > checksums-sha512.txt
 
       - name: Create GitHub Release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

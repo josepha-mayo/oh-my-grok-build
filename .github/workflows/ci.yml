@@ -9,20 +9,20 @@ on:
 jobs:
   rust:
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            # Upstream codegen clippy still compiles on Unix; test only omgb.
             clippy: cargo clippy --workspace --all-targets
             test: cargo test -p oh-my-grok-build
           - os: macos-latest
             clippy: cargo clippy --workspace --all-targets
             test: cargo test -p oh-my-grok-build
           - os: windows-latest
-            # Upstream codegen crates still contain Unix-only tests/examples.
-            # Validate the omgb crate (which is intended to be cross-platform).
             clippy: cargo clippy -p oh-my-grok-build --all-targets
             test: cargo test -p oh-my-grok-build
     steps:
@@ -32,8 +32,11 @@ jobs:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
       - uses: swatinem/rust-cache@v2
-      - run: cargo fmt --check
+      - run: cargo fmt --check -p oh-my-grok-build
       - run: ${{ matrix.clippy }}
       - run: ${{ matrix.test }}
       - name: Build and install safe-shell-guard hook binary
@@ -44,3 +47,19 @@ jobs:
           for f in target/debug/safe-shell-guard target/debug/safe-shell-guard.exe; do
             if [ -f "$f" ]; then cp "$f" plugin/bin/; fi
           done
+
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - uses: swatinem/rust-cache@v2
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -3,7 +3,12 @@ name = "oh-my-grok-build"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "Opinionated productivity, orchestration, and mobile-relay layer on top of Grok Build."
+keywords = ["cli", "ai", "agent", "grok", "xai"]
+categories = ["command-line-utilities", "development-tools"]
 default-run = "omgb"
 
 [dependencies]
