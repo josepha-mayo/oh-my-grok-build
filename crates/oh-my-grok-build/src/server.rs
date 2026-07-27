@@ -862,6 +862,9 @@ async fn group_info_handler(
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg));
     }
+    if crate::threads::validate_id(&id).is_err() {
+        return Err((StatusCode::BAD_REQUEST, "invalid group id"));
+    }
     let token = extract_group_token(&query, &headers);
     let group = crate::group::load_group_async(&id)
         .await
@@ -917,6 +920,9 @@ async fn group_list_messages_handler(
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg));
     }
+    if crate::threads::validate_id(&id).is_err() {
+        return Err((StatusCode::BAD_REQUEST, "invalid group id"));
+    }
     let token = extract_group_token(&query, &headers);
     let group = crate::group::load_group_async(&id)
         .await
@@ -946,6 +952,9 @@ async fn group_post_message_handler(
     if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg.to_string()));
+    }
+    if let Err(e) = crate::threads::validate_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
     }
     let token = extract_group_token(&query, &headers);
     let group = crate::group::load_group_async(&id)
