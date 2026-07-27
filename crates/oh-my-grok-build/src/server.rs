@@ -988,19 +988,19 @@ async fn group_post_message_handler(
             )
         })?;
 
-    // Trigger agent dispatch off the response path. We run it on a blocking
-    // thread with block_on because the upstream headless turn uses non-Send
-    // auth state; this also lets the HTTP response return immediately.
-    let runtime_handle = tokio::runtime::Handle::current();
+    // Trigger agent dispatch off the response path. dispatch_for_message is
+    // Send, so spawn it as an async task and return the HTTP response immediately.
     let group_for_dispatch = group.clone();
     let trigger_for_dispatch = message.clone();
     let sender_for_dispatch = message.sender.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = runtime_handle.block_on(crate::group::dispatch_for_message(
+    tokio::spawn(async move {
+        if let Err(e) = crate::group::dispatch_for_message(
             group_for_dispatch,
             trigger_for_dispatch,
             sender_for_dispatch,
-        )) {
+        )
+        .await
+        {
             eprintln!("warning: group dispatch failed: {e}");
         }
     });
@@ -1342,13 +1342,11 @@ async fn group_remote_agent_message_handler(
         )
     })?;
     let trigger_for_dispatch = message.clone();
-    let runtime_handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = runtime_handle.block_on(crate::group::dispatch_for_message(
-            group_for_dispatch,
-            trigger_for_dispatch,
-            agent_name,
-        )) {
+    tokio::spawn(async move {
+        if let Err(e) =
+            crate::group::dispatch_for_message(group_for_dispatch, trigger_for_dispatch, agent_name)
+                .await
+        {
             eprintln!("warning: remote agent dispatch failed: {e}");
         }
     });

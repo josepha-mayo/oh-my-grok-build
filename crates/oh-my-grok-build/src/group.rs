@@ -938,6 +938,16 @@ fn show_group(id: &str) -> Result<()> {
             println!("  {} ({}) — {}", r.name, r.model, r.role);
         }
     }
+    if !group.members.is_empty() {
+        println!("members: {}", group.members.join(", "));
+    }
+    if !group.pending_joins.is_empty() {
+        println!("pending join requests:");
+        for r in &group.pending_joins {
+            let gh = r.github.as_deref().unwrap_or("-");
+            println!("  {}: {} (github: {})", r.id, r.name, gh);
+        }
+    }
     let messages = load_messages(id)?;
     if !messages.is_empty() {
         println!("\nmessages (last {} shown):", messages.len().min(30));
@@ -1092,19 +1102,11 @@ async fn send(id: &str, _token: &str, message: &GroupMessage) -> Result<()> {
     }
     let group = load_group_async(id).await?;
     add_message_async(&group.id, message).await?;
-    let trigger_for_dispatch = message.clone();
-    let sender = trigger_for_dispatch.sender.clone();
-    let group_for_dispatch = group.clone();
-    let runtime_handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = runtime_handle.block_on(dispatch_for_message(
-            group_for_dispatch,
-            trigger_for_dispatch,
-            sender,
-        )) {
-            eprintln!("warning: group dispatch failed: {e}");
-        }
-    });
+    if let Err(e) =
+        dispatch_for_message(group.clone(), message.clone(), message.sender.clone()).await
+    {
+        eprintln!("warning: group dispatch failed: {e}");
+    }
     println!("sent message to group {} ({})", group.id, group.name);
     Ok(())
 }
@@ -1688,21 +1690,14 @@ async fn dispatch_turn(
 
     let agent_names = all_agent_names(group);
     let prompt = build_routing_prompt(group, &messages[..=idx], trigger, human_name);
-    let reply = match crate::run_single_turn_capture(
-        &prompt,
-        Some(group.model.clone()),
-        yolo,
-        Some(1),
-        None,
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("warning: group routing failed: {e}");
-            return Ok(());
-        }
-    };
+    let reply =
+        match run_single_turn_capture_blocking(prompt, Some(group.model.clone()), yolo).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("warning: group routing failed: {e}");
+                return Ok(());
+            }
+        };
 
     let replies: Vec<_> = parse_replies(&reply, &agent_names)
         .into_iter()
@@ -1738,7 +1733,7 @@ async fn dispatch_turn(
                 format_history(&messages, HISTORY_LIMIT)
             );
             let model = agent_model(group, &agent.name);
-            match crate::run_single_turn_capture(&prompt, Some(model), yolo, Some(1), None).await {
+            match run_single_turn_capture_blocking(prompt, Some(model), yolo).await {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("warning: agent {name} reply failed: {e}");
@@ -1821,7 +1816,7 @@ async fn dispatch_turn(
                 context
             );
             let model = agent_model(group, &agent.name);
-            match crate::run_single_turn_capture(&prompt, Some(model), yolo, Some(1), None).await {
+            match run_single_turn_capture_blocking(prompt, Some(model), yolo).await {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("warning: mention reply failed: {e}");
@@ -1854,6 +1849,26 @@ async fn dispatch_turn(
     }
 
     Ok(())
+}
+
+/// Run the headless single-turn capture on a blocking thread so the
+/// non-Send auth/session state stays off the async worker threads.
+async fn run_single_turn_capture_blocking(
+    prompt: String,
+    model: Option<String>,
+    yolo: bool,
+) -> Result<String> {
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(crate::run_single_turn_capture(
+            &prompt,
+            model,
+            yolo,
+            Some(1),
+            None,
+        ))
+    })
+    .await
+    .context("single turn capture task failed")?
 }
 
 /// Dispatch agent replies for a single message, seeding `seen` with existing
