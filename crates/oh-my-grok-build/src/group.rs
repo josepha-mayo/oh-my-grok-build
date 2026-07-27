@@ -882,6 +882,7 @@ async fn new_group(args: &GroupNewArgs) -> Result<()> {
         "invite link:  omgb://group/{}?token={}",
         group.id, group.invite_token
     );
+    println!("invite cmd:   omgb group invite {}", group.id);
     if let Ok(remote) = std::env::var("OMGB_REMOTE") {
         let remote = remote.trim_end_matches('/');
         println!(
@@ -965,10 +966,15 @@ fn invite(id: &str) -> Result<()> {
         "share this invite link with humans/agents to join group {}:\n",
         group.name
     );
+    println!("  omgb group join {id} --token {}", group.invite_token);
     println!("  omgb://group/{id}?token={}", group.invite_token);
     if let Ok(remote) = std::env::var("OMGB_REMOTE") {
         let remote = remote.trim_end_matches('/');
         println!("  {remote}/group/{id}?token={}", group.invite_token);
+        println!(
+            "  omgb group join {id} --token {} --remote {remote}",
+            group.invite_token
+        );
     }
     Ok(())
 }
