@@ -965,7 +965,7 @@ pub(crate) async fn run_single_turn_with(
         }
     }
 
-    let mut last_result: Result<()> = Ok(());
+    let mut last_result: Result<()> = Err(anyhow::anyhow!("no usable model candidates"));
     let mut errors: Vec<String> = Vec::new();
     for m in &candidates {
         let provider_id = m.strip_prefix("omgb-").unwrap_or(m);

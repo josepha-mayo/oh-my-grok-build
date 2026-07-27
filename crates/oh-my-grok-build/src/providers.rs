@@ -291,7 +291,11 @@ pub(crate) fn write_file_atomic(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent)?;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().to_string().replace('-', "")
+    ));
     let write = || -> Result<()> {
         std::fs::write(&tmp, content.as_ref())?;
         if restrict {
@@ -640,6 +644,57 @@ pub fn remove_provider(id: &str) -> Result<()> {
 
 pub(crate) fn provider_template(id: &str) -> Option<ProviderConfig> {
     catalog::provider_template(id)
+}
+
+fn model_alias_to_provider(model: &str) -> Option<&'static str> {
+    match model.to_ascii_lowercase().as_str() {
+        "grok" | "grok-3" | "grok3" | "grok-4" | "grok4" | "grok-4.5" | "grok4.5" => Some("xai"),
+        "gpt" | "gpt-4" | "gpt4" | "gpt-4o" | "gpt4o" | "gpt-4o-mini" | "gpt4omini"
+        | "gpt-4-turbo" | "gpt4turbo" => Some("openai"),
+        "claude"
+        | "claude-3"
+        | "claude3"
+        | "claude-3-5"
+        | "claude3.5"
+        | "claude-3-5-sonnet"
+        | "claude-3.5-sonnet"
+        | "claude-3-5-sonnet-20241022" => Some("anthropic"),
+        "llama"
+        | "llama-3"
+        | "llama3"
+        | "llama-3.3"
+        | "llama-3.3-70b"
+        | "llama-3.3-70b-versatile" => Some("groq"),
+        "gemini" | "gemini-1.5" | "gemini-1.5-flash" => Some("gemini"),
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_model_to_provider(model: &str) -> Option<String> {
+    let m = model.trim();
+    if m.is_empty() {
+        return None;
+    }
+    // Provider id/template id takes precedence so exact ids (e.g. "openai")
+    // are never misinterpreted.
+    let id = sanitize_provider_id(m);
+    if get_provider(&id).ok().flatten().is_some() || provider_template(&id).is_some() {
+        return Some(id);
+    }
+    // Canonical aliases come next; they resolve ambiguous model strings
+    // (e.g. "gpt-4o" or "claude-3-5-sonnet-20241022") to the canonical
+    // provider instead of whichever third-party template happens to be first
+    // in the catalog.
+    if let Some(alias) = model_alias_to_provider(m) {
+        return Some(alias.into());
+    }
+    // Last resort: exact template model string match.
+    for t in catalog::TEMPLATES {
+        if t.model.eq_ignore_ascii_case(m) {
+            return Some(t.id.into());
+        }
+    }
+    None
 }
 
 pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {

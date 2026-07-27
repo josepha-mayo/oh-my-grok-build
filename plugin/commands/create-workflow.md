@@ -7,8 +7,9 @@ allowed-tools: run_terminal_cmd
 # /create-workflow — generate a reusable workflow
 
 1. Capture the user's plain-English task or objective.
-2. Run `omgb workflow create "<task>" [--name <name>] [--model <model>] [--yolo]`.
-   - The planner will produce a workflow with `exec`, `fan_out`, and `shell` steps.
+2. Run `omgb workflow create "<task>" [--name <name>] [--model <provider-id>] [--yolo]`.
+   - `<provider-id>` should be a configured provider id (e.g. `xai`, `openai`) or a known model name.
+   - The planner will produce a workflow with `exec`, `fan_out`, and `shell` steps; `max_turns` defaults to 10 for `exec` and 5 for `fan_out`.
 3. Smoke-check the generated workflow by loading it with `omgb workflow show <name>` or `omgb workflow run <name> --dry-run`.
 4. If `--dry-run` was used, review the plan with the user before saving.
 5. Saved workflows live in `~/.omgb/workflows/` and can be invoked with `/workflow <name>`.

@@ -19,7 +19,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
@@ -571,7 +571,10 @@ struct GroupInfo {
     description: String,
     model: String,
     yolo: bool,
+    host_name: String,
     agents: Vec<crate::group::Agent>,
+    members: Vec<String>,
+    pending_joins: Vec<crate::group::JoinRequest>,
 }
 
 #[derive(Deserialize)]
@@ -581,12 +584,83 @@ struct GroupMessagePayload {
     kind: crate::group::MessageKind,
 }
 
-fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
-    if let Some(t) = query.token.as_deref()
+#[derive(Deserialize)]
+struct CreateGroupPayload {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    human_name: Option<String>,
+    #[serde(default)]
+    yolo: bool,
+}
+
+#[derive(Serialize)]
+struct CreateGroupResponse {
+    id: String,
+    token: String,
+    name: String,
+    description: String,
+    model: String,
+    yolo: bool,
+    host_name: String,
+    agents: Vec<crate::group::Agent>,
+    members: Vec<String>,
+    pending_joins: Vec<crate::group::JoinRequest>,
+}
+
+#[derive(Deserialize)]
+struct CreateWorkflowPayload {
+    prompt: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    yolo: bool,
+}
+
+#[derive(Serialize)]
+struct CreateWorkflowResponse {
+    name: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ServerTokenQuery {
+    server_key: Option<String>,
+}
+
+fn extract_server_token(query: &ServerTokenQuery, headers: &HeaderMap) -> String {
+    if let Some(t) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return t.to_string();
+    }
+    if let Some(t) = headers.get("x-server-token").and_then(|v| v.to_str().ok()) {
+        return t.to_string();
+    }
+    if let Some(t) = query.server_key.as_deref()
         && !t.is_empty()
     {
         return t.to_string();
     }
+    String::new()
+}
+
+fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
     if let Some(t) = headers.get("x-group-token").and_then(|v| v.to_str().ok()) {
         return t.to_string();
     }
@@ -597,11 +671,120 @@ fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
     {
         return t.to_string();
     }
+    if let Some(t) = query.token.as_deref()
+        && !t.is_empty()
+    {
+        return t.to_string();
+    }
     String::new()
 }
 
 fn group_token_valid(group: &crate::group::Group, token: &str) -> bool {
     constant_time_eq::constant_time_eq(group.invite_token.as_bytes(), token.as_bytes())
+}
+
+fn server_token_valid(state: &ProxyState, token: &str) -> bool {
+    constant_time_eq::constant_time_eq(
+        state.secret_hash.as_ref(),
+        blake3::hash(token.as_bytes()).as_bytes(),
+    )
+}
+
+async fn admin_create_group_handler(
+    Query(query): Query<ServerTokenQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<CreateGroupPayload>,
+) -> Result<Json<CreateGroupResponse>, (StatusCode, String)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, msg);
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg.to_string()));
+    }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, msg);
+        return Err((StatusCode::FORBIDDEN, msg.to_string()));
+    }
+    let token = extract_server_token(&query, &headers);
+    if !server_token_valid(&state, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid server token".to_string()));
+    }
+
+    let args = crate::args::GroupNewArgs {
+        name: payload.name,
+        description: Some(payload.description).filter(|d| !d.is_empty()),
+        count: payload.count,
+        model: payload.model,
+        names: payload.names,
+        roles: payload.roles,
+        models: payload.models,
+        human_name: payload.human_name.filter(|h| !h.is_empty()),
+        yolo: payload.yolo,
+    };
+
+    let spec = crate::group::validate_group_create(&args)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let group = tokio::task::spawn_blocking(move || crate::group::build_group(&args, spec))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(CreateGroupResponse {
+        id: group.id,
+        token: group.invite_token,
+        name: group.name,
+        description: group.description,
+        model: group.model,
+        yolo: group.yolo,
+        host_name: group.host_name,
+        agents: group.agents,
+        members: group.members,
+        pending_joins: group.pending_joins,
+    }))
+}
+
+async fn admin_create_workflow_handler(
+    Query(query): Query<ServerTokenQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<CreateWorkflowPayload>,
+) -> Result<Json<CreateWorkflowResponse>, (StatusCode, String)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, msg);
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg.to_string()));
+    }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, msg);
+        return Err((StatusCode::FORBIDDEN, msg.to_string()));
+    }
+    let token = extract_server_token(&query, &headers);
+    if !server_token_valid(&state, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid server token".to_string()));
+    }
+
+    let args = crate::args::WorkflowCreateArgs {
+        prompt: payload.prompt,
+        name: payload.name,
+        model: payload.model,
+        yolo: payload.yolo,
+        dry_run: false,
+    };
+
+    let (name, path) = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(crate::workflow::create_workflow(&args))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(CreateWorkflowResponse {
+        name,
+        path: path.to_string_lossy().into_owned(),
+    }))
 }
 
 async fn group_info_handler(
@@ -616,6 +799,10 @@ async fn group_info_handler(
         warn!("Rate limit exceeded for {}: {}", addr, msg);
         return Err((StatusCode::TOO_MANY_REQUESTS, msg));
     }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, msg);
+        return Err((StatusCode::FORBIDDEN, msg));
+    }
     let token = extract_group_token(&query, &headers);
     let group = crate::group::load_group_async(&id)
         .await
@@ -629,7 +816,10 @@ async fn group_info_handler(
         description: group.description,
         model: group.model,
         yolo: group.yolo,
+        host_name: group.host_name,
         agents: group.agents,
+        members: group.members,
+        pending_joins: group.pending_joins,
     }))
 }
 
@@ -645,6 +835,10 @@ async fn group_list_messages_handler(
         warn!("Rate limit exceeded for {}: {}", addr, msg);
         return Err((StatusCode::TOO_MANY_REQUESTS, msg));
     }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, msg);
+        return Err((StatusCode::FORBIDDEN, msg));
+    }
     let token = extract_group_token(&query, &headers);
     let group = crate::group::load_group_async(&id)
         .await
@@ -658,6 +852,8 @@ async fn group_list_messages_handler(
     Ok(Json(messages))
 }
 
+const MAX_GROUP_MESSAGE_BYTES: usize = 4096;
+
 async fn group_post_message_handler(
     Path(id): Path<String>,
     Query(query): Query<GroupTokenQuery>,
@@ -665,18 +861,22 @@ async fn group_post_message_handler(
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<GroupMessagePayload>,
-) -> Result<StatusCode, (StatusCode, &'static str)> {
+) -> Result<StatusCode, (StatusCode, String)> {
     if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
     {
         warn!("Rate limit exceeded for {}: {}", addr, msg);
-        return Err((StatusCode::TOO_MANY_REQUESTS, msg));
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg.to_string()));
+    }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, msg);
+        return Err((StatusCode::FORBIDDEN, msg.to_string()));
     }
     let token = extract_group_token(&query, &headers);
     let group = crate::group::load_group_async(&id)
         .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
     if !group_token_valid(&group, &token) {
-        return Err((StatusCode::UNAUTHORIZED, "invalid token"));
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
     }
     if !matches!(
         payload.kind,
@@ -684,18 +884,31 @@ async fn group_post_message_handler(
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "message kind must be user or human",
+            "message kind must be user or human".to_string(),
         ));
     }
     let sender = payload.sender.trim().to_string();
-    if sender.is_empty()
-        || sender.eq_ignore_ascii_case("all")
-        || group
-            .agents
-            .iter()
-            .any(|a| a.name.eq_ignore_ascii_case(&sender))
+    if let Err(e) = crate::group::validate_human_name(&sender) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
+    if group
+        .agents
+        .iter()
+        .any(|a| a.name.eq_ignore_ascii_case(&sender))
     {
-        return Err((StatusCode::BAD_REQUEST, "invalid sender"));
+        return Err((StatusCode::BAD_REQUEST, "invalid sender".to_string()));
+    }
+    if !crate::group::is_member(&group, &sender) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "sender is not an approved member".to_string(),
+        ));
+    }
+    if payload.content.len() > MAX_GROUP_MESSAGE_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "message too large".to_string(),
+        ));
     }
     let sender_for_dispatch = sender.clone();
     let message = crate::group::GroupMessage {
@@ -707,7 +920,12 @@ async fn group_post_message_handler(
     };
     crate::group::add_message_async(&id, &message)
         .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed to save message"))?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to save message".to_string(),
+            )
+        })?;
 
     // Trigger agent dispatch off the response path. We run it on a blocking
     // thread with block_on so the HTTP response returns immediately without
@@ -725,6 +943,168 @@ async fn group_post_message_handler(
     });
 
     Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize)]
+struct JoinPayload {
+    name: String,
+    #[serde(default)]
+    github: Option<String>,
+}
+
+async fn group_list_joins_handler(
+    Path(id): Path<String>,
+    Query(query): Query<GroupTokenQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<Vec<crate::group::JoinRequest>>, (StatusCode, String)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, msg);
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg.to_string()));
+    }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, msg);
+        return Err((StatusCode::FORBIDDEN, msg.to_string()));
+    }
+    let token = extract_group_token(&query, &headers);
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+    if !group_token_valid(&group, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    }
+    Ok(Json(group.pending_joins))
+}
+
+async fn group_request_join_handler(
+    Path(id): Path<String>,
+    Query(query): Query<GroupTokenQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<JoinPayload>,
+) -> Result<Json<crate::group::JoinResult>, (StatusCode, String)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, msg);
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg.to_string()));
+    }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, msg);
+        return Err((StatusCode::FORBIDDEN, msg.to_string()));
+    }
+    let token = extract_group_token(&query, &headers);
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+    if !group_token_valid(&group, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    }
+    let name = payload.name.trim().to_string();
+    let github = payload
+        .github
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "missing name".to_string()));
+    }
+
+    let result = crate::group::modify_group_async(&id, move |group| {
+        if group.members.is_empty() {
+            crate::group::ensure_local_member(group, &name)?;
+            return Ok(crate::group::JoinResult {
+                id: String::new(),
+                status: "approved".to_string(),
+                name: name.clone(),
+                github: github.clone(),
+            });
+        }
+        if crate::group::is_member(group, &name) {
+            return Ok(crate::group::JoinResult {
+                id: String::new(),
+                status: "approved".to_string(),
+                name: name.clone(),
+                github: github.clone(),
+            });
+        }
+        let request_id = crate::group::add_join_request(group, &name, github.as_deref())?;
+        Ok(crate::group::JoinResult {
+            id: request_id,
+            status: "pending".to_string(),
+            name: name.clone(),
+            github,
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(result))
+}
+
+async fn group_approve_join_handler(
+    Path((id, request_id)): Path<(String, String)>,
+    Query(query): Query<GroupTokenQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<crate::group::JoinResult>, (StatusCode, String)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, msg);
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg.to_string()));
+    }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, msg);
+        return Err((StatusCode::FORBIDDEN, msg.to_string()));
+    }
+    let token = extract_group_token(&query, &headers);
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+    if !group_token_valid(&group, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    }
+    let approver = headers
+        .get("x-approver-name")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing x-approver-name header".to_string(),
+            )
+        })?;
+    if !crate::group::is_member(&group, &approver) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "approver is not an approved member".to_string(),
+        ));
+    }
+
+    let modify_request_id = request_id.clone();
+    let name = crate::group::modify_group_async(&id, move |group| {
+        crate::group::approve_join_request(group, &modify_request_id)
+    })
+    .await
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("not found") {
+            (StatusCode::NOT_FOUND, msg)
+        } else {
+            (StatusCode::BAD_REQUEST, msg)
+        }
+    })?;
+
+    Ok(Json(crate::group::JoinResult {
+        id: request_id,
+        status: "approved".to_string(),
+        name,
+        github: None,
+    }))
 }
 
 pub async fn serve(args: &ServeArgs) -> Result<()> {
@@ -804,11 +1184,19 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/acp", get(ws_handler))
+        .route("/group", post(admin_create_group_handler))
         .route("/group/{id}", get(group_info_handler))
+        .route("/group/{id}/joins", get(group_list_joins_handler))
+        .route("/group/{id}/join", post(group_request_join_handler))
+        .route(
+            "/group/{id}/joins/{request_id}/approve",
+            post(group_approve_join_handler),
+        )
         .route(
             "/group/{id}/messages",
             get(group_list_messages_handler).post(group_post_message_handler),
         )
+        .route("/workflow", post(admin_create_workflow_handler))
         .with_state(state);
     let listener = TcpListener::bind(bind_addr).await?;
     let actual_addr = listener.local_addr()?;

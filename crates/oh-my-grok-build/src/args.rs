@@ -1148,6 +1148,10 @@ pub enum GroupCommand {
     Chat(GroupChatArgs),
     /// Send a message to a group as a human participant
     Send(GroupSendArgs),
+    /// Request to join a group as a human participant
+    Join(GroupJoinArgs),
+    /// Approve a pending join request for a group
+    Approve(GroupApproveArgs),
     /// Print an invite command/link for a group
     Invite { id: String },
 }
@@ -1162,18 +1166,21 @@ pub struct GroupNewArgs {
     /// Number of agents (2-20; defaults to 3 or names.len())
     #[arg(short, long)]
     pub count: Option<usize>,
-    /// Model for all agents (provider id or omgb-<provider>)
+    /// Model for all agents (provider id or known model name)
     #[arg(short, long)]
     pub model: Option<String>,
-    /// Comma-separated agent names
-    #[arg(long)]
-    pub names: Option<String>,
-    /// Comma-separated agent roles (defaults to generalist)
-    #[arg(long)]
-    pub roles: Option<String>,
-    /// Comma-separated per-agent models (defaults to --model)
-    #[arg(long)]
-    pub models: Option<String>,
+    /// Agent names (comma-separated or repeatable)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub names: Vec<String>,
+    /// Agent roles (comma-separated or repeatable; defaults to generalist)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub roles: Vec<String>,
+    /// Per-agent models (comma-separated or repeatable; defaults to --model)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub models: Vec<String>,
+    /// Host/creator human display name (defaults to $USER)
+    #[arg(short = 'H', long)]
+    pub human_name: Option<String>,
     /// Auto-approve tool use for agents
     #[arg(long)]
     pub yolo: bool,
@@ -1206,6 +1213,41 @@ pub struct GroupSendArgs {
     /// Human display name
     #[arg(short = 'n', long)]
     pub human_name: Option<String>,
+    /// Invite token for the group
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Remote server base URL
+    #[arg(long, value_name = "URL")]
+    pub remote: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupJoinArgs {
+    /// Group id
+    pub id: String,
+    /// Human display name to request as
+    #[arg(short = 'n', long)]
+    pub name: Option<String>,
+    /// GitHub username (shown to members for approval)
+    #[arg(long)]
+    pub github: Option<String>,
+    /// Invite token for the group
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Remote server base URL
+    #[arg(long, value_name = "URL")]
+    pub remote: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupApproveArgs {
+    /// Group id
+    pub id: String,
+    /// Pending join request id
+    pub request_id: String,
+    /// Your display name (required for remote approve to verify membership)
+    #[arg(short = 'n', long)]
+    pub name: Option<String>,
     /// Invite token for the group
     #[arg(long)]
     pub token: Option<String>,

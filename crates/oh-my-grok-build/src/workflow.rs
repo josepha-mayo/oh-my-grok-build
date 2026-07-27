@@ -236,7 +236,7 @@ fn new(args: &WorkflowNewArgs) -> Result<()> {
     Ok(())
 }
 
-async fn create(args: &WorkflowCreateArgs) -> Result<()> {
+pub(crate) async fn create_workflow(args: &WorkflowCreateArgs) -> Result<(String, PathBuf)> {
     let model = match &args.model {
         Some(m) => normalize_model(m),
         None => {
@@ -244,6 +244,17 @@ async fn create(args: &WorkflowCreateArgs) -> Result<()> {
             format!("omgb-{provider}")
         }
     };
+    let provider_id = model.strip_prefix("omgb-").unwrap_or(&model);
+    if crate::providers::get_provider(provider_id)
+        .ok()
+        .flatten()
+        .is_none()
+        && crate::providers::provider_template(provider_id).is_none()
+    {
+        bail!(
+            "unknown workflow model '{model}'; pass a provider id (e.g. xai, openai) or known model name"
+        );
+    }
 
     let name = args
         .name
@@ -261,8 +272,8 @@ async fn create(args: &WorkflowCreateArgs) -> Result<()> {
          Task: {prompt}\n\n\
          Output strictly valid JSON matching this shape (no markdown, no code fences):\n\
          {{\"name\":\"Workflow Name\",\"description\":\"...\",\"step\":[{{\"type\":\"exec\",\"prompt\":\"...\"}},{{\"type\":\"fan_out\",\"prompt\":\"...\",\"count\":3}},{{\"type\":\"shell\",\"command\":\"echo\",\"args\":[\"ok\"]}}]}}\n\n\
-         The 'exec' step may include optional fields: model, yolo (bool), tools (comma-separated string), max_turns (u32). \
-         The 'fan_out' step may include the same plus count (required, 1-1024) and aggregate (string prompt). \
+         The 'exec' step may include optional fields: model (provider id or known model name), yolo (bool), tools (comma-separated string), max_turns (u32, defaults to 10). \
+         The 'fan_out' step may include the same plus count (required, 1-1024) and aggregate (string prompt); max_turns defaults to 5. \
          The 'shell' step may include args (array of strings) and expect_exit (i32).",
         prompt = args.prompt
     );
@@ -286,7 +297,7 @@ async fn create(args: &WorkflowCreateArgs) -> Result<()> {
     if args.dry_run {
         println!("{summary}\n");
         println!("{}", serde_json::to_string_pretty(&workflow)?);
-        return Ok(());
+        return Ok((safe_name, PathBuf::new()));
     }
 
     let dir = workflows_dir()?;
@@ -298,6 +309,11 @@ async fn create(args: &WorkflowCreateArgs) -> Result<()> {
     crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(&workflow)?, true)?;
     println!("{summary}");
     println!("created workflow {safe_name} at {}", path.display());
+    Ok((safe_name, path))
+}
+
+async fn create(args: &WorkflowCreateArgs) -> Result<()> {
+    create_workflow(args).await?;
     Ok(())
 }
 
@@ -417,12 +433,23 @@ async fn run_exec(step: &ExecStep, run_yolo: bool) -> Result<()> {
     let session = SessionParams::default();
     let yolo = run_yolo && step.yolo.unwrap_or(true);
     let model = step.model.as_deref().map(normalize_model);
+    if let Some(ref m) = model {
+        let provider_id = m.strip_prefix("omgb-").unwrap_or(m);
+        if crate::providers::get_provider(provider_id)
+            .ok()
+            .flatten()
+            .is_none()
+            && crate::providers::provider_template(provider_id).is_none()
+        {
+            bail!("workflow exec step references unknown model '{m}'");
+        }
+    }
     run_single_turn_with(
         &step.prompt,
         model,
         yolo,
         OutputFormat::Plain,
-        step.max_turns,
+        step.max_turns.or(Some(10)),
         step.tools.clone(),
         None,
         None,
@@ -440,6 +467,18 @@ async fn run_fan_out(step: &FanOutStep, run_yolo: bool) -> Result<()> {
     }
     let yolo = run_yolo && step.yolo.unwrap_or(true);
     let model = step.model.as_deref().map(normalize_model);
+    if let Some(ref m) = model {
+        let provider_id = m.strip_prefix("omgb-").unwrap_or(m);
+        if crate::providers::get_provider(provider_id)
+            .ok()
+            .flatten()
+            .is_none()
+            && crate::providers::provider_template(provider_id).is_none()
+        {
+            bail!("workflow fan_out step references unknown model '{m}'");
+        }
+    }
+    let max_turns = step.max_turns.or(Some(5));
     let mut outputs: Vec<(usize, String)> = Vec::with_capacity(step.count);
 
     let mut i = 0;
@@ -454,7 +493,6 @@ async fn run_fan_out(step: &FanOutStep, run_yolo: bool) -> Result<()> {
             );
             let m = model.clone();
             let tools = step.tools.clone();
-            let max_turns = step.max_turns;
             async move { crate::run_single_turn_capture(&prompt, m, yolo, max_turns, tools).await }
         });
         let results = futures::future::join_all(futures).await;
@@ -475,15 +513,9 @@ async fn run_fan_out(step: &FanOutStep, run_yolo: bool) -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n\n");
         let prompt = format!("{aggregate}\n\n{context}");
-        let _ = crate::run_single_turn_capture(
-            &prompt,
-            model,
-            yolo,
-            step.max_turns,
-            step.tools.clone(),
-        )
-        .await
-        .map_err(|e| eprintln!("warning: fan_out aggregate failed: {e}"));
+        let _ = crate::run_single_turn_capture(&prompt, model, yolo, max_turns, step.tools.clone())
+            .await
+            .map_err(|e| eprintln!("warning: fan_out aggregate failed: {e}"));
     }
     Ok(())
 }
