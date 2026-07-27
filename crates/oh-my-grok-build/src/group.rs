@@ -1506,6 +1506,7 @@ async fn approve_local(id: &str, request_id: &str, args: &GroupApproveArgs) -> R
         approve_join_request(group, &modify_request_id, "")
     })
     .await?;
+    save_membership(id, &name, &member_token)?;
     println!("approved join request {request_id}: '{name}' can now post in group {id}");
     println!("member token for '{name}': {member_token}");
     Ok(())
