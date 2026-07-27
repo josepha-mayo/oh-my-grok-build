@@ -326,21 +326,25 @@ mod tests {
         let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("omgb-moe-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("OMGB_HOME", &tmp) };
+        crate::providers::set_omg_home_for_tests(Some(tmp.clone()));
 
+        // Isolate tests from any API-key env vars the host may have set.
         let saved: Vec<(String, String)> = std::env::vars()
-            .filter(|(k, _)| k.ends_with("_API_KEY"))
+            .filter(|(k, _)| crate::providers::is_valid_env_key(k))
             .collect();
         for (k, _) in &saved {
+            // SAFETY: tests hold the global OMGB_HOME_TEST_LOCK and run with
+            // the current-thread Tokio runtime, so no other task reads env.
             unsafe { std::env::remove_var(k) };
         }
 
         f(&tmp).await;
 
         for (k, v) in saved {
+            // SAFETY: same as above.
             unsafe { std::env::set_var(k, v) };
         }
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -413,7 +417,7 @@ mod tests {
         assert!(select_provider_from(&[], "task").is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_available_providers_reads_env_and_config() {
         with_temp_home(|home| {
             Box::pin(async move {
@@ -447,7 +451,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_available_providers_uses_default_env_key() {
         with_temp_home(|home| {
             Box::pin(async move {
@@ -481,7 +485,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_available_providers_detects_catalog_keys() {
         with_temp_home(|home| {
             Box::pin(async move {
@@ -493,7 +497,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_available_providers_skips_empty_model() {
         with_temp_home(|home| {
             Box::pin(async move {

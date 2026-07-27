@@ -1160,8 +1160,14 @@ pub enum GroupCommand {
     RemoteAgentList { id: String },
     /// Remove a remote agent from a group
     RemoteAgentRemove { id: String, name: String },
+    /// Print the token for a remote agent in a group
+    RemoteAgentToken(GroupRemoteAgentTokenArgs),
     /// Register this machine to host a remote agent for another group
     HostAgent(GroupHostAgentArgs),
+    /// Print the token for a hosted agent registered on this machine
+    HostedAgentToken(GroupHostedAgentTokenArgs),
+    /// Check the status of a pending remote join request and save the membership token if approved
+    JoinStatus(GroupJoinStatusArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1199,8 +1205,8 @@ pub struct GroupChatArgs {
     /// Group id
     pub id: String,
     /// Human display name in the chat
-    #[arg(short = 'n', long)]
-    pub human_name: Option<String>,
+    #[arg(short = 'n', long, visible_alias = "human-name")]
+    pub name: Option<String>,
     /// Member token for the group (or a previously saved membership will be used)
     #[arg(long)]
     pub token: Option<String>,
@@ -1219,8 +1225,8 @@ pub struct GroupSendArgs {
     /// Message text
     pub message: String,
     /// Human display name
-    #[arg(short = 'n', long)]
-    pub human_name: Option<String>,
+    #[arg(short = 'n', long, visible_alias = "human-name")]
+    pub name: Option<String>,
     /// Member token for the group (or a previously saved membership will be used)
     #[arg(long)]
     pub token: Option<String>,
@@ -1296,4 +1302,37 @@ pub struct GroupHostAgentArgs {
     /// Shared secret token (generated if omitted)
     #[arg(long, value_name = "TOKEN")]
     pub token: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupRemoteAgentTokenArgs {
+    /// Group id this agent belongs to
+    pub id: String,
+    /// Remote agent display name
+    pub name: String,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupHostedAgentTokenArgs {
+    /// Group id this agent belongs to
+    pub id: String,
+    /// Remote agent display name
+    pub name: String,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupJoinStatusArgs {
+    /// Group id
+    pub id: String,
+    /// Pending join request id
+    pub request_id: String,
+    /// Human display name (used when the server response does not include one)
+    #[arg(short = 'n', long)]
+    pub name: Option<String>,
+    /// Remote server base URL (only needed if the pending request was not saved locally)
+    #[arg(long, value_name = "URL")]
+    pub remote: Option<String>,
+    /// Pre-auth token (only needed if the pending request was not saved locally)
+    #[arg(long, value_name = "TOKEN")]
+    pub pre_auth: Option<String>,
 }

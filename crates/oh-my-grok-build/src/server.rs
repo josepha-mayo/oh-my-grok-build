@@ -1179,14 +1179,27 @@ async fn group_approve_join_handler(
     }))
 }
 
-#[derive(Deserialize)]
-struct JoinStatusQuery {
-    pre_auth: String,
+fn extract_pre_auth(headers: &HeaderMap) -> Option<String> {
+    if let Some(t) = headers
+        .get("x-pre-auth-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        return Some(t.to_string());
+    }
+    if let Some(t) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty())
+    {
+        return Some(t.to_string());
+    }
+    None
 }
 
 async fn group_join_status_handler(
     Path((id, request_id)): Path<(String, String)>,
-    Query(query): Query<JoinStatusQuery>,
     headers: HeaderMap,
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1201,15 +1214,27 @@ async fn group_join_status_handler(
         return Err((StatusCode::FORBIDDEN, msg.to_string()));
     }
 
+    let pre_auth = extract_pre_auth(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "missing pre-auth token".to_string(),
+        )
+    })?;
+
     let group = crate::group::load_group_async(&id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
 
-    if group.approved_member_tokens.contains_key(&query.pre_auth) {
-        let pre_auth = query.pre_auth.clone();
-        let member_token = crate::group::modify_group_async(&id, move |g| {
-            let token = g.approved_member_tokens.remove(&pre_auth);
-            Ok(token)
+    if group.approved_member_tokens.contains_key(&pre_auth) {
+        let pre_auth_for_modify = pre_auth.clone();
+        let (member_name, member_token) = crate::group::modify_group_async(&id, move |g| {
+            let token = g.approved_member_tokens.remove(&pre_auth_for_modify);
+            let name = token
+                .as_ref()
+                .and_then(|t| g.member_token_index.get(t))
+                .cloned()
+                .unwrap_or_default();
+            Ok((name, token))
         })
         .await
         .map_err(|_| {
@@ -1222,7 +1247,7 @@ async fn group_join_status_handler(
             return Ok(Json(crate::group::JoinResult {
                 id: request_id,
                 status: "approved".to_string(),
-                name: String::new(),
+                name: member_name,
                 github: None,
                 member_token: Some(token),
                 pre_auth_token: None,
@@ -1230,15 +1255,15 @@ async fn group_join_status_handler(
         }
     }
 
-    if group
+    if let Some(req) = group
         .pending_joins
         .iter()
-        .any(|r| r.id == request_id && r.pre_auth_token.as_deref() == Some(&query.pre_auth))
+        .find(|r| r.id == request_id && r.pre_auth_token.as_deref() == Some(&pre_auth))
     {
         return Ok(Json(crate::group::JoinResult {
             id: request_id,
             status: "pending".to_string(),
-            name: String::new(),
+            name: req.name.clone(),
             github: None,
             member_token: None,
             pre_auth_token: None,

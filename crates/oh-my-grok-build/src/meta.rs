@@ -361,7 +361,7 @@ mod tests {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
         std::fs::create_dir_all(&home).unwrap();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
 
         assert!(plan_path("abc-123").is_ok());
         assert!(plan_path("").is_err());
@@ -369,7 +369,7 @@ mod tests {
         assert!(plan_path("a b").is_err());
 
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
         std::fs::create_dir_all(&home).unwrap();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
 
         let plan = MetaPlan {
             id: "abc".into(),
@@ -403,6 +403,6 @@ mod tests {
         assert_eq!(plans.len(), 1);
 
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 }

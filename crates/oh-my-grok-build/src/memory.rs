@@ -403,19 +403,19 @@ mod tests {
     fn test_remember_and_recall() {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
         let note = remember("Use anyhow for error handling", &["rust".to_string()]).unwrap();
         let notes = recall("anyhow error", 5).unwrap();
         assert!(notes.iter().any(|n| n.id == note.id));
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 
     #[test]
     fn test_list_and_compact() {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
         remember("duplicate", &[]).unwrap();
         remember("duplicate", &["tag".to_string()]).unwrap();
         let removed = compact().unwrap();
@@ -424,14 +424,14 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert!(notes[0].tags.contains(&"tag".to_string()));
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 
     #[test]
     fn test_remember_and_recall_one_shot() {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
         remember_one_shot("meeting", "discuss rust migration").unwrap();
         remember_one_shot("meeting", "discuss api keys").unwrap();
         let first = recall_one_shot("meeting", 1).unwrap();
@@ -442,20 +442,20 @@ mod tests {
         let third = recall_one_shot("meeting", 10).unwrap();
         assert!(third.is_empty());
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 
     #[test]
     fn test_remember_one_shot_dedup() {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
         let a = remember_one_shot("todo", "fix permissions").unwrap();
         let b = remember_one_shot("todo", "fix permissions").unwrap();
         assert_eq!(a.id, b.id);
         let all = recall_one_shot("todo", 10).unwrap();
         assert_eq!(all.len(), 1);
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 }

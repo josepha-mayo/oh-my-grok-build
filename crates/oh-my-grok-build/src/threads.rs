@@ -493,7 +493,7 @@ mod tests {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
         std::fs::create_dir_all(&home).unwrap();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
 
         let (id, _session_id): (String, String) = with_records_mut(|records| {
             records.push(ThreadRecord {
@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(record.session_id, "s1");
 
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 
     #[test]
@@ -529,7 +529,7 @@ mod tests {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
         std::fs::create_dir_all(&home).unwrap();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
 
         with_records_mut(|records| {
             records.push(ThreadRecord {
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(inbox[0].content, "hello");
 
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 
     #[test]
@@ -580,7 +580,7 @@ mod tests {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
         std::fs::create_dir_all(&home).unwrap();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
 
         let mut handles = Vec::new();
         for i in 0..4 {
@@ -609,6 +609,6 @@ mod tests {
         assert_eq!(records.len(), 4);
 
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 }

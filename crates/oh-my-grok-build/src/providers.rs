@@ -56,12 +56,25 @@ pub struct ModelListEntry {
 }
 
 pub fn omg_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(override_path) = OMGB_HOME_OVERRIDE.lock().unwrap().as_ref() {
+        return Ok(override_path.clone());
+    }
     if let Ok(v) = std::env::var("OMGB_HOME") {
         return Ok(PathBuf::from(v));
     }
     dirs::home_dir()
         .map(|h| h.join(".omgb"))
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory; set OMGB_HOME"))
+}
+
+#[cfg(test)]
+pub(crate) static OMGB_HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_omg_home_for_tests(path: Option<PathBuf>) {
+    *OMGB_HOME_OVERRIDE.lock().unwrap() = path;
 }
 
 fn omg_config_path() -> Result<PathBuf> {
@@ -142,10 +155,11 @@ pub(crate) fn load_env_file() -> Result<HashMap<String, String>> {
 
 /// Returns the set of `*_API_KEY` environment variable names that should be
 /// loaded into the process environment at startup. Only keys referenced by a
-/// configured provider, connector, or known catalog template are loaded, and
-/// only when a non-empty value is present in `~/.omgb/.env`. This limits the
-/// secrets exposed to child processes while still letting catalog-based MoE
-/// routing discover keys before a provider is persisted to config.
+/// configured provider, connector, known catalog template, or built-in web
+/// search integration are loaded, and only when a non-empty value is present
+/// in `~/.omgb/.env`. This limits the secrets visible to child processes while
+/// still letting upstream Grok Build resolve `env_key` references and letting
+/// catalog-based MoE routing discover keys before a provider is persisted.
 pub(crate) fn env_keys_to_load() -> HashSet<String> {
     let mut keys = HashSet::new();
     for k in [
@@ -192,16 +206,6 @@ pub(crate) fn env_keys_to_load() -> HashSet<String> {
         }
     }
 
-    let referenced: HashSet<String> = keys.clone();
-    if let Ok(path) = omg_env_path()
-        && let Ok(raw) = std::fs::read_to_string(&path)
-    {
-        for (k, _) in parse_env_entries(&raw) {
-            if is_valid_env_key(&k) && referenced.contains(&k) {
-                keys.insert(k);
-            }
-        }
-    }
     keys
 }
 
@@ -557,16 +561,12 @@ fn resolve_api_key_with_maps(
 ) -> Option<String> {
     let keys = valid_env_keys(provider);
     for k in &keys {
-        if let Some(v) = env.get(k)
-            && !v.is_empty()
-        {
+        if let Some(v) = env.get(k).filter(|v| !v.is_empty()) {
             return Some(v.clone());
         }
     }
     for k in &keys {
-        if let Some(v) = dotenv.get(k)
-            && !v.is_empty()
-        {
+        if let Some(v) = dotenv.get(k).filter(|v| !v.is_empty()) {
             return Some(v.clone());
         }
     }
@@ -583,10 +583,13 @@ pub fn resolve_env_key(key: &str) -> Result<Option<String>> {
     if !is_valid_env_key(key) {
         return Ok(None);
     }
-    if let Ok(v) = std::env::var(key)
-        && !v.is_empty()
-    {
+    if let Some(v) = std::env::var(key).ok().filter(|v| !v.is_empty()) {
         return Ok(Some(v));
+    }
+    // OMGB_API_KEY is a transient input for `omgb provider add` and must not be
+    // persisted in ~/.omgb/.env; only the live process environment may supply it.
+    if key == "OMGB_API_KEY" {
+        return Ok(None);
     }
     let dotenv = load_env_file()?;
     Ok(dotenv.get(key).filter(|v| !v.is_empty()).cloned())
@@ -1446,7 +1449,7 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("omgb-providers-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("OMGB_HOME", tmp.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(tmp.clone()));
 
         let provider = ProviderConfig {
             id: "emptymodel".into(),
@@ -1473,7 +1476,7 @@ mod tests {
 
         let err = ensure_provider_configured("emptymodel").unwrap_err();
         assert!(err.to_string().contains("no configured model"));
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

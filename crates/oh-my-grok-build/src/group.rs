@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 
 use crate::args::{
-    GroupApproveArgs, GroupArgs, GroupCommand, GroupHostAgentArgs, GroupJoinArgs, GroupNewArgs,
-    GroupRemoteAgentAddArgs,
+    GroupApproveArgs, GroupArgs, GroupCommand, GroupHostAgentArgs, GroupHostedAgentTokenArgs,
+    GroupJoinArgs, GroupJoinStatusArgs, GroupNewArgs, GroupRemoteAgentAddArgs,
+    GroupRemoteAgentTokenArgs,
 };
 
 const MAX_AGENTS: usize = 20;
@@ -327,6 +328,84 @@ fn save_hosted_agents(store: &HostedAgents) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
+fn pending_joins_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("pending_joins.json"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PendingJoins {
+    #[serde(default)]
+    joins: HashMap<String, PendingJoin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingJoin {
+    group_id: String,
+    request_id: String,
+    name: String,
+    base: String,
+    pre_auth_token: String,
+}
+
+fn load_pending_joins() -> Result<PendingJoins> {
+    let path = pending_joins_path()?;
+    if !path.exists() {
+        return Ok(PendingJoins::default());
+    }
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn save_pending_joins(store: &PendingJoins) -> Result<()> {
+    let path = pending_joins_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(store)?, true)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn save_pending_join(
+    group_id: &str,
+    request_id: &str,
+    name: &str,
+    base: &str,
+    pre_auth_token: &str,
+) -> Result<()> {
+    let mut store = load_pending_joins()?;
+    let key = format!("{}:{}", group_id, request_id);
+    store.joins.insert(
+        key,
+        PendingJoin {
+            group_id: group_id.to_string(),
+            request_id: request_id.to_string(),
+            name: name.to_string(),
+            base: base.to_string(),
+            pre_auth_token: pre_auth_token.to_string(),
+        },
+    );
+    save_pending_joins(&store)
+}
+
+fn remove_pending_join(group_id: &str, request_id: &str) -> Result<()> {
+    let mut store = load_pending_joins()?;
+    store.joins.remove(&format!("{}:{}", group_id, request_id));
+    save_pending_joins(&store)
+}
+
+fn get_pending_join(group_id: &str, request_id: &str) -> Result<PendingJoin> {
+    let store = load_pending_joins()?;
+    store
+        .joins
+        .get(&format!("{}:{}", group_id, request_id))
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no saved pending join for group {group_id} request {request_id}; pass --remote and --pre-auth"
+            )
+        })
+}
+
 pub(crate) fn register_hosted_agent(group_id: &str, name: &str, token: &str) -> Result<()> {
     let mut store = load_hosted_agents()?;
     let key = format!("{}:{}", group_id, name.trim().to_lowercase());
@@ -349,6 +428,16 @@ pub(crate) fn validate_hosted_agent_token(group_id: &str, name: &str, token: &st
         return constant_time_token_eq(&agent.token, token);
     }
     false
+}
+
+fn get_hosted_agent_token(group_id: &str, name: &str) -> Result<String> {
+    let key = format!("{}:{}", group_id, name.trim().to_lowercase());
+    let store = load_hosted_agents()?;
+    store
+        .agents
+        .get(&key)
+        .map(|a| a.token.clone())
+        .ok_or_else(|| anyhow::anyhow!("no hosted agent '{name}' for group {group_id}"))
 }
 
 fn modify_group<F, T>(id: &str, f: F) -> Result<T>
@@ -519,7 +608,7 @@ pub async fn run_group(args: &GroupArgs) -> Result<()> {
         GroupCommand::Chat(args) => {
             let id = args.id.clone();
             let human_name = args
-                .human_name
+                .name
                 .clone()
                 .unwrap_or_else(default_human_name)
                 .trim()
@@ -548,7 +637,7 @@ pub async fn run_group(args: &GroupArgs) -> Result<()> {
         GroupCommand::Send(args) => {
             let id = args.id.clone();
             let human_name = args
-                .human_name
+                .name
                 .clone()
                 .unwrap_or_else(default_human_name)
                 .trim()
@@ -621,7 +710,10 @@ pub async fn run_group(args: &GroupArgs) -> Result<()> {
         GroupCommand::RemoteAgentAdd(args) => add_remote_agent(&args.id, args).await,
         GroupCommand::RemoteAgentList { id } => list_remote_agents(id).await,
         GroupCommand::RemoteAgentRemove { id, name } => remove_remote_agent(id, name).await,
+        GroupCommand::RemoteAgentToken(args) => remote_agent_token(args),
         GroupCommand::HostAgent(args) => host_agent(args).await,
+        GroupCommand::HostedAgentToken(args) => hosted_agent_token(args),
+        GroupCommand::JoinStatus(args) => join_status(&args.id, args).await,
     }
 }
 
@@ -858,25 +950,25 @@ pub(crate) fn approve_join_request(
 
 async fn new_group(args: &GroupNewArgs) -> Result<()> {
     let group = create_group(args).await?;
-    let host_token = group
-        .member_tokens
-        .get(&group.host_name)
-        .cloned()
-        .unwrap_or_else(generate_member_token);
 
     println!("created group {}: {}", group.id, group.name);
     println!("  agents:");
     for a in &group.agents {
         println!("    {} ({}) — {}", a.name, a.model, a.role);
     }
-    println!("\nhost member token: {host_token}");
     println!(
-        "host chat:    omgb group chat {} --token {}",
-        group.id, host_token
+        "\nhost token saved; membership is under '{host_name}'",
+        host_name = group.host_name
     );
     println!(
-        "send message: omgb group send {} \"<message>\" --token {}",
-        group.id, host_token
+        "host chat:    omgb group chat {} --name {host_name}",
+        group.id,
+        host_name = group.host_name
+    );
+    println!(
+        "send message: omgb group send {} --name {host_name} \"<message>\"",
+        group.id,
+        host_name = group.host_name
     );
     println!(
         "invite link:  omgb://group/{}?token={}",
@@ -966,15 +1058,12 @@ fn invite(id: &str) -> Result<()> {
         "share this invite link with humans/agents to join group {}:\n",
         group.name
     );
-    println!("  omgb group join {id} --token {}", group.invite_token);
     println!("  omgb://group/{id}?token={}", group.invite_token);
+    println!("  omgb group join {id} --token <invite-token>");
     if let Ok(remote) = std::env::var("OMGB_REMOTE") {
         let remote = remote.trim_end_matches('/');
         println!("  {remote}/group/{id}?token={}", group.invite_token);
-        println!(
-            "  omgb group join {id} --token {} --remote {remote}",
-            group.invite_token
-        );
+        println!("  omgb group join {id} --token <invite-token> --remote {remote}");
     }
     Ok(())
 }
@@ -1001,7 +1090,6 @@ async fn add_remote_agent(id: &str, args: &GroupRemoteAgentAddArgs) -> Result<()
 
     let name_print = name.clone();
     let url_print = url.clone();
-    let token_print = token.clone();
     modify_group_async(id, move |group| {
         if all_agent_names(group).len() >= MAX_AGENTS {
             bail!("a group can have at most {MAX_AGENTS} agents");
@@ -1032,7 +1120,8 @@ async fn add_remote_agent(id: &str, args: &GroupRemoteAgentAddArgs) -> Result<()
     .await?;
     println!("added remote agent '{name_print}' to group {id}");
     println!("  url: {url_print}");
-    println!("  token: {token_print}");
+    println!("  retrieve token:    omgb group remote-agent-token {id} {name_print}");
+    println!("  configure remote:  omgb group host-agent {id} {name_print} --token <token>");
     Ok(())
 }
 
@@ -1076,6 +1165,23 @@ async fn remove_remote_agent(id: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn get_remote_agent_token(group_id: &str, name: &str) -> Result<String> {
+    let group = load_group(group_id)?;
+    find_remote_agent(&group, name.trim())
+        .map(|r| r.token.clone())
+        .ok_or_else(|| anyhow::anyhow!("no remote agent '{name}' for group {group_id}"))
+}
+
+fn remote_agent_token(args: &GroupRemoteAgentTokenArgs) -> Result<()> {
+    let group_id = args.id.trim().to_string();
+    crate::threads::validate_id(&group_id)?;
+    let name = args.name.trim().to_string();
+    validate_human_name(&name)?;
+    let token = get_remote_agent_token(&group_id, &name)?;
+    println!("{token}");
+    Ok(())
+}
+
 async fn host_agent(args: &GroupHostAgentArgs) -> Result<()> {
     let group_id = args.id.trim().to_string();
     crate::threads::validate_id(&group_id)?;
@@ -1089,16 +1195,25 @@ async fn host_agent(args: &GroupHostAgentArgs) -> Result<()> {
         .unwrap_or_else(generate_member_token);
     let group_id_print = group_id.clone();
     let name_print = name.clone();
-    let token_print = token.clone();
     tokio::task::spawn_blocking(move || register_hosted_agent(&group_id, &name, &token))
         .await
         .context("register hosted agent task failed")??;
     println!("registered hosted agent '{name_print}' for group {group_id_print}");
     println!("  dispatch URL path: /group/{group_id_print}/agent/{name_print}/dispatch");
-    println!("  token: {token_print}");
+    println!("  retrieve token:    omgb group hosted-agent-token {group_id_print} {name_print}");
     println!(
-        "  configure the remote group with: omgb group remote-agent-add {group_id_print} {name_print} --url <this-server>/group/{group_id_print}/agent/{name_print}/dispatch --token {token_print}"
+        "  configure remote:  omgb group remote-agent-add {group_id_print} {name_print} --url <this-server>/group/{group_id_print}/agent/{name_print}/dispatch --token <token>"
     );
+    Ok(())
+}
+
+fn hosted_agent_token(args: &GroupHostedAgentTokenArgs) -> Result<()> {
+    let group_id = args.id.trim().to_string();
+    crate::threads::validate_id(&group_id)?;
+    let name = args.name.trim().to_string();
+    validate_human_name(&name)?;
+    let token = get_hosted_agent_token(&group_id, &name)?;
+    println!("{token}");
     Ok(())
 }
 
@@ -1251,6 +1366,7 @@ pub(crate) async fn chat_remote(
     human_name: &str,
     vurl: &crate::net::ValidatedUrl,
 ) -> Result<()> {
+    crate::threads::validate_id(id)?;
     let base = vurl.url.as_str().trim_end_matches('/');
     let info_url = format!("{base}/group/{id}");
     let messages_url = format!("{base}/group/{id}/messages");
@@ -1419,6 +1535,7 @@ pub(crate) async fn send_remote(
     message: &GroupMessage,
     vurl: &crate::net::ValidatedUrl,
 ) -> Result<()> {
+    crate::threads::validate_id(id)?;
     if message.content.len() > MAX_GROUP_MESSAGE_BYTES {
         bail!("message too large (max {MAX_GROUP_MESSAGE_BYTES} bytes)");
     }
@@ -1474,7 +1591,7 @@ async fn join_local(id: &str, args: &GroupJoinArgs) -> Result<()> {
     .await?;
     if status == "approved" {
         save_membership(id, &name, &token)?;
-        println!("'{name}' joined group {id} (member token: {token})");
+        println!("'{name}' joined group {id} (membership saved)");
     } else {
         println!("join request {request_id} for '{name}' is pending approval in group {id}");
         println!(
@@ -1514,7 +1631,7 @@ async fn approve_local(id: &str, request_id: &str, args: &GroupApproveArgs) -> R
     .await?;
     save_membership(id, &name, &member_token)?;
     println!("approved join request {request_id}: '{name}' can now post in group {id}");
-    println!("member token for '{name}': {member_token}");
+    println!("membership token saved for '{name}'");
     Ok(())
 }
 
@@ -1536,6 +1653,7 @@ async fn join_remote(
     args: &GroupJoinArgs,
     vurl: &crate::net::ValidatedUrl,
 ) -> Result<()> {
+    crate::threads::validate_id(id)?;
     let name = if let Some(n) = args.name.as_deref() {
         n.trim().to_string()
     } else {
@@ -1572,19 +1690,14 @@ async fn join_remote(
         "approved" => {
             if let Some(member_token) = result.member_token {
                 save_membership(id, &name, &member_token)?;
-                println!(
-                    "'{name}' was auto-approved for group {id} (member token: {member_token})"
-                );
+                println!("'{name}' was auto-approved for group {id} (membership saved)");
             } else {
-                println!("'{name}' was auto-approved for group {id}");
+                bail!("'{name}' was auto-approved for group {id} but no member token was returned");
             }
         }
         "member" => {
-            if let Some(membership) = load_membership_by_name(id, &name) {
-                println!(
-                    "'{name}' is already a member of group {id} (member token: {membership_token})",
-                    membership_token = membership.token
-                );
+            if load_membership_by_name(id, &name).is_some() {
+                println!("'{name}' is already a member of group {id}");
             } else {
                 bail!(
                     "'{name}' is already a member of group {id}; pass --token <member-token> to chat"
@@ -1592,17 +1705,23 @@ async fn join_remote(
             }
         }
         _ => {
-            println!(
-                "join request {} for '{name}' is pending approval in group {id}",
-                result.id
-            );
-            println!(
-                "an existing member can approve with: omgb group approve {id} {} --token <token> --remote {base}",
-                result.id
-            );
-            if let Some(pre_auth) = result.pre_auth_token {
+            if let Some(pre_auth) = result.pre_auth_token.as_deref() {
+                save_pending_join(id, &result.id, &name, base, pre_auth)?;
                 println!(
-                    "poll for approval with: GET {base}/group/{id}/joins/{}/status?pre_auth={pre_auth}",
+                    "join request {} for '{name}' is pending approval in group {id}",
+                    result.id
+                );
+                println!(
+                    "an existing member can approve with: omgb group approve {id} {} --token <token> --remote {base}",
+                    result.id
+                );
+                println!(
+                    "poll for approval with: omgb group join-status {id} {}",
+                    result.id
+                );
+            } else {
+                println!(
+                    "join request {} for '{name}' is pending approval in group {id}; no pre-auth token provided",
                     result.id
                 );
             }
@@ -1618,6 +1737,8 @@ async fn approve_remote(
     _args: &GroupApproveArgs,
     vurl: &crate::net::ValidatedUrl,
 ) -> Result<()> {
+    crate::threads::validate_id(id)?;
+    crate::threads::validate_id(request_id)?;
     let base = vurl.url.as_str().trim_end_matches('/');
     let url = format!("{base}/group/{id}/joins/{request_id}/approve");
     let client = crate::net::build_client(vurl, std::time::Duration::from_secs(30))?;
@@ -1635,8 +1756,88 @@ async fn approve_remote(
         "approved join request {request_id}: '{}' can now post in group {id}",
         result.name
     );
-    if let Some(member_token) = result.member_token {
-        println!("member token for '{}': {member_token}", result.name);
+    if result.member_token.is_some() {
+        println!("membership token issued for '{}'", result.name);
+    }
+    Ok(())
+}
+
+async fn join_status(id: &str, args: &GroupJoinStatusArgs) -> Result<()> {
+    crate::threads::validate_id(id)?;
+    crate::threads::validate_id(&args.request_id)?;
+    if args.remote.is_some() != args.pre_auth.is_some() {
+        bail!("--remote and --pre-auth must be provided together");
+    }
+    let (base, pre_auth, pending) = if let (Some(remote), Some(pre_auth)) =
+        (args.remote.as_deref(), args.pre_auth.as_deref())
+    {
+        (
+            remote.trim_end_matches('/').to_string(),
+            pre_auth.to_string(),
+            None,
+        )
+    } else {
+        let pending = get_pending_join(id, &args.request_id)?;
+        (
+            pending.base.clone(),
+            pending.pre_auth_token.clone(),
+            Some(pending),
+        )
+    };
+    if pre_auth.is_empty() {
+        bail!("pre-auth token is required");
+    }
+
+    let validated = validate_remote_base_url(&base).await?;
+    let client = crate::net::build_client(&validated, std::time::Duration::from_secs(30))?;
+    let url = format!("{base}/group/{id}/joins/{}/status", args.request_id);
+    let res = client.get(&url).bearer_auth(&pre_auth).send().await?;
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        bail!("failed to poll join status: {text}");
+    }
+    let result: JoinResult = res.json().await?;
+    let name = if !result.name.is_empty() {
+        result.name
+    } else if let Some(n) = args.name.as_deref().filter(|n| !n.is_empty()) {
+        n.to_string()
+    } else if let Some(pending) = pending.as_ref() {
+        pending.name.clone()
+    } else {
+        bail!("server did not return a name; pass --name to save membership");
+    };
+    match result.status.as_str() {
+        "approved" => {
+            if let Some(member_token) = result.member_token {
+                save_membership(id, &name, &member_token)?;
+                remove_pending_join(id, &args.request_id)?;
+                println!("'{name}' was approved for group {id} (membership saved)");
+            } else {
+                bail!("join approved but no member token returned");
+            }
+        }
+        "member" => {
+            if load_membership_by_name(id, &name).is_some() {
+                remove_pending_join(id, &args.request_id)?;
+                println!("'{name}' is already a member of group {id}");
+            } else {
+                bail!(
+                    "'{name}' is already a member of group {id}; pass --token <member-token> to chat"
+                );
+            }
+        }
+        "pending" => {
+            println!(
+                "join request {} for '{name}' is still pending in group {id}",
+                args.request_id
+            );
+        }
+        other => {
+            println!(
+                "join request {} for '{name}' has status '{other}' in group {id}",
+                args.request_id
+            );
+        }
     }
     Ok(())
 }
@@ -2212,11 +2413,20 @@ pub(crate) fn normalize_model(model: &str) -> String {
 fn default_human_name() -> String {
     std::env::var("USER")
         .ok()
+        .or_else(|| std::env::var("USERNAME").ok())
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            std::env::var("USERNAME")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let n: String = s
+                .trim()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .take(32)
+                .collect();
+            if n.is_empty() || n.eq_ignore_ascii_case("all") {
+                "human".to_string()
+            } else {
+                n
+            }
         })
         .unwrap_or_else(|| "human".to_string())
 }
@@ -2421,5 +2631,100 @@ mod tests {
         let truncated = truncate_message_content(&multi_byte);
         assert!(truncated.len() <= MAX_GROUP_MESSAGE_BYTES);
         assert!(!truncated.is_empty());
+    }
+
+    #[test]
+    fn hosted_agent_token_roundtrip() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("omgb-hosted-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
+
+        register_hosted_agent("group-1", "agent-A", "secret-token").unwrap();
+        assert_eq!(
+            get_hosted_agent_token("group-1", "agent-A").unwrap(),
+            "secret-token"
+        );
+        assert!(get_hosted_agent_token("group-1", "agent-B").is_err());
+
+        crate::providers::set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pending_join_roundtrip() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("omgb-pending-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
+
+        save_pending_join(
+            "group-1",
+            "req-1",
+            "alice",
+            "https://example.com",
+            "preauth-1",
+        )
+        .unwrap();
+        let pending = get_pending_join("group-1", "req-1").unwrap();
+        assert_eq!(pending.name, "alice");
+        assert_eq!(pending.pre_auth_token, "preauth-1");
+
+        remove_pending_join("group-1", "req-1").unwrap();
+        assert!(get_pending_join("group-1", "req-1").is_err());
+
+        crate::providers::set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remote_agent_token_roundtrip() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("omgb-remote-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let group = Group {
+            id: id.clone(),
+            name: "test".into(),
+            description: String::new(),
+            created_at: Utc::now(),
+            model: "omgb-xai".into(),
+            yolo: false,
+            invite_token: "invite".into(),
+            host_name: String::new(),
+            members: Vec::new(),
+            member_tokens: HashMap::new(),
+            member_token_index: HashMap::new(),
+            pending_joins: Vec::new(),
+            approved_member_tokens: HashMap::new(),
+            agents: Vec::new(),
+            remote_agents: Vec::new(),
+        };
+        save_group(&group).unwrap();
+
+        modify_group(&id, |g| {
+            g.remote_agents.push(RemoteAgent {
+                name: "remote-1".into(),
+                role: "generalist".into(),
+                model: "omgb-xai".into(),
+                token: "remote-secret".into(),
+                callback_url: None,
+                allow_local: false,
+                last_heartbeat: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            get_remote_agent_token(&id, "remote-1").unwrap(),
+            "remote-secret"
+        );
+        assert!(get_remote_agent_token(&id, "missing").is_err());
+
+        crate::providers::set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

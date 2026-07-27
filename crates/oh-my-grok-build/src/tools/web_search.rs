@@ -74,8 +74,9 @@ impl Tool for OmgbWebSearchTool {
         let allowed = input.allowed_domains.as_deref();
         let mut errors: Vec<String> = Vec::new();
 
-        if let Some(key) = std::env::var("TAVILY_API_KEY")
+        if let Some(key) = crate::providers::resolve_env_key("TAVILY_API_KEY")
             .ok()
+            .flatten()
             .filter(|s| !s.is_empty())
         {
             match tavily(&client, &key, query, allowed).await {
@@ -83,8 +84,9 @@ impl Tool for OmgbWebSearchTool {
                 Err(e) => errors.push(e.to_string()),
             }
         }
-        if let Some(key) = std::env::var("BRAVE_API_KEY")
+        if let Some(key) = crate::providers::resolve_env_key("BRAVE_API_KEY")
             .ok()
+            .flatten()
             .filter(|s| !s.is_empty())
         {
             match brave(&client, &key, query, allowed).await {
@@ -92,8 +94,9 @@ impl Tool for OmgbWebSearchTool {
                 Err(e) => errors.push(e.to_string()),
             }
         }
-        if let Some(key) = std::env::var("SERPER_API_KEY")
+        if let Some(key) = crate::providers::resolve_env_key("SERPER_API_KEY")
             .ok()
+            .flatten()
             .filter(|s| !s.is_empty())
         {
             match serper(&client, &key, query, allowed).await {
@@ -102,23 +105,35 @@ impl Tool for OmgbWebSearchTool {
             }
         }
         if let (Some(key), Some(cx)) = (
-            std::env::var("GOOGLE_API_KEY")
+            crate::providers::resolve_env_key("GOOGLE_API_KEY")
                 .ok()
+                .flatten()
                 .filter(|s| !s.is_empty()),
-            std::env::var("GOOGLE_CX").ok().filter(|s| !s.is_empty()),
+            crate::providers::resolve_env_key("GOOGLE_CX")
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty()),
         ) {
             match google(&client, &key, &cx, query, allowed).await {
                 Ok(out) => return Ok(out),
                 Err(e) => errors.push(e.to_string()),
             }
         }
-        if let Some(key) = std::env::var("BING_API_KEY").ok().filter(|s| !s.is_empty()) {
+        if let Some(key) = crate::providers::resolve_env_key("BING_API_KEY")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+        {
             match bing(&client, &key, query, allowed).await {
                 Ok(out) => return Ok(out),
                 Err(e) => errors.push(e.to_string()),
             }
         }
-        if let Some(base) = std::env::var("SEARXNG_URL").ok().filter(|s| !s.is_empty()) {
+        if let Some(base) = crate::providers::resolve_env_key("SEARXNG_URL")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+        {
             match searxng(&client, &base, query, allowed).await {
                 Ok(out) => return Ok(out),
                 Err(e) => errors.push(e.to_string()),

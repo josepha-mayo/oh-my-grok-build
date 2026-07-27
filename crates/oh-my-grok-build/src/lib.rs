@@ -59,45 +59,58 @@ fn desktop_control_allowed() -> bool {
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
+fn set_default_env(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        // SAFETY: `main()` is single-threaded at this point; this runs before the
+        // Tokio runtime or any signal handlers are installed, so no other thread
+        // can be reading or writing the environment.
+        unsafe { std::env::set_var(key, value) };
+    }
+}
+
 /// Loads `*_API_KEY` entries from `~/.omgb/.env` into the process environment,
-/// but only for keys referenced by configured providers, connectors, or known
-/// catalog templates (plus `OMGB_API_KEY`). This limits the secrets visible to
-/// child processes while still letting upstream Grok Build resolve `env_key`
-/// references.
+/// but only for keys referenced by configured providers, connectors, known
+/// catalog templates, or built-in web search integrations. This limits the
+/// secrets visible to child processes while still letting upstream Grok Build
+/// resolve `env_key` references.
 ///
-/// This is a bridge to the upstream Grok Build harness, which reads provider
-/// secrets from the process environment via `env_key`. It is called only before
-/// any other thread starts.
+/// Existing process environment values are preserved (env overrides dotenv).
 ///
 /// # Safety
-/// Must be called before any other thread can read the environment. This is the
-/// first thing `main()` does, before installing signal handlers or spawning the
-/// Tokio runtime.
+/// Must be called before any other thread can read or write the environment.
+/// This is the first operation in `main()`, before the Tokio runtime or any
+/// signal handlers are installed.
 unsafe fn load_omg_env_into_process() -> Result<()> {
-    let entries = crate::providers::load_env_file()?;
-    let allowed = crate::providers::env_keys_to_load();
-    for (k, v) in entries {
-        let relevant = allowed.contains(&k) || k == "OMGB_API_KEY";
-        if relevant && crate::providers::is_valid_env_key(&k) && !v.is_empty() {
-            // SAFETY: see the function-level safety contract above.
-            unsafe { std::env::set_var(k, v) };
+    // Best-effort: if ~/.omgb/.env cannot be read yet (e.g. OMGB_HOME is not
+    // set and the home directory is unknown), skip the bridge. Commands that
+    // actually need secrets will report the missing key when they try to read
+    // the file.
+    if let Ok(dotenv) = crate::providers::load_env_file() {
+        let allowed = crate::providers::env_keys_to_load();
+        for (k, v) in dotenv {
+            // OMGB_API_KEY is a transient input for `omgb provider add`; it is not
+            // an upstream env_key and should not be exposed to the whole process.
+            if k == "OMGB_API_KEY" {
+                continue;
+            }
+            if allowed.contains(&k)
+                && crate::providers::is_valid_env_key(&k)
+                && !v.is_empty()
+                && std::env::var(&k).ok().filter(|v| !v.is_empty()).is_none()
+            {
+                // SAFETY: see the function-level safety contract above.
+                unsafe { std::env::set_var(k, v) };
+            }
         }
     }
     Ok(())
 }
 
-fn set_default_env(key: &str, value: &str) {
-    if std::env::var_os(key).is_none() {
-        // SAFETY: main starts before any other thread or signal handler.
-        unsafe { std::env::set_var(key, value) };
-    }
-}
-
 pub fn main() -> Result<()> {
-    // Load valid *_API_KEY entries from ~/.omgb/.env before anything else can read
-    // the process environment. This is safe because it is the very first
-    // operation and runs before any other thread or signal handler is installed.
-    // SAFETY: no other threads exist at this point.
+    // Load referenced BYOK keys from ~/.omgb/.env into the process environment
+    // before any other thread can observe it. Upstream Grok Build resolves
+    // env_key via std::env::var, so this bridge is required.
+    // SAFETY: no other threads exist; this is the very first operation.
     unsafe { load_omg_env_into_process() }?;
 
     // omgb: opt out of upstream telemetry/feedback by default. Users can opt in

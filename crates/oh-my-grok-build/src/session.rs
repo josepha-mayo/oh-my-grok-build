@@ -259,12 +259,20 @@ mod tests {
 
     #[test]
     fn test_session_paths_under_grok_home() {
-        let tmp = std::env::temp_dir();
-        unsafe { std::env::set_var("GROK_HOME", tmp.as_os_str()) };
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("omgb-session-test-{}-", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("GROK_HOME", &tmp) };
+
         let root = sessions_root().unwrap();
+        assert!(root.starts_with(&tmp));
         assert!(root.to_string_lossy().contains("sessions"));
+
         let dir = session_dir("sess-1").unwrap();
-        assert!(dir.to_string_lossy().contains("sess-1"));
+        assert!(dir.starts_with(&tmp));
+        assert_eq!(dir.file_name().unwrap_or_default(), "sess-1");
+
         unsafe { std::env::remove_var("GROK_HOME") };
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

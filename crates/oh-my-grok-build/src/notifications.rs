@@ -80,7 +80,7 @@ mod tests {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let home = tmp_home();
         std::fs::create_dir_all(&home).unwrap();
-        unsafe { std::env::set_var("OMGB_HOME", home.as_os_str()) };
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
 
         push("event1", serde_json::json!({"k": "v1"})).unwrap();
         push("event2", serde_json::json!({"k": "v2"})).unwrap();
@@ -97,6 +97,6 @@ mod tests {
         assert_eq!(limited[0].event_type, "event2");
 
         std::fs::remove_dir_all(&home).ok();
-        unsafe { std::env::remove_var("OMGB_HOME") };
+        crate::providers::set_omg_home_for_tests(None);
     }
 }
