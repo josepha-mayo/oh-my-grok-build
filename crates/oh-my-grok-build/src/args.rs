@@ -1154,6 +1154,14 @@ pub enum GroupCommand {
     Approve(GroupApproveArgs),
     /// Print an invite command/link for a group
     Invite { id: String },
+    /// Add a remote agent to a group
+    RemoteAgentAdd(GroupRemoteAgentAddArgs),
+    /// List remote agents in a group
+    RemoteAgentList { id: String },
+    /// Remove a remote agent from a group
+    RemoteAgentRemove { id: String, name: String },
+    /// Register this machine to host a remote agent for another group
+    HostAgent(GroupHostAgentArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1193,7 +1201,7 @@ pub struct GroupChatArgs {
     /// Human display name in the chat
     #[arg(short = 'n', long)]
     pub human_name: Option<String>,
-    /// Invite token for the group
+    /// Member token for the group (or a previously saved membership will be used)
     #[arg(long)]
     pub token: Option<String>,
     /// Auto-approve tool use for agents
@@ -1213,7 +1221,7 @@ pub struct GroupSendArgs {
     /// Human display name
     #[arg(short = 'n', long)]
     pub human_name: Option<String>,
-    /// Invite token for the group
+    /// Member token for the group (or a previously saved membership will be used)
     #[arg(long)]
     pub token: Option<String>,
     /// Remote server base URL
@@ -1231,7 +1239,7 @@ pub struct GroupJoinArgs {
     /// GitHub username (shown to members for approval)
     #[arg(long)]
     pub github: Option<String>,
-    /// Invite token for the group
+    /// Invite or member token for the group
     #[arg(long)]
     pub token: Option<String>,
     /// Remote server base URL
@@ -1245,13 +1253,47 @@ pub struct GroupApproveArgs {
     pub id: String,
     /// Pending join request id
     pub request_id: String,
-    /// Your display name (required for remote approve to verify membership)
+    /// Your display name (used to verify the member token)
     #[arg(short = 'n', long)]
     pub name: Option<String>,
-    /// Invite token for the group
+    /// Member token of the approver
     #[arg(long)]
     pub token: Option<String>,
     /// Remote server base URL
     #[arg(long, value_name = "URL")]
     pub remote: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupRemoteAgentAddArgs {
+    /// Group id
+    pub id: String,
+    /// Remote agent display name
+    pub name: String,
+    /// Remote agent endpoint URL
+    #[arg(short, long, value_name = "URL")]
+    pub url: String,
+    /// Remote agent role
+    #[arg(short, long, default_value = "generalist")]
+    pub role: String,
+    /// Remote agent model
+    #[arg(short, long, default_value = "")]
+    pub model: String,
+    /// Shared secret token (generated if omitted)
+    #[arg(long, value_name = "TOKEN")]
+    pub token: Option<String>,
+    /// Allow loopback/private URLs (e.g. http://localhost) for testing
+    #[arg(long)]
+    pub allow_local: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct GroupHostAgentArgs {
+    /// Group id this agent belongs to
+    pub id: String,
+    /// Remote agent display name
+    pub name: String,
+    /// Shared secret token (generated if omitted)
+    #[arg(long, value_name = "TOKEN")]
+    pub token: Option<String>,
 }

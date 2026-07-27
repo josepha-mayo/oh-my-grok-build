@@ -7,8 +7,8 @@
 //! role, or when they have a relevant update, and `@mention` routing lets
 //! agents ask each other directly without spawning reply loops.
 
-use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufRead, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -18,14 +18,17 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 
 use crate::args::{
-    GroupApproveArgs, GroupArgs, GroupChatArgs, GroupCommand, GroupJoinArgs, GroupNewArgs,
-    GroupSendArgs,
+    GroupApproveArgs, GroupArgs, GroupCommand, GroupHostAgentArgs, GroupJoinArgs, GroupNewArgs,
+    GroupRemoteAgentAddArgs,
 };
 
 const MAX_AGENTS: usize = 20;
 const MIN_AGENTS: usize = 2;
 const HISTORY_LIMIT: usize = 50;
 const MENTION_LIMIT: usize = 1;
+const MAX_LOADED_MESSAGES: usize = 1000;
+const MAX_GROUP_MESSAGES_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_GROUP_MESSAGE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
@@ -42,8 +45,30 @@ pub struct Group {
     #[serde(default)]
     pub members: Vec<String>,
     #[serde(default)]
+    pub member_tokens: HashMap<String, String>,
+    #[serde(default, skip)]
+    pub member_token_index: HashMap<String, String>,
+    #[serde(default)]
     pub pending_joins: Vec<JoinRequest>,
     pub agents: Vec<Agent>,
+    #[serde(default)]
+    pub remote_agents: Vec<RemoteAgent>,
+    #[serde(default)]
+    pub approved_member_tokens: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAgent {
+    pub name: String,
+    pub role: String,
+    pub model: String,
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
+    #[serde(default)]
+    pub allow_local: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +78,8 @@ pub struct JoinRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<String>,
     pub requested_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_auth_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -116,6 +143,214 @@ fn group_lock_path(id: &str) -> Result<PathBuf> {
     Ok(groups_dir()?.join(format!("{id}.lock")))
 }
 
+fn membership_store_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("group_memberships.json"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct MembershipStore {
+    #[serde(default)]
+    memberships: HashMap<String, Membership>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Membership {
+    name: String,
+    token: String,
+}
+
+fn membership_key(group_id: &str, name: &str) -> String {
+    format!("{}:{}", group_id, name.trim().to_ascii_lowercase())
+}
+
+fn load_membership_store() -> Result<MembershipStore> {
+    let path = membership_store_path()?;
+    if !path.exists() {
+        return Ok(MembershipStore::default());
+    }
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut store: MembershipStore =
+        serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut migrated = false;
+    let old_keys: Vec<String> = store
+        .memberships
+        .keys()
+        .filter(|k| !k.contains(':'))
+        .cloned()
+        .collect();
+    for k in old_keys {
+        if let Some(m) = store.memberships.remove(&k) {
+            store.memberships.insert(membership_key(&k, &m.name), m);
+            migrated = true;
+        }
+    }
+    if migrated {
+        save_membership_store(&store)?;
+    }
+    Ok(store)
+}
+
+fn save_membership_store(store: &MembershipStore) -> Result<()> {
+    let path = membership_store_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(store)?, true)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+pub(crate) fn load_membership(group_id: &str, name: &str) -> Option<Membership> {
+    load_membership_store()
+        .ok()?
+        .memberships
+        .get(&membership_key(group_id, name))
+        .cloned()
+}
+
+pub(crate) fn save_membership(group_id: &str, name: &str, token: &str) -> Result<()> {
+    let mut store = load_membership_store()?;
+    store.memberships.insert(
+        membership_key(group_id, name),
+        Membership {
+            name: name.trim().to_string(),
+            token: token.to_string(),
+        },
+    );
+    save_membership_store(&store)
+}
+
+pub(crate) fn load_membership_by_name(group_id: &str, name: &str) -> Option<Membership> {
+    load_membership(group_id, name.trim())
+}
+
+pub(crate) fn generate_member_token() -> String {
+    uuid::Uuid::new_v4().to_string().replace('-', "")
+}
+
+pub(crate) fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    constant_time_eq::constant_time_eq(a.as_bytes(), b.as_bytes())
+}
+
+fn recompute_member_token_index(group: &mut Group) {
+    group.member_token_index.clear();
+    for (name, token) in &group.member_tokens {
+        group.member_token_index.insert(token.clone(), name.clone());
+    }
+}
+
+pub(crate) fn validate_member_token(group: &Group, token: &str) -> Option<String> {
+    let mut matched = None;
+    for (stored, name) in &group.member_token_index {
+        if constant_time_token_eq(stored, token) {
+            matched = Some(name.clone());
+        }
+    }
+    matched
+}
+
+pub(crate) fn issue_member_token(group: &mut Group, name: &str) -> Result<String> {
+    let name = name.trim();
+    validate_member_name(group, name)?;
+    let canonical = group
+        .members
+        .iter()
+        .find(|m| m.eq_ignore_ascii_case(name))
+        .cloned()
+        .unwrap_or_else(|| name.to_string());
+    if !group
+        .members
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(&canonical))
+    {
+        group.members.push(canonical.clone());
+    }
+    let token = group
+        .member_tokens
+        .entry(canonical.clone())
+        .or_insert_with(generate_member_token)
+        .clone();
+    group.member_token_index.insert(token.clone(), canonical);
+    Ok(token)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RemoteAgentDispatchPayload {
+    pub group_id: String,
+    pub agent_name: String,
+    pub role: String,
+    pub model: String,
+    pub group_model: String,
+    #[serde(default)]
+    pub yolo: bool,
+    pub prompt: String,
+    pub history: Vec<GroupMessage>,
+    pub message: GroupMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RemoteAgentDispatchResponse {
+    pub content: String,
+}
+
+fn hosted_agents_path() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("hosted_agents.json"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HostedAgents {
+    #[serde(default)]
+    agents: HashMap<String, HostedAgent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostedAgent {
+    group_id: String,
+    name: String,
+    token: String,
+}
+
+fn load_hosted_agents() -> Result<HostedAgents> {
+    let path = hosted_agents_path()?;
+    if !path.exists() {
+        return Ok(HostedAgents::default());
+    }
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn save_hosted_agents(store: &HostedAgents) -> Result<()> {
+    let path = hosted_agents_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(store)?, true)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+pub(crate) fn register_hosted_agent(group_id: &str, name: &str, token: &str) -> Result<()> {
+    let mut store = load_hosted_agents()?;
+    let key = format!("{}:{}", group_id, name.trim().to_lowercase());
+    store.agents.insert(
+        key,
+        HostedAgent {
+            group_id: group_id.to_string(),
+            name: name.trim().to_string(),
+            token: token.to_string(),
+        },
+    );
+    save_hosted_agents(&store)
+}
+
+pub(crate) fn validate_hosted_agent_token(group_id: &str, name: &str, token: &str) -> bool {
+    let key = format!("{}:{}", group_id, name.trim().to_lowercase());
+    if let Ok(store) = load_hosted_agents()
+        && let Some(agent) = store.agents.get(&key)
+    {
+        return constant_time_token_eq(&agent.token, token);
+    }
+    false
+}
+
 fn modify_group<F, T>(id: &str, f: F) -> Result<T>
 where
     F: FnOnce(&mut Group) -> Result<T>,
@@ -133,6 +368,7 @@ where
     let mut group = load_group(id)?;
     let result = f(&mut group);
     if result.is_ok() {
+        recompute_member_token_index(&mut group);
         save_group(&group)?;
     }
     drop(lock_file);
@@ -163,7 +399,9 @@ fn save_group(group: &Group) -> Result<()> {
 pub(crate) fn load_group(id: &str) -> Result<Group> {
     let path = group_path(id)?;
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{e}"))
+    let mut group: Group = serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
+    recompute_member_token_index(&mut group);
+    Ok(group)
 }
 
 pub(crate) async fn load_group_async(id: &str) -> Result<Group> {
@@ -178,17 +416,31 @@ pub(crate) fn load_messages(id: &str) -> Result<Vec<GroupMessage>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let mut file = std::fs::OpenOptions::new().read(true).open(&path)?;
+    let metadata = std::fs::metadata(&path)?;
+    if metadata.len() > MAX_GROUP_MESSAGES_BYTES {
+        bail!(
+            "group {id} messages file exceeds the {} byte limit; clear or archive messages",
+            MAX_GROUP_MESSAGES_BYTES
+        );
+    }
+    let file = std::fs::OpenOptions::new().read(true).open(&path)?;
     file.lock_shared()?;
-    let mut raw = String::new();
-    file.read_to_string(&mut raw)
-        .with_context(|| format!("read {}", path.display()))?;
-    drop(file);
-    raw.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(|l| serde_json::from_str(l).with_context(|| format!("parse message line: {l}")))
-        .collect()
+    let reader = std::io::BufReader::new(file);
+    let mut messages: VecDeque<GroupMessage> = VecDeque::with_capacity(MAX_LOADED_MESSAGES);
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("read message line in {}", path.display()))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let m: GroupMessage =
+            serde_json::from_str(line).with_context(|| format!("parse message line: {line}"))?;
+        if messages.len() >= MAX_LOADED_MESSAGES {
+            messages.pop_front();
+        }
+        messages.push_back(m);
+    }
+    Ok(messages.into_iter().collect())
 }
 
 pub(crate) async fn load_messages_async(id: &str) -> Result<Vec<GroupMessage>> {
@@ -206,11 +458,40 @@ pub(crate) fn add_message(id: &str, message: &GroupMessage) -> Result<()> {
     let existed = path.exists();
     let mut file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(false)
         .read(true)
+        .write(true)
         .open(&path)?;
     file.lock_exclusive()?;
+
     let line = serde_json::to_string(message)?;
+    let line_len = line.len() as u64 + 1;
+    let size = file.metadata()?.len();
+    if size + line_len > MAX_GROUP_MESSAGES_BYTES {
+        file.seek(SeekFrom::Start(0))?;
+        let reader = std::io::BufReader::new(&file);
+        let mut kept: VecDeque<String> = VecDeque::with_capacity(MAX_LOADED_MESSAGES);
+        for l in reader.lines() {
+            let l = l?;
+            let l = l.trim();
+            if l.is_empty() {
+                continue;
+            }
+            if kept.len() >= MAX_LOADED_MESSAGES {
+                kept.pop_front();
+            }
+            kept.push_back(l.to_string());
+        }
+        let drop_count = kept.len() / 2;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        for l in kept.into_iter().skip(drop_count) {
+            writeln!(file, "{l}")?;
+        }
+        file.flush()?;
+    }
+
+    file.seek(SeekFrom::End(0))?;
     writeln!(file, "{line}")?;
     drop(file);
     if !existed {
@@ -220,6 +501,9 @@ pub(crate) fn add_message(id: &str, message: &GroupMessage) -> Result<()> {
 }
 
 pub(crate) async fn add_message_async(id: &str, message: &GroupMessage) -> Result<()> {
+    if message.content.len() > MAX_GROUP_MESSAGE_BYTES {
+        bail!("message too large (max {MAX_GROUP_MESSAGE_BYTES} bytes)");
+    }
     let id = id.to_string();
     let message = message.clone();
     tokio::task::spawn_blocking(move || add_message(&id, &message))
@@ -233,36 +517,76 @@ pub async fn run_group(args: &GroupArgs) -> Result<()> {
         GroupCommand::List => list_groups(),
         GroupCommand::Show { id } => show_group(id),
         GroupCommand::Chat(args) => {
-            let human_name = args.human_name.clone().unwrap_or_else(default_human_name);
+            let id = args.id.clone();
+            let human_name = args
+                .human_name
+                .clone()
+                .unwrap_or_else(default_human_name)
+                .trim()
+                .to_string();
+            let provided_token = args.token.clone();
             if let Some(remote) = args.remote.as_deref() {
-                let token = args
-                    .token
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--token is required for remote group chat"))?;
-                chat_remote(&args.id, token, &human_name, remote).await
+                let token =
+                    resolve_remote_member_token(&id, &human_name, provided_token.as_deref())?;
+                let validated = validate_remote_base_url(remote).await?;
+                chat_remote(&id, &token, &human_name, &validated).await
             } else {
-                chat(args).await
+                let name_for_token = human_name.clone();
+                let id_for_token = id.clone();
+                let (token, human_name) = modify_group_async(&id, move |g| {
+                    resolve_local_member_token(
+                        g,
+                        &id_for_token,
+                        &name_for_token,
+                        provided_token.as_deref(),
+                    )
+                })
+                .await?;
+                chat(&id, &token, &human_name, args.yolo).await
             }
         }
         GroupCommand::Send(args) => {
+            let id = args.id.clone();
+            let human_name = args
+                .human_name
+                .clone()
+                .unwrap_or_else(default_human_name)
+                .trim()
+                .to_string();
+            let content = args.message.trim().to_string();
+            if content.len() > MAX_GROUP_MESSAGE_BYTES {
+                bail!("message too large (max {MAX_GROUP_MESSAGE_BYTES} bytes)");
+            }
+            let mut message = GroupMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: Utc::now(),
+                sender: human_name.clone(),
+                content,
+                kind: MessageKind::Human,
+            };
+            let provided_token = args.token.clone();
             if let Some(remote) = args.remote.as_deref() {
-                let token = args
-                    .token
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--token is required for remote group send"))?;
-                let sender = args.human_name.clone().unwrap_or_else(default_human_name);
-                let message = GroupMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: Utc::now(),
-                    sender,
-                    content: args.message.clone(),
-                    kind: MessageKind::Human,
-                };
-                send_remote(&args.id, token, &message, remote).await?;
-                println!("sent message to remote group {}", args.id);
+                let token =
+                    resolve_remote_member_token(&id, &human_name, provided_token.as_deref())?;
+                let validated = validate_remote_base_url(remote).await?;
+                send_remote(&id, &token, &message, &validated).await?;
+                save_membership(&id, &human_name, &token)?;
+                println!("sent message to remote group {}", id);
                 Ok(())
             } else {
-                send(args).await
+                let name_for_token = human_name.clone();
+                let id_for_token = id.clone();
+                let (token, canonical_name) = modify_group_async(&id, move |g| {
+                    resolve_local_member_token(
+                        g,
+                        &id_for_token,
+                        &name_for_token,
+                        provided_token.as_deref(),
+                    )
+                })
+                .await?;
+                message.sender = canonical_name;
+                send(&id, &token, &message).await
             }
         }
         GroupCommand::Join(args) => {
@@ -271,22 +595,33 @@ pub async fn run_group(args: &GroupArgs) -> Result<()> {
                     .token
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("--token is required for remote group join"))?;
-                join_remote(&args.id, token, args, remote).await
+                let validated = validate_remote_base_url(remote).await?;
+                join_remote(&args.id, token, args, &validated).await
             } else {
                 join_local(&args.id, args).await
             }
         }
         GroupCommand::Approve(args) => {
+            let approver = args
+                .name
+                .clone()
+                .unwrap_or_else(default_human_name)
+                .trim()
+                .to_string();
             if let Some(remote) = args.remote.as_deref() {
-                let token = args.token.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("--token is required for remote group approve")
-                })?;
-                approve_remote(&args.id, &args.request_id, token, args, remote).await
+                let token =
+                    resolve_remote_member_token(&args.id, &approver, args.token.as_deref())?;
+                let validated = validate_remote_base_url(remote).await?;
+                approve_remote(&args.id, &args.request_id, &token, args, &validated).await
             } else {
-                approve_local(&args.id, &args.request_id).await
+                approve_local(&args.id, &args.request_id, args).await
             }
         }
         GroupCommand::Invite { id } => invite(id),
+        GroupCommand::RemoteAgentAdd(args) => add_remote_agent(&args.id, args).await,
+        GroupCommand::RemoteAgentList { id } => list_remote_agents(id).await,
+        GroupCommand::RemoteAgentRemove { id, name } => remove_remote_agent(id, name).await,
+        GroupCommand::HostAgent(args) => host_agent(args).await,
     }
 }
 
@@ -375,6 +710,12 @@ pub(crate) fn build_group(args: &GroupNewArgs, spec: GroupSpec) -> Result<Group>
         });
     }
 
+    let mut member_tokens = HashMap::new();
+    let mut member_token_index = HashMap::new();
+    let host_token = generate_member_token();
+    member_tokens.insert(spec.host_name.clone(), host_token.clone());
+    member_token_index.insert(host_token.clone(), spec.host_name.clone());
+
     let group = Group {
         id: uuid::Uuid::new_v4().to_string(),
         name: args.name.clone(),
@@ -385,11 +726,16 @@ pub(crate) fn build_group(args: &GroupNewArgs, spec: GroupSpec) -> Result<Group>
         invite_token: uuid::Uuid::new_v4().to_string().replace('-', ""),
         host_name: spec.host_name.clone(),
         members: vec![spec.host_name],
+        member_tokens,
+        member_token_index,
         pending_joins: Vec::new(),
         agents,
+        remote_agents: Vec::new(),
+        approved_member_tokens: HashMap::new(),
     };
 
     save_group(&group)?;
+    save_membership(&group.id, &group.host_name, &host_token)?;
     Ok(group)
 }
 
@@ -425,15 +771,33 @@ pub(crate) fn validate_member_name(group: &Group, name: &str) -> Result<()> {
     if group.agents.iter().any(|a| a.name.eq_ignore_ascii_case(n)) {
         bail!("human name '{n}' conflicts with an agent name");
     }
+    if group
+        .remote_agents
+        .iter()
+        .any(|r| r.name.eq_ignore_ascii_case(n))
+    {
+        bail!("human name '{n}' conflicts with a remote agent name");
+    }
     Ok(())
 }
 
-pub(crate) fn ensure_local_member(group: &mut Group, name: &str) -> Result<()> {
+pub(crate) fn ensure_local_member(group: &mut Group, name: &str) -> Result<String> {
     validate_member_name(group, name)?;
-    if !is_member(group, name) {
-        group.members.push(name.trim().to_string());
+    issue_member_token(group, name)
+}
+
+pub(crate) fn truncate_message_content(s: &str) -> String {
+    let mut out = String::with_capacity(MAX_GROUP_MESSAGE_BYTES.min(s.len()));
+    let mut len = 0;
+    for c in s.chars() {
+        let cl = c.len_utf8();
+        if len + cl > MAX_GROUP_MESSAGE_BYTES {
+            break;
+        }
+        out.push(c);
+        len += cl;
     }
-    Ok(())
+    out
 }
 
 pub(crate) fn add_join_request(
@@ -461,38 +825,58 @@ pub(crate) fn add_join_request(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
         requested_at: Utc::now(),
+        pre_auth_token: Some(generate_member_token()),
     });
     Ok(id)
 }
 
-pub(crate) fn approve_join_request(group: &mut Group, request_id: &str) -> Result<String> {
+pub(crate) fn approve_join_request(
+    group: &mut Group,
+    request_id: &str,
+    pre_auth: &str,
+) -> Result<(String, String)> {
     let pos = group
         .pending_joins
         .iter()
         .position(|r| r.id == request_id)
         .ok_or_else(|| anyhow::anyhow!("join request {request_id} not found"))?;
     let req = group.pending_joins.remove(pos);
-    if !is_member(group, &req.name) {
-        group.members.push(req.name.clone());
+    if let Some(expected) = &req.pre_auth_token
+        && !pre_auth.is_empty()
+        && !constant_time_token_eq(pre_auth, expected)
+    {
+        bail!("pre-auth token mismatch for join request {request_id}");
     }
-    Ok(req.name)
+    let token = issue_member_token(group, &req.name)?;
+    if !pre_auth.is_empty() {
+        group
+            .approved_member_tokens
+            .insert(pre_auth.to_string(), token.clone());
+    }
+    Ok((req.name, token))
 }
 
 async fn new_group(args: &GroupNewArgs) -> Result<()> {
     let group = create_group(args).await?;
+    let host_token = group
+        .member_tokens
+        .get(&group.host_name)
+        .cloned()
+        .unwrap_or_else(generate_member_token);
 
     println!("created group {}: {}", group.id, group.name);
     println!("  agents:");
     for a in &group.agents {
         println!("    {} ({}) — {}", a.name, a.model, a.role);
     }
+    println!("\nhost member token: {host_token}");
     println!(
-        "\nhost chat:    omgb group chat {} --token {}",
-        group.id, group.invite_token
+        "host chat:    omgb group chat {} --token {}",
+        group.id, host_token
     );
     println!(
         "send message: omgb group send {} \"<message>\" --token {}",
-        group.id, group.invite_token
+        group.id, host_token
     );
     println!(
         "invite link:  omgb://group/{}?token={}",
@@ -548,6 +932,12 @@ fn show_group(id: &str) -> Result<()> {
     for a in &group.agents {
         println!("  {} ({}) — {}", a.name, a.model, a.role);
     }
+    if !group.remote_agents.is_empty() {
+        println!("remote agents:");
+        for r in &group.remote_agents {
+            println!("  {} ({}) — {}", r.name, r.model, r.role);
+        }
+    }
     let messages = load_messages(id)?;
     if !messages.is_empty() {
         println!("\nmessages (last {} shown):", messages.len().min(30));
@@ -562,13 +952,8 @@ fn show_group(id: &str) -> Result<()> {
 fn invite(id: &str) -> Result<()> {
     let group = load_group(id)?;
     println!(
-        "share this with humans/agents to join group {}:\n",
+        "share this invite link with humans/agents to join group {}:\n",
         group.name
-    );
-    println!("  omgb group chat {id} --token {}", group.invite_token);
-    println!(
-        "  omgb group send {id} \"<message>\" --token {}",
-        group.invite_token
     );
     println!("  omgb://group/{id}?token={}", group.invite_token);
     if let Ok(remote) = std::env::var("OMGB_REMOTE") {
@@ -578,29 +963,147 @@ fn invite(id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn send(args: &GroupSendArgs) -> Result<()> {
-    let group = load_group_async(&args.id).await?;
-    validate_token(&group, args.token.as_deref())?;
-    let sender = args.human_name.clone().unwrap_or_else(default_human_name);
-    let sender_for_modify = sender.clone();
-    modify_group_async(&args.id, move |g| {
-        ensure_local_member(g, &sender_for_modify)
+async fn add_remote_agent(id: &str, args: &GroupRemoteAgentAddArgs) -> Result<()> {
+    crate::threads::validate_id(id)?;
+    let name = args.name.trim().to_string();
+    validate_human_name(&name)?;
+    let url = args.url.trim().to_string();
+    if url.is_empty() {
+        bail!("remote agent url is required");
+    }
+    let token = args
+        .token
+        .as_deref()
+        .map(|s: &str| s.trim().to_string())
+        .filter(|s: &String| !s.is_empty())
+        .unwrap_or_else(generate_member_token);
+    let role = args.role.trim().to_string();
+    let model = normalize_model(args.model.trim());
+    let allow_local = args.allow_local;
+
+    validate_remote_agent_url(&url, allow_local).await?;
+
+    let name_print = name.clone();
+    let url_print = url.clone();
+    let token_print = token.clone();
+    modify_group_async(id, move |group| {
+        if all_agent_names(group).len() >= MAX_AGENTS {
+            bail!("a group can have at most {MAX_AGENTS} agents");
+        }
+        if group
+            .agents
+            .iter()
+            .any(|a| a.name.eq_ignore_ascii_case(&name))
+            || group
+                .remote_agents
+                .iter()
+                .any(|r| r.name.eq_ignore_ascii_case(&name))
+            || group.members.iter().any(|m| m.eq_ignore_ascii_case(&name))
+        {
+            bail!("name '{name}' is already in use in this group");
+        }
+        group.remote_agents.push(RemoteAgent {
+            name: name.clone(),
+            role: role.clone(),
+            model: model.clone(),
+            token: token.clone(),
+            callback_url: Some(url.clone()),
+            allow_local,
+            last_heartbeat: None,
+        });
+        Ok(())
     })
     .await?;
-    let group = load_group_async(&args.id).await?;
-    let message = GroupMessage {
-        id: uuid::Uuid::new_v4().to_string(),
-        timestamp: Utc::now(),
-        sender,
-        content: args.message.clone(),
-        kind: MessageKind::Human,
-    };
-    add_message_async(&group.id, &message).await?;
-    let sender = message.sender.clone();
+    println!("added remote agent '{name_print}' to group {id}");
+    println!("  url: {url_print}");
+    println!("  token: {token_print}");
+    Ok(())
+}
+
+async fn list_remote_agents(id: &str) -> Result<()> {
+    crate::threads::validate_id(id)?;
+    let group = load_group_async(id).await?;
+    if group.remote_agents.is_empty() {
+        println!("no remote agents in group {id}");
+        return Ok(());
+    }
+    println!("remote agents in group {}:", group.name);
+    for r in &group.remote_agents {
+        let status = r
+            .last_heartbeat
+            .map(|h| format!("last heartbeat {h}"))
+            .unwrap_or_else(|| "never seen".to_string());
+        let url = r.callback_url.as_deref().unwrap_or("-");
+        println!("  {} ({}) — {} [{}]", r.name, r.role, url, status);
+    }
+    Ok(())
+}
+
+async fn remove_remote_agent(id: &str, name: &str) -> Result<()> {
+    crate::threads::validate_id(id)?;
+    let name = name.trim().to_string();
+    let name_print = name.clone();
+    let id_owned = id.to_string();
+    modify_group_async(id, move |group| {
+        let pos = group
+            .remote_agents
+            .iter()
+            .position(|r| r.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| {
+                anyhow::anyhow!("remote agent '{name}' not found in group {id_owned}")
+            })?;
+        group.remote_agents.remove(pos);
+        Ok(())
+    })
+    .await?;
+    println!("removed remote agent '{name_print}' from group {id}");
+    Ok(())
+}
+
+async fn host_agent(args: &GroupHostAgentArgs) -> Result<()> {
+    let group_id = args.id.trim().to_string();
+    crate::threads::validate_id(&group_id)?;
+    let name = args.name.trim().to_string();
+    validate_human_name(&name)?;
+    let token = args
+        .token
+        .as_deref()
+        .map(|s: &str| s.trim().to_string())
+        .filter(|s: &String| !s.is_empty())
+        .unwrap_or_else(generate_member_token);
+    let group_id_print = group_id.clone();
+    let name_print = name.clone();
+    let token_print = token.clone();
+    tokio::task::spawn_blocking(move || register_hosted_agent(&group_id, &name, &token))
+        .await
+        .context("register hosted agent task failed")??;
+    println!("registered hosted agent '{name_print}' for group {group_id_print}");
+    println!("  dispatch URL path: /group/{group_id_print}/agent/{name_print}/dispatch");
+    println!("  token: {token_print}");
+    println!(
+        "  configure the remote group with: omgb group remote-agent-add {group_id_print} {name_print} --url <this-server>/group/{group_id_print}/agent/{name_print}/dispatch --token {token_print}"
+    );
+    Ok(())
+}
+
+async fn send(id: &str, _token: &str, message: &GroupMessage) -> Result<()> {
+    if message.content.len() > MAX_GROUP_MESSAGE_BYTES {
+        bail!("message too large (max {MAX_GROUP_MESSAGE_BYTES} bytes)");
+    }
+    let group = load_group_async(id).await?;
+    add_message_async(&group.id, message).await?;
+    let trigger_for_dispatch = message.clone();
+    let sender = trigger_for_dispatch.sender.clone();
     let group_for_dispatch = group.clone();
     let runtime_handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        let _ = runtime_handle.block_on(dispatch_for_message(group_for_dispatch, message, sender));
+        if let Err(e) = runtime_handle.block_on(dispatch_for_message(
+            group_for_dispatch,
+            trigger_for_dispatch,
+            sender,
+        )) {
+            eprintln!("warning: group dispatch failed: {e}");
+        }
     });
     println!("sent message to group {} ({})", group.id, group.name);
     Ok(())
@@ -613,29 +1116,18 @@ fn print_pending_alert(requests: &[JoinRequest]) {
         let gh = r.github.as_deref().unwrap_or("-");
         println!("  {}: {} (github: {})", r.id, r.name, gh);
     }
-    println!("Approve with: omgb group approve <id> <request_id>");
+    println!(
+        "Approve with: omgb group approve <id> <request_id> --token <member-token> [--remote <url>]"
+    );
     println!("\x1b[0m");
 }
 
-async fn chat(args: &GroupChatArgs) -> Result<()> {
-    let group = load_group_async(&args.id).await?;
-    validate_token(&group, args.token.as_deref())?;
-    let human_name = args.human_name.clone().unwrap_or_else(default_human_name);
-    let modify_name = human_name.clone();
-    modify_group_async(&args.id, move |g| ensure_local_member(g, &modify_name)).await?;
-    let group = load_group_async(&args.id).await?;
-    let yolo = args.yolo || group.yolo;
+async fn chat(id: &str, _token: &str, human_name: &str, yolo: bool) -> Result<()> {
+    let group = load_group_async(id).await?;
+    let yolo = yolo || group.yolo;
 
     println!("group: {} ({})", group.name, group.id);
-    println!(
-        "agents: {}",
-        group
-            .agents
-            .iter()
-            .map(|a| a.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    println!("agents: {}", all_agent_names(&group).join(", "));
     println!("members: {}", group.members.join(", "));
     if !group.pending_joins.is_empty() {
         print_pending_alert(&group.pending_joins);
@@ -682,7 +1174,7 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
                     }
                     seen.insert(m.id.clone());
                     if !matches!(m.kind, MessageKind::Agent) && m.sender != human_name {
-                        dispatch_turn(&group, m, &human_name, yolo, &mut seen).await?;
+                        dispatch_turn(&group, m, human_name, yolo, &mut seen).await?;
                     }
                 }
             }
@@ -697,24 +1189,33 @@ async fn chat(args: &GroupChatArgs) -> Result<()> {
                 if text == "/quit" || text == "/exit" {
                     break;
                 }
+                if text.len() > MAX_GROUP_MESSAGE_BYTES {
+                    eprintln!("message too large (max {MAX_GROUP_MESSAGE_BYTES} bytes)");
+                    continue;
+                }
 
                 let message = GroupMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     timestamp: Utc::now(),
-                    sender: human_name.clone(),
-                    content: text.into(),
+                    sender: human_name.to_string(),
+                    content: text.to_string(),
                     kind: MessageKind::User,
                 };
                 add_message_async(&group.id, &message).await?;
                 print_message(&message);
                 seen.insert(message.id.clone());
-                dispatch_turn(&group, &message, &human_name, yolo, &mut seen).await?;
+                dispatch_turn(&group, &message, human_name, yolo, &mut seen).await?;
             }
         }
     }
 
     println!("\nleft group {}", group.id);
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteGroupAgentInfo {
+    name: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -732,52 +1233,53 @@ struct RemoteGroupInfo {
     #[serde(default)]
     pending_joins: Vec<JoinRequest>,
     agents: Vec<Agent>,
+    #[serde(default)]
+    remote_agents: Vec<RemoteGroupAgentInfo>,
 }
 
 pub(crate) async fn chat_remote(
     id: &str,
     token: &str,
     human_name: &str,
-    remote: &str,
+    vurl: &crate::net::ValidatedUrl,
 ) -> Result<()> {
-    let remote = remote.trim_end_matches('/');
-    let info_url = format!("{remote}/group/{id}");
-    let messages_url = format!("{remote}/group/{id}/messages");
-    let joins_url = format!("{remote}/group/{id}/joins");
+    let base = vurl.url.as_str().trim_end_matches('/');
+    let info_url = format!("{base}/group/{id}");
+    let messages_url = format!("{base}/group/{id}/messages");
+    let joins_url = format!("{base}/group/{id}/joins");
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let group: Group = match client
+    let client = crate::net::build_client(vurl, std::time::Duration::from_secs(30))?;
+    let info = match client
         .get(&info_url)
-        .header("x-group-token", token)
+        .header("x-member-token", token)
         .send()
         .await
     {
-        Ok(res) if res.status().is_success() => {
-            let info = res
-                .json::<RemoteGroupInfo>()
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to parse group info: {e}"))?;
-            Group {
-                id: id.to_string(),
-                name: info.name,
-                description: info.description,
-                created_at: Utc::now(),
-                model: info.model,
-                yolo: info.yolo,
-                invite_token: token.to_string(),
-                host_name: info.host_name,
-                members: info.members,
-                pending_joins: info.pending_joins,
-                agents: info.agents,
-            }
-        }
+        Ok(res) if res.status().is_success() => res
+            .json::<RemoteGroupInfo>()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to parse group info: {e}"))?,
         Ok(res) => bail!("failed to fetch group info: {}", res.status()),
         Err(e) => bail!("failed to fetch group info: {e}"),
     };
 
-    let can_send = is_member(&group, human_name);
+    let group = Group {
+        id: id.to_string(),
+        name: info.name,
+        description: info.description,
+        created_at: Utc::now(),
+        model: info.model,
+        yolo: info.yolo,
+        invite_token: String::new(),
+        host_name: info.host_name,
+        members: info.members,
+        member_tokens: HashMap::new(),
+        member_token_index: HashMap::new(),
+        pending_joins: info.pending_joins,
+        agents: info.agents,
+        remote_agents: Vec::new(),
+        approved_member_tokens: HashMap::new(),
+    };
 
     println!("group: {} ({})", group.name, group.id);
     println!(
@@ -789,13 +1291,17 @@ pub(crate) async fn chat_remote(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!("members: {}", group.members.join(", "));
-    if !can_send {
-        println!("\x1b[1;31m*** You ('{human_name}') are not yet an approved member. ***\x1b[0m");
+    if !info.remote_agents.is_empty() {
         println!(
-            "Run: omgb group join {id} --token <token> --remote {remote} --name <your-name> [--github <github>]"
+            "remote agents: {}",
+            info.remote_agents
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
+    println!("members: {}", group.members.join(", "));
     if !group.pending_joins.is_empty() {
         print_pending_alert(&group.pending_joins);
     }
@@ -804,17 +1310,21 @@ pub(crate) async fn chat_remote(
     let mut seen: HashSet<String> = HashSet::new();
     match client
         .get(&messages_url)
-        .header("x-group-token", token)
+        .header("x-member-token", token)
         .send()
         .await
     {
         Ok(res) if res.status().is_success() => {
+            save_membership(id, human_name, token)?;
             if let Ok(initial) = res.json::<Vec<GroupMessage>>().await {
                 for m in &initial {
                     print_message(m);
                     seen.insert(m.id.clone());
                 }
             }
+        }
+        Ok(res) if res.status().as_u16() == 401 => {
+            bail!("invalid member token for group {id}")
         }
         Ok(res) => eprintln!("warning: failed to fetch messages: {}", res.status()),
         Err(e) => eprintln!("warning: failed to fetch messages: {e}"),
@@ -831,7 +1341,7 @@ pub(crate) async fn chat_remote(
         input.clear();
         tokio::select! {
             _ = interval.tick() => {
-                match client.get(&messages_url).header("x-group-token", token).send().await {
+                match client.get(&messages_url).header("x-member-token", token).send().await {
                     Ok(res) if res.status().is_success() => {
                         if let Ok(fresh) = res.json::<Vec<GroupMessage>>().await {
                             for m in fresh {
@@ -845,7 +1355,7 @@ pub(crate) async fn chat_remote(
                     Err(e) => eprintln!("warning: failed to poll messages: {e}"),
                 }
 
-                match client.get(&joins_url).header("x-group-token", token).send().await {
+                match client.get(&joins_url).header("x-member-token", token).send().await {
                     Ok(res) if res.status().is_success() => {
                         if let Ok(fresh) = res.json::<Vec<JoinRequest>>().await
                             && fresh.len() != last_pending_count
@@ -869,8 +1379,8 @@ pub(crate) async fn chat_remote(
                 if text == "/quit" || text == "/exit" {
                     break;
                 }
-                if !can_send {
-                    eprintln!("\x1b[1;31m*** You are not an approved member. Run `omgb group join ...` first. ***\x1b[0m");
+                if text.len() > MAX_GROUP_MESSAGE_BYTES {
+                    eprintln!("message too large (max {MAX_GROUP_MESSAGE_BYTES} bytes)");
                     continue;
                 }
 
@@ -881,7 +1391,7 @@ pub(crate) async fn chat_remote(
                     content: text.to_string(),
                     kind: MessageKind::User,
                 };
-                if let Err(e) = send_remote(id, token, &message, remote).await {
+                if let Err(e) = send_remote(id, token, &message, vurl).await {
                     eprintln!("warning: failed to send message: {e}");
                 } else {
                     print_message(&message);
@@ -899,16 +1409,17 @@ pub(crate) async fn send_remote(
     id: &str,
     token: &str,
     message: &GroupMessage,
-    remote: &str,
+    vurl: &crate::net::ValidatedUrl,
 ) -> Result<()> {
-    let remote = remote.trim_end_matches('/');
-    let url = format!("{remote}/group/{id}/messages");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    if message.content.len() > MAX_GROUP_MESSAGE_BYTES {
+        bail!("message too large (max {MAX_GROUP_MESSAGE_BYTES} bytes)");
+    }
+    let base = vurl.url.as_str().trim_end_matches('/');
+    let url = format!("{base}/group/{id}/messages");
+    let client = crate::net::build_client(vurl, std::time::Duration::from_secs(30))?;
     let res = client
         .post(&url)
-        .header("x-group-token", token)
+        .header("x-member-token", token)
         .json(message)
         .send()
         .await?;
@@ -931,42 +1442,70 @@ async fn read_line_prompt(prompt: &str) -> Result<String> {
 
 async fn join_local(id: &str, args: &GroupJoinArgs) -> Result<()> {
     let name = if let Some(n) = args.name.as_deref() {
-        n.to_string()
+        n.trim().to_string()
     } else {
         read_line_prompt("Enter your name: ").await?
     };
+    if name.is_empty() {
+        bail!("name is required to join a group");
+    }
     let github = args.github.clone();
     let modify_name = name.clone();
-    let (status, request_id) = modify_group_async(id, move |group| {
+    let (status, request_id, token) = modify_group_async(id, move |group| {
         if group.members.is_empty() {
-            // Legacy group: first human to join is auto-approved.
-            ensure_local_member(group, &modify_name)?;
-            return Ok(("approved".to_string(), String::new()));
+            let token = ensure_local_member(group, &modify_name)?;
+            return Ok(("approved".to_string(), String::new(), token));
         }
         if is_member(group, &modify_name) {
-            return Ok(("approved".to_string(), String::new()));
+            let token = issue_member_token(group, &modify_name)?;
+            return Ok(("approved".to_string(), String::new(), token));
         }
         let request_id = add_join_request(group, &modify_name, github.as_deref())?;
-        Ok(("pending".to_string(), request_id))
+        Ok(("pending".to_string(), request_id, String::new()))
     })
     .await?;
     if status == "approved" {
-        println!("'{name}' joined group {id} (auto-approved as first member)");
+        save_membership(id, &name, &token)?;
+        println!("'{name}' joined group {id} (member token: {token})");
     } else {
         println!("join request {request_id} for '{name}' is pending approval in group {id}");
-        println!("an existing member can approve with: omgb group approve {id} {request_id}");
+        println!(
+            "an existing member can approve with: omgb group approve {id} {request_id} --token <member-token>"
+        );
     }
     Ok(())
 }
 
-async fn approve_local(id: &str, request_id: &str) -> Result<()> {
+async fn approve_local(id: &str, request_id: &str, args: &GroupApproveArgs) -> Result<()> {
+    let approver = args
+        .name
+        .clone()
+        .unwrap_or_else(default_human_name)
+        .trim()
+        .to_string();
+    let token = args
+        .token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("--token <member-token> is required to approve a join request")
+        })?;
     let request_id = request_id.to_string();
     let modify_request_id = request_id.clone();
-    let name = modify_group_async(id, move |group| {
-        approve_join_request(group, &modify_request_id)
+    let token = token.to_string();
+    let (name, member_token) = modify_group_async(id, move |group| {
+        if let Some(member_name) = validate_member_token(group, &token) {
+            if !name_eq(&approver, &member_name) {
+                bail!("token belongs to member '{member_name}', not '{approver}'");
+            }
+        } else {
+            bail!("invalid member token");
+        }
+        approve_join_request(group, &modify_request_id, "")
     })
     .await?;
     println!("approved join request {request_id}: '{name}' can now post in group {id}");
+    println!("member token for '{name}': {member_token}");
     Ok(())
 }
 
@@ -976,21 +1515,35 @@ pub(crate) struct JoinResult {
     pub status: String,
     pub name: String,
     pub github: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_auth_token: Option<String>,
 }
 
-async fn join_remote(id: &str, token: &str, args: &GroupJoinArgs, remote: &str) -> Result<()> {
-    let remote = remote.trim_end_matches('/');
-    let url = format!("{remote}/group/{id}/join");
+async fn join_remote(
+    id: &str,
+    token: &str,
+    args: &GroupJoinArgs,
+    vurl: &crate::net::ValidatedUrl,
+) -> Result<()> {
     let name = if let Some(n) = args.name.as_deref() {
-        n.to_string()
+        n.trim().to_string()
     } else {
         read_line_prompt("Enter your name: ").await?
     };
-    let github = args.github.as_deref();
+    if name.is_empty() {
+        bail!("name is required to join a group");
+    }
+    let base = vurl.url.as_str().trim_end_matches('/');
+    let url = format!("{base}/group/{id}/join");
+    let github = args
+        .github
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = crate::net::build_client(vurl, std::time::Duration::from_secs(30))?;
     let body = serde_json::json!({
         "name": name,
         "github": github,
@@ -1006,17 +1559,45 @@ async fn join_remote(id: &str, token: &str, args: &GroupJoinArgs, remote: &str) 
         bail!("failed to request join: {text}");
     }
     let result: JoinResult = res.json().await?;
-    if result.status == "approved" {
-        println!("'{name}' was auto-approved for group {id}");
-    } else {
-        println!(
-            "join request {} for '{name}' is pending approval in group {id}",
-            result.id
-        );
-        println!(
-            "an existing member can approve with: omgb group approve {id} {} --token <token> --remote {remote}",
-            result.id
-        );
+    match result.status.as_str() {
+        "approved" => {
+            if let Some(member_token) = result.member_token {
+                save_membership(id, &name, &member_token)?;
+                println!(
+                    "'{name}' was auto-approved for group {id} (member token: {member_token})"
+                );
+            } else {
+                println!("'{name}' was auto-approved for group {id}");
+            }
+        }
+        "member" => {
+            if let Some(membership) = load_membership_by_name(id, &name) {
+                println!(
+                    "'{name}' is already a member of group {id} (member token: {membership_token})",
+                    membership_token = membership.token
+                );
+            } else {
+                bail!(
+                    "'{name}' is already a member of group {id}; pass --token <member-token> to chat"
+                );
+            }
+        }
+        _ => {
+            println!(
+                "join request {} for '{name}' is pending approval in group {id}",
+                result.id
+            );
+            println!(
+                "an existing member can approve with: omgb group approve {id} {} --token <token> --remote {base}",
+                result.id
+            );
+            if let Some(pre_auth) = result.pre_auth_token {
+                println!(
+                    "poll for approval with: GET {base}/group/{id}/joins/{}/status?pre_auth={pre_auth}",
+                    result.id
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1025,19 +1606,15 @@ async fn approve_remote(
     id: &str,
     request_id: &str,
     token: &str,
-    args: &GroupApproveArgs,
-    remote: &str,
+    _args: &GroupApproveArgs,
+    vurl: &crate::net::ValidatedUrl,
 ) -> Result<()> {
-    let remote = remote.trim_end_matches('/');
-    let url = format!("{remote}/group/{id}/joins/{request_id}/approve");
-    let approver = args.name.clone().unwrap_or_else(default_human_name);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let base = vurl.url.as_str().trim_end_matches('/');
+    let url = format!("{base}/group/{id}/joins/{request_id}/approve");
+    let client = crate::net::build_client(vurl, std::time::Duration::from_secs(30))?;
     let res = client
         .post(&url)
-        .header("x-group-token", token)
-        .header("x-approver-name", approver)
+        .header("x-member-token", token)
         .send()
         .await?;
     if !res.status().is_success() {
@@ -1049,6 +1626,9 @@ async fn approve_remote(
         "approved join request {request_id}: '{}' can now post in group {id}",
         result.name
     );
+    if let Some(member_token) = result.member_token {
+        println!("member token for '{}': {member_token}", result.name);
+    }
     Ok(())
 }
 
@@ -1104,7 +1684,9 @@ async fn dispatch_turn(
     }
 
     seen.insert(trigger.id.clone());
+    let pre_main_seen = seen.clone();
 
+    let agent_names = all_agent_names(group);
     let prompt = build_routing_prompt(group, &messages[..=idx], trigger, human_name);
     let reply = match crate::run_single_turn_capture(
         &prompt,
@@ -1122,28 +1704,75 @@ async fn dispatch_turn(
         }
     };
 
-    let replies = parse_replies(&reply, &group.agents);
-    for (name, content) in replies {
+    let replies: Vec<_> = parse_replies(&reply, &agent_names)
+        .into_iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(&trigger.sender))
+        .collect();
+
+    let mut new_message_ids: Vec<String> = Vec::new();
+    for (name, _content) in replies {
+        let content = if let Some(remote) = find_remote_agent(group, &name) {
+            let prompt = format!(
+                "You are {} ({}) in the group chat.\n\n\
+                 Conversation so far:\n{}\n\n\
+                 Reply to the latest message. Be concise and in character.",
+                remote.name,
+                remote.role,
+                format_history(&messages, HISTORY_LIMIT)
+            );
+            match dispatch_remote_agent(group, remote, &prompt, &messages, trigger).await {
+                Some(c) => c,
+                None => continue,
+            }
+        } else if let Some(agent) = group
+            .agents
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(&name))
+        {
+            let prompt = format!(
+                "You are {} ({}) in the group chat.\n\n\
+                 Conversation so far:\n{}\n\n\
+                 Reply to the latest message. Be concise and in character.",
+                agent.name,
+                agent.role,
+                format_history(&messages, HISTORY_LIMIT)
+            );
+            let model = agent_model(group, &agent.name);
+            match crate::run_single_turn_capture(&prompt, Some(model), yolo, Some(1), None).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("warning: agent {name} reply failed: {e}");
+                    continue;
+                }
+            }
+        } else {
+            continue;
+        };
+        let content = truncate_message_content(&content);
+        let trimmed = content.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NO_REPLY") {
+            continue;
+        }
         let message = GroupMessage {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
             sender: name,
-            content,
+            content: trimmed.into(),
             kind: MessageKind::Agent,
         };
         add_message_async(&group.id, &message).await?;
         messages.push(message.clone());
         print_message(&message);
-        seen.insert(message.id.clone());
+        new_message_ids.push(message.id.clone());
     }
 
     // One round of @mention routing so agents can ask each other directly.
-    // Only consider messages not already handled in a previous dispatch so
-    // the same mention pair does not trigger repeatedly.
+    // Only consider messages produced in this turn so the same mention pair
+    // does not trigger repeatedly.
     let mut mention_targets: Vec<(String, String, String)> = Vec::new();
     for m in messages.iter().rev().take(HISTORY_LIMIT) {
-        if matches!(m.kind, MessageKind::Agent) && !seen.contains(&m.id) {
-            for target in parse_mentions(&m.content, &group.agents) {
+        if matches!(m.kind, MessageKind::Agent) && !pre_main_seen.contains(&m.id) {
+            for target in parse_mentions(&m.content, &agent_names) {
                 if target.eq_ignore_ascii_case(&m.sender) {
                     continue;
                 }
@@ -1159,7 +1788,23 @@ async fn dispatch_turn(
     }
 
     for (sender, target_name, context) in mention_targets.into_iter().take(MENTION_LIMIT * 5) {
-        if let Some(agent) = group
+        let content = if let Some(remote) = find_remote_agent(group, &target_name) {
+            let prompt = format!(
+                "You are {} ({}) in the group chat.\n\n\
+                 Conversation so far:\n{}\n\n\
+                 {} mentioned you:\n{}\n\n\
+                 Reply concisely. Do not ask follow-up questions unless essential.",
+                remote.name,
+                remote.role,
+                format_history(&messages, HISTORY_LIMIT),
+                sender,
+                context
+            );
+            match dispatch_remote_agent(group, remote, &prompt, &messages, trigger).await {
+                Some(c) => c,
+                None => continue,
+            }
+        } else if let Some(agent) = group
             .agents
             .iter()
             .find(|a| a.name.eq_ignore_ascii_case(&target_name))
@@ -1176,32 +1821,36 @@ async fn dispatch_turn(
                 context
             );
             let model = agent_model(group, &agent.name);
-            let content =
-                match crate::run_single_turn_capture(&prompt, Some(model), yolo, Some(1), None)
-                    .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("warning: mention reply failed: {e}");
-                        continue;
-                    }
-                };
-            let trimmed = content.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NO_REPLY") {
-                continue;
+            match crate::run_single_turn_capture(&prompt, Some(model), yolo, Some(1), None).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("warning: mention reply failed: {e}");
+                    continue;
+                }
             }
-            let message = GroupMessage {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: Utc::now(),
-                sender: agent.name.clone(),
-                content: trimmed.into(),
-                kind: MessageKind::Agent,
-            };
-            add_message_async(&group.id, &message).await?;
-            messages.push(message.clone());
-            print_message(&message);
-            seen.insert(message.id.clone());
+        } else {
+            continue;
+        };
+        let content = truncate_message_content(&content);
+        let trimmed = content.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NO_REPLY") {
+            continue;
         }
+        let message = GroupMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: Utc::now(),
+            sender: target_name,
+            content: trimmed.into(),
+            kind: MessageKind::Agent,
+        };
+        add_message_async(&group.id, &message).await?;
+        messages.push(message.clone());
+        print_message(&message);
+        new_message_ids.push(message.id.clone());
+    }
+
+    for id in new_message_ids {
+        seen.insert(id);
     }
 
     Ok(())
@@ -1222,6 +1871,23 @@ pub(crate) async fn dispatch_for_message(
     dispatch_turn(&group, &trigger, &human_name, yolo, &mut seen).await
 }
 
+fn all_agent_names(group: &Group) -> Vec<String> {
+    let mut names: Vec<String> = group.agents.iter().map(|a| a.name.clone()).collect();
+    for r in &group.remote_agents {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(&r.name)) {
+            names.push(r.name.clone());
+        }
+    }
+    names
+}
+
+fn find_remote_agent<'a>(group: &'a Group, name: &str) -> Option<&'a RemoteAgent> {
+    group
+        .remote_agents
+        .iter()
+        .find(|r| r.name.eq_ignore_ascii_case(name))
+}
+
 fn build_routing_prompt(
     group: &Group,
     messages: &[GroupMessage],
@@ -1236,6 +1902,12 @@ fn build_routing_prompt(
         prompt.push_str(&format!(
             "- {} (role: {}, model: {})\n",
             a.name, a.role, a.model
+        ));
+    }
+    for r in &group.remote_agents {
+        prompt.push_str(&format!(
+            "- {} (role: {}, model: {}, remote host)\n",
+            r.name, r.role, r.model
         ));
     }
 
@@ -1277,7 +1949,7 @@ fn format_history(messages: &[GroupMessage], limit: usize) -> String {
         .join("\n")
 }
 
-fn parse_replies(text: &str, agents: &[Agent]) -> Vec<(String, String)> {
+fn parse_replies(text: &str, agent_names: &[String]) -> Vec<(String, String)> {
     let value = match crate::extract_json_object(text) {
         Some(v) => v,
         None => {
@@ -1293,15 +1965,15 @@ fn parse_replies(text: &str, agents: &[Agent]) -> Vec<(String, String)> {
             if content.is_empty() || content.eq_ignore_ascii_case("NO_REPLY") {
                 continue;
             }
-            if let Some(agent) = agents.iter().find(|a| a.name.eq_ignore_ascii_case(name)) {
-                out.push((agent.name.clone(), content.to_string()));
+            if let Some(matched) = agent_names.iter().find(|n| n.eq_ignore_ascii_case(name)) {
+                out.push((matched.clone(), content.to_string()));
             }
         }
     }
     out
 }
 
-fn parse_mentions(text: &str, agents: &[Agent]) -> Vec<String> {
+fn parse_mentions(text: &str, agent_names: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (i, _) in text.match_indices('@') {
@@ -1321,18 +1993,86 @@ fn parse_mentions(text: &str, agents: &[Agent]) -> Vec<String> {
         }
         let lower = name.to_lowercase();
         if lower == "all" {
-            for a in agents {
-                if seen.insert(a.name.to_lowercase()) {
-                    out.push(a.name.clone());
+            for n in agent_names {
+                if seen.insert(n.to_lowercase()) {
+                    out.push(n.clone());
                 }
             }
-        } else if let Some(agent) = agents.iter().find(|a| a.name.eq_ignore_ascii_case(name))
-            && seen.insert(agent.name.to_lowercase())
+        } else if let Some(matched) = agent_names.iter().find(|n| n.eq_ignore_ascii_case(name))
+            && seen.insert(matched.to_lowercase())
         {
-            out.push(agent.name.clone());
+            out.push(matched.clone());
         }
     }
     out
+}
+
+async fn dispatch_remote_agent(
+    group: &Group,
+    remote: &RemoteAgent,
+    prompt: &str,
+    history: &[GroupMessage],
+    trigger: &GroupMessage,
+) -> Option<String> {
+    let url = remote.callback_url.as_deref()?;
+    if url.trim().is_empty() {
+        return None;
+    }
+    let vurl = validate_remote_agent_url(url, remote.allow_local)
+        .await
+        .ok()?;
+
+    let payload = RemoteAgentDispatchPayload {
+        group_id: group.id.clone(),
+        agent_name: remote.name.clone(),
+        role: remote.role.clone(),
+        model: remote.model.clone(),
+        group_model: normalize_model(&group.model),
+        yolo: group.yolo,
+        prompt: prompt.to_string(),
+        history: history
+            .iter()
+            .rev()
+            .take(HISTORY_LIMIT)
+            .rev()
+            .cloned()
+            .collect(),
+        message: trigger.clone(),
+    };
+
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-agent-token".to_string(), remote.token.clone());
+    match crate::net::http_post_json(
+        &vurl,
+        &headers,
+        serde_json::to_value(payload).ok()?,
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    {
+        Ok((200, text)) => serde_json::from_str::<RemoteAgentDispatchResponse>(&text)
+            .ok()
+            .and_then(|r| {
+                let c = truncate_message_content(&r.content).trim().to_string();
+                if c.is_empty() || c.eq_ignore_ascii_case("NO_REPLY") {
+                    None
+                } else {
+                    Some(c)
+                }
+            }),
+        Ok((status, text)) => {
+            let preview: String = text.chars().take(120).collect();
+            eprintln!(
+                "warning: remote agent {} returned HTTP {status}: {preview}",
+                remote.name
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("warning: remote agent {} unreachable: {e}", remote.name);
+            None
+        }
+    }
 }
 
 fn print_message(m: &GroupMessage) {
@@ -1459,15 +2199,76 @@ fn default_human_name() -> String {
         .unwrap_or_else(|| "human".to_string())
 }
 
-fn validate_token(group: &Group, token: Option<&str>) -> Result<()> {
-    let t = token.unwrap_or("");
-    if t.is_empty() || t != group.invite_token {
-        bail!(
-            "group {} requires a valid invite token; use --token <token>",
-            group.id
-        );
+fn name_eq(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+async fn validate_remote_agent_url(
+    url: &str,
+    allow_local: bool,
+) -> Result<crate::net::ValidatedUrl> {
+    // --allow-local gates both loopback and private/LAN agent callbacks.
+    crate::net::validate_url(url, allow_local, allow_local).await
+}
+
+async fn validate_remote_base_url(remote: &str) -> Result<crate::net::ValidatedUrl> {
+    let remote = remote.trim_end_matches('/');
+    let is_loopback = crate::net::is_url_host_loopback(remote);
+    let is_private = crate::net::is_url_host_private(remote).await;
+    crate::net::validate_url(remote, is_loopback, is_private).await
+}
+
+/// Resolve a member token for a local group, validating the provided token or
+/// falling back to a saved membership. Returns `(token, canonical_member_name)`.
+fn resolve_local_member_token(
+    group: &mut Group,
+    group_id: &str,
+    human_name: &str,
+    provided_token: Option<&str>,
+) -> Result<(String, String)> {
+    let human_name = human_name.trim().to_string();
+    validate_member_name(group, &human_name)?;
+    if !is_member(group, &human_name) {
+        bail!("'{human_name}' is not a member of group {group_id}; request to join first");
     }
-    Ok(())
+    if let Some(t) = provided_token.filter(|t| !t.is_empty()) {
+        if let Some(name) = validate_member_token(group, t) {
+            if name_eq(&human_name, &name) {
+                save_membership(group_id, &human_name, t)?;
+                return Ok((t.to_string(), name));
+            }
+            bail!("token belongs to member '{name}', not '{human_name}'");
+        }
+        bail!("invalid member token for group {group_id}");
+    }
+    if let Some(membership) = load_membership_by_name(group_id, &human_name)
+        && let Some(name) = validate_member_token(group, &membership.token)
+        && name_eq(&human_name, &name)
+    {
+        return Ok((membership.token, name));
+    }
+    bail!(
+        "no member token found for '{human_name}' in group {group_id}; pass --token <member-token> or run `omgb group join` first"
+    )
+}
+
+/// Resolve a member token for a remote group without requiring the local group file.
+fn resolve_remote_member_token(
+    group_id: &str,
+    human_name: &str,
+    provided_token: Option<&str>,
+) -> Result<String> {
+    let human_name = human_name.trim().to_string();
+    validate_human_name(&human_name)?;
+    if let Some(t) = provided_token.filter(|t| !t.is_empty()) {
+        return Ok(t.to_string());
+    }
+    if let Some(membership) = load_membership_by_name(group_id, &human_name) {
+        return Ok(membership.token);
+    }
+    bail!(
+        "no member token found for '{human_name}' in group {group_id}; pass --token <member-token> or run `omgb group join` first"
+    )
 }
 
 fn dispatch_lock_path(id: &str) -> Result<PathBuf> {
@@ -1531,24 +2332,11 @@ mod tests {
 
     #[test]
     fn parse_mentions_extracts_names_and_all() {
-        let agents = vec![
-            Agent {
-                id: "alice".into(),
-                name: "Alice".into(),
-                role: "coder".into(),
-                model: "omgb-openai".into(),
-            },
-            Agent {
-                id: "bob".into(),
-                name: "bob".into(),
-                role: "reviewer".into(),
-                model: "omgb-openai".into(),
-            },
-        ];
-        let m = parse_mentions("@alice can you check this? @ALL @unknown", &agents);
+        let names = vec!["Alice".to_string(), "bob".to_string()];
+        let m = parse_mentions("@alice can you check this? @ALL @unknown", &names);
         assert_eq!(m, vec!["Alice".to_string(), "bob".to_string()]);
 
-        let m = parse_mentions("email me at alice@example.com or use array@index", &agents);
+        let m = parse_mentions("email me at alice@example.com or use array@index", &names);
         assert!(m.is_empty());
     }
 
@@ -1561,14 +2349,9 @@ mod tests {
 
     #[test]
     fn parse_replies_filters_no_reply() {
-        let agents = vec![Agent {
-            id: "a".into(),
-            name: "Alpha".into(),
-            role: "dev".into(),
-            model: "omgb-openai".into(),
-        }];
+        let names = vec!["Alpha".to_string()];
         let text = r#"{"replies":{"Alpha":"working on it","Beta":"NO_REPLY"}}"#;
-        let replies = parse_replies(text, &agents);
+        let replies = parse_replies(text, &names);
         assert_eq!(replies, vec![("Alpha".into(), "working on it".into())]);
     }
 
@@ -1601,5 +2384,20 @@ mod tests {
             normalize_model("not-a-real-provider"),
             "not-a-real-provider"
         );
+    }
+
+    #[test]
+    fn truncate_message_content_respects_byte_limit_and_char_boundaries() {
+        let short = "hello";
+        assert_eq!(truncate_message_content(short), "hello");
+
+        let repeated = "a".repeat(MAX_GROUP_MESSAGE_BYTES + 10);
+        let truncated = truncate_message_content(&repeated);
+        assert_eq!(truncated.len(), MAX_GROUP_MESSAGE_BYTES);
+
+        let multi_byte = "🎉".repeat(2000);
+        let truncated = truncate_message_content(&multi_byte);
+        assert!(truncated.len() <= MAX_GROUP_MESSAGE_BYTES);
+        assert!(!truncated.is_empty());
     }
 }

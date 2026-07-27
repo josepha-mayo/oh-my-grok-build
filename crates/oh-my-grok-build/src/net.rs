@@ -351,7 +351,10 @@ pub async fn connect_ws_url(
     )
 }
 
-fn build_client(vurl: &ValidatedUrl, timeout: Duration) -> anyhow::Result<reqwest::Client> {
+pub(crate) fn build_client(
+    vurl: &ValidatedUrl,
+    timeout: Duration,
+) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none());
