@@ -1292,69 +1292,68 @@ async fn group_join_status_handler(
         )
     })?;
 
+    let request_id_for_modify = request_id.clone();
+    let pre_auth_for_modify = pre_auth.clone();
+
     let group = crate::group::load_group_async(&id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+    for r in &group.pending_joins {
+        if r.id == request_id
+            && r.pre_auth_token
+                .as_deref()
+                .is_some_and(|t| crate::group::constant_time_token_eq(t, &pre_auth))
+        {
+            return Ok(Json(crate::group::JoinResult {
+                id: request_id,
+                status: "pending".to_string(),
+                name: r.name.clone(),
+                github: r.github.clone(),
+                member_token: None,
+                pre_auth_token: None,
+            }));
+        }
+    }
 
-    if let Some(token) = group.approved_member_tokens.get(&pre_auth) {
-        let token = token.clone();
+    crate::group::modify_group_async(&id, move |group| {
+        let mut approved: Option<(String, String)> = None;
+        for (k, v) in &group.approved_member_tokens {
+            if crate::group::constant_time_token_eq(k, &pre_auth_for_modify) {
+                approved = Some((k.clone(), v.clone()));
+                break;
+            }
+        }
+        let Some((key, token)) = approved else {
+            bail!("join request not found");
+        };
+        group.approved_member_tokens.remove(&key);
         let name = group
             .member_token_index
             .get(&token)
             .cloned()
             .filter(|n| !n.is_empty())
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "member token index inconsistent".to_string(),
-                )
-            })?;
-        let pre_auth_for_modify = pre_auth.clone();
-        crate::group::modify_group_async(&id, move |g| {
-            if g.approved_member_tokens
-                .remove(&pre_auth_for_modify)
-                .is_none()
-            {
-                bail!("join request not found")
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("join request not found") {
-                (StatusCode::NOT_FOUND, "join request not found".to_string())
-            } else {
-                warn!("group join status failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to consume approval".to_string(),
-                )
-            }
-        })?;
+            .ok_or_else(|| anyhow::anyhow!("member token index inconsistent"))?;
         Ok(Json(crate::group::JoinResult {
-            id: request_id,
+            id: request_id_for_modify,
             status: "approved".to_string(),
             name,
             github: None,
             member_token: Some(token),
             pre_auth_token: None,
         }))
-    } else if let Some(req) = group
-        .pending_joins
-        .iter()
-        .find(|r| r.id == request_id && r.pre_auth_token.as_deref() == Some(pre_auth.as_str()))
-    {
-        Ok(Json(crate::group::JoinResult {
-            id: request_id,
-            status: "pending".to_string(),
-            name: req.name.clone(),
-            github: req.github.clone(),
-            member_token: None,
-            pre_auth_token: None,
-        }))
-    } else {
-        Err((StatusCode::NOT_FOUND, "join request not found".to_string()))
-    }
+    })
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("join request not found") {
+            (StatusCode::NOT_FOUND, "join request not found".to_string())
+        } else {
+            warn!("group join status failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to consume approval".to_string(),
+            )
+        }
+    })
 }
 
 #[derive(Deserialize)]
