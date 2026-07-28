@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
@@ -131,6 +132,7 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
     };
 
     let prompt_file = crate::write_prompt_temp(&prompt).await?;
+    let prompt_guard = crate::PromptFileGuard(prompt_file.clone());
     let out_file = std::fs::File::create(&out_path)?;
     let err_file = std::fs::File::create(&err_path)?;
     let mut cmd = tokio::process::Command::new(&exe);
@@ -182,7 +184,8 @@ pub async fn spawn(prompt: &str, yolo: bool) -> Result<()> {
     );
     println!("spawned subagent {id} (pid {pid})");
     tokio::spawn(async move {
-        // Reap the detached child once it exits so it does not become a zombie.
+        // Keep the prompt file alive until the child has read it, then reap.
+        let _guard = prompt_guard;
         let _ = child.wait().await;
     });
     Ok(())
@@ -212,7 +215,24 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
-pub fn kill(id: &str) -> Result<()> {
+async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let alive = tokio::task::spawn_blocking(move || crate::process_alive(pid))
+            .await
+            .unwrap_or(true);
+        if !alive {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let alive = tokio::task::spawn_blocking(move || crate::process_alive(pid))
+        .await
+        .unwrap_or(true);
+    !alive
+}
+
+pub async fn kill(id: &str) -> Result<()> {
     if !is_safe_id(id) {
         bail!("invalid subagent id '{id}'");
     }
@@ -222,25 +242,83 @@ pub fn kill(id: &str) -> Result<()> {
         .find(|r| r.id == id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("subagent '{id}' not found"))?;
-    if !crate::process_alive(record.pid) {
+    let alive = tokio::task::spawn_blocking(move || crate::process_alive(record.pid))
+        .await
+        .unwrap_or(true);
+    if !alive {
         println!("subagent {} (pid {}) is not running", record.id, record.pid);
         return Ok(());
     }
-    #[cfg(unix)]
-    {
+
+    if cfg!(unix) {
         // The subagent called setsid, so its PID is also its process-group ID.
-        std::process::Command::new("kill")
+        let term_status = tokio::process::Command::new("kill")
             .args(["-TERM", &format!("-{}", record.pid)])
-            .spawn()?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::process::Command::new("taskkill")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        if let Err(e) = term_status {
+            // If the process died between the probe and the signal, there is nothing to do.
+            if wait_for_process_exit(record.pid, Duration::from_millis(200)).await {
+                println!("killed subagent {} (pid {})", record.id, record.pid);
+                return Ok(());
+            }
+            bail!(
+                "failed to send SIGTERM to subagent {id} (pid {}): {e}",
+                record.pid
+            );
+        }
+
+        if wait_for_process_exit(record.pid, Duration::from_secs(2)).await {
+            println!("killed subagent {} (pid {})", record.id, record.pid);
+            return Ok(());
+        }
+
+        // Fall back to SIGKILL if the process ignored SIGTERM.
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", &format!("-{}", record.pid)])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+
+        if wait_for_process_exit(record.pid, Duration::from_secs(2)).await {
+            println!("killed subagent {} (pid {})", record.id, record.pid);
+            return Ok(());
+        }
+
+        bail!(
+            "subagent {id} (pid {}) did not terminate after SIGTERM/SIGKILL",
+            record.pid
+        );
+    } else {
+        let status = tokio::process::Command::new("taskkill")
             .args(["/PID", &record.pid.to_string(), "/F", "/T"])
-            .spawn()?;
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        if let Err(e) = status {
+            bail!(
+                "taskkill failed for subagent {id} (pid {}): {e}",
+                record.pid
+            );
+        }
+
+        if wait_for_process_exit(record.pid, Duration::from_secs(2)).await {
+            println!("killed subagent {} (pid {})", record.id, record.pid);
+            Ok(())
+        } else {
+            bail!(
+                "subagent {id} (pid {}) did not terminate after taskkill",
+                record.pid
+            )
+        }
     }
-    println!("killed subagent {} (pid {})", record.id, record.pid);
-    Ok(())
 }
 
 pub async fn logs(id: &str) -> Result<()> {

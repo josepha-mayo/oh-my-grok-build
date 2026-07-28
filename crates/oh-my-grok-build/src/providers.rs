@@ -340,7 +340,15 @@ pub(crate) fn restrict_omg_file_permissions(path: &std::path::Path) -> Result<()
 #[cfg(windows)]
 fn windows_restrict_file_permissions(path: &std::path::Path) -> Result<()> {
     let user = windows_username()?;
-    if user.contains('"') || user.chars().any(|c| c.is_control()) {
+    // icacls argument syntax uses `:`, `,`, `*` and `?` as separators/wildcards,
+    // and several other characters are unsafe in command-line arguments.
+    const FORBIDDEN: &[char] = &[
+        '"', ':', '*', '?', '<', '>', '|', '&', ';', ',', '%', '!', '\'', '(', ')',
+    ];
+    if user
+        .chars()
+        .any(|c| c.is_control() || FORBIDDEN.contains(&c))
+    {
         bail!("Windows user name contains unsafe characters");
     }
     let grant = if user.contains(' ') {

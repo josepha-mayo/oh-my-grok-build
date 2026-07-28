@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
@@ -14,6 +14,246 @@ use crate::taste::taste_preamble;
 
 const IS_WINDOWS: bool = cfg!(windows);
 const DEFAULT_CONNECTOR_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Allowed connector executable stems. The supported cross-harness CLIs are
+/// exactly Codex, Claude, OpenCode, Hermes, Pi, and OMP. A connector command
+/// must resolve to one of these basenames (after following symlinks) to prevent
+/// shell-interpreter and command-wrapper injection.
+const ALLOWED_CONNECTOR_STEMS: &[&str] = &["codex", "claude", "opencode", "hermes", "pi", "omp"];
+
+/// Basenames that are explicitly rejected and called out in error messages.
+const DENIED_CONNECTOR_BINARIES: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "csh",
+    "ksh",
+    "tcsh",
+    "dash",
+    "ash",
+    "cmd",
+    "command",
+    "powershell",
+    "pwsh",
+    "python",
+    "python3",
+    "python2",
+    "ruby",
+    "perl",
+    "php",
+    "node",
+    "nodejs",
+    "lua",
+    "osascript",
+    "wscript",
+    "cscript",
+    "mshta",
+    "npx",
+    "npm",
+    "yarn",
+    "pnpm",
+    "bun",
+    "deno",
+    "rm",
+    "rmdir",
+    "del",
+    "erase",
+    "rd",
+    "dd",
+    "mv",
+    "move",
+    "ren",
+    "rename",
+    "cp",
+    "copy",
+    "xcopy",
+    "robocopy",
+    "format",
+    "mkfs",
+    "fdisk",
+    "fsutil",
+    "chmod",
+    "chown",
+    "sudo",
+    "su",
+    "doas",
+    "pkexec",
+    "runas",
+    "schtasks",
+    "sc",
+    "net",
+    "ssh",
+    "scp",
+    "sftp",
+    "ftp",
+    "telnet",
+    "nc",
+    "netcat",
+    "curl",
+    "wget",
+    "env",
+    "nice",
+    "ionice",
+    "chrt",
+    "taskset",
+    "stdbuf",
+    "timeout",
+    "setsid",
+    "script",
+    "screen",
+    "tmux",
+    "xargs",
+    "parallel",
+    "find",
+    "git",
+    "make",
+    "cmake",
+    "ninja",
+    "gcc",
+    "cc",
+    "clang",
+    "rustc",
+    "go",
+    "javac",
+    "java",
+    "dotnet",
+    "mono",
+    "wine",
+    "dosbox",
+    "qemu",
+    "tftp",
+    "socat",
+    "ncat",
+    "rlsh",
+    "rlogin",
+    "rsh",
+    "rexec",
+    "ed",
+    "ex",
+    "sed",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "vi",
+    "vim",
+    "emacs",
+    "nano",
+];
+
+/// Basename prefixes used for quick rejection of interpreter families.
+const DENIED_CONNECTOR_PREFIXES: &[&str] = &["python", "node", "npm", "yarn", "pnpm", "perl"];
+
+fn first_token_stem(token: &str) -> String {
+    std::path::Path::new(token)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(token)
+        .to_ascii_lowercase()
+}
+
+fn allowed_connector_stem(stem: &str) -> bool {
+    ALLOWED_CONNECTOR_STEMS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(stem))
+}
+
+fn is_denied_connector_stem(stem: &str) -> bool {
+    DENIED_CONNECTOR_BINARIES
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(stem))
+        || DENIED_CONNECTOR_PREFIXES
+            .iter()
+            .any(|p| stem.starts_with(p))
+}
+
+/// Validate the connector command string. This is used both when the connector
+/// is added and when it runs, and only permits the known cross-harness CLIs.
+fn validate_connector_command(command: &str) -> Result<()> {
+    let parts: Vec<String> = shlex::split(command)
+        .ok_or_else(|| anyhow::anyhow!("invalid connector command quoting"))?
+        .into_iter()
+        .collect();
+    if parts.is_empty() {
+        bail!("empty connector command");
+    }
+    if !parts.iter().any(|p| p == "{prompt}") {
+        bail!("connector command must contain {{prompt}}");
+    }
+
+    let first = &parts[0];
+    let base = first_token_stem(first);
+    if !allowed_connector_stem(&base) {
+        if is_denied_connector_stem(&base) {
+            bail!(
+                "connector executable '{base}' is not allowed; use a harness CLI such as codex, claude, opencode, hermes, pi, or omp"
+            );
+        }
+        bail!(
+            "connector executable '{base}' is not an allowed harness CLI; allowed: codex, claude, opencode, hermes, pi, omp"
+        );
+    }
+    Ok(())
+}
+
+/// Validate the resolved executable on the filesystem. This catches symlinks to
+/// disallowed binaries and any executable (binary or script) that lives inside
+/// the connector's working directory (including subdirectories and symlinks),
+/// which would let an attacker drop a malicious file named after an allowed
+/// harness. Install harness CLIs in PATH or reference them with an absolute
+/// path outside the connector working directory.
+fn validate_connector_executable(
+    resolved: &std::path::Path,
+    first_token: &str,
+    resolve_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let canonical = dunce::canonicalize(resolved).with_context(|| {
+        format!(
+            "cannot canonicalize connector executable {}",
+            resolved.display()
+        )
+    })?;
+
+    let stem = canonical
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !allowed_connector_stem(&stem) {
+        if is_denied_connector_stem(&stem) {
+            bail!(
+                "connector executable resolves to a disallowed binary '{stem}'; use a harness CLI such as codex, claude, opencode, hermes, pi, or omp"
+            );
+        }
+        bail!("connector executable resolves to '{stem}', which is not an allowed harness CLI");
+    }
+
+    if let Some(dir) = resolve_dir {
+        let canonical_dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let resolved_parent = resolved
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("connector executable has no parent directory"))?;
+        let canonical_parent =
+            dunce::canonicalize(resolved_parent).unwrap_or_else(|_| resolved_parent.to_path_buf());
+        let target_parent = canonical
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("connector executable has no parent directory"))?;
+        let canonical_target_parent =
+            dunce::canonicalize(target_parent).unwrap_or_else(|_| target_parent.to_path_buf());
+        if canonical_parent.starts_with(&canonical_dir)
+            || canonical_target_parent.starts_with(&canonical_dir)
+        {
+            bail!(
+                "connector executable {} ({}) is under the connector working directory; install the harness in PATH or use an absolute path outside this directory",
+                resolved.display(),
+                first_token
+            );
+        }
+    }
+
+    Ok(())
+}
 
 fn registry_path() -> Result<PathBuf> {
     Ok(crate::providers::omg_dir()?.join("connectors.json"))
@@ -86,6 +326,27 @@ fn executable_extensions() -> Vec<String> {
     }
 }
 
+fn is_executable_file(path: &std::path::Path, exts: &[String]) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| exts.iter().any(|ext| ext.eq_ignore_ascii_case(e)))
+    }
+    #[cfg(not(any(unix, windows)))]
+    false
+}
+
 fn resolve_executable(name: &str, cwd: Option<&std::path::Path>) -> Result<PathBuf> {
     let candidate = PathBuf::from(name);
     if candidate
@@ -97,23 +358,44 @@ fn resolve_executable(name: &str, cwd: Option<&std::path::Path>) -> Result<PathB
             candidate.display()
         );
     }
-    if candidate.is_absolute() {
-        return Ok(candidate);
-    }
 
     let exts = if IS_WINDOWS {
         executable_extensions()
     } else {
         Vec::new()
     };
+
+    if candidate.is_absolute() {
+        if is_executable_file(&candidate, &exts) {
+            return Ok(candidate);
+        }
+        // On Windows the user may have omitted the extension (e.g. "codex" when
+        // "codex.exe" exists). Try the PATHEXT extensions in the same directory.
+        if IS_WINDOWS
+            && let (Some(parent), Some(stem)) = (candidate.parent(), candidate.file_stem())
+        {
+            let stem = stem.to_string_lossy();
+            for ext in &exts {
+                let with_ext = parent.join(format!("{stem}{ext}"));
+                if is_executable_file(&with_ext, &exts) {
+                    return Ok(with_ext);
+                }
+            }
+        }
+        bail!(
+            "connector command not found or is not executable: {}",
+            candidate.display()
+        );
+    }
+
     let try_dir = |dir: &std::path::Path| -> Option<PathBuf> {
         let joined = dir.join(&candidate);
-        if joined.is_file() {
+        if is_executable_file(&joined, &exts) {
             return Some(joined);
         }
         for ext in &exts {
             let with_ext = dir.join(format!("{name}{ext}"));
-            if with_ext.is_file() {
+            if is_executable_file(&with_ext, &exts) {
                 return Some(with_ext);
             }
         }
@@ -292,6 +574,9 @@ pub fn add_connector(
     if command.is_none() && url.is_none() {
         bail!("connector requires --command or --url");
     }
+    if let Some(ref cmd) = command {
+        validate_connector_command(cmd)?;
+    }
     let mut registry = load_registry()?;
 
     let child_key = secret_env_key
@@ -361,6 +646,7 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         .command
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("connector has no command"))?;
+    validate_connector_command(command)?;
 
     let prompt = format!("{}{}", prompt, taste_preamble());
     let placeholder = "{prompt}";
@@ -393,6 +679,7 @@ pub async fn run_connector(name: &str, prompt: &str) -> Result<()> {
         .map(|c| parent_cwd.join(c))
         .or_else(|| Some(parent_cwd.clone()));
     let resolved = resolve_executable(&parts[0], resolve_dir.as_deref())?;
+    validate_connector_executable(&resolved, &parts[0], resolve_dir.as_deref())?;
     let binary_dir = resolved.parent().map(|p| p.to_path_buf());
 
     let mut cmd = tokio::process::Command::new(&resolved);
@@ -510,6 +797,11 @@ mod tests {
 
     #[test]
     fn test_add_connector_rejects_non_ascii_name() {
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("omgb-test-{}-harness", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        crate::providers::set_omg_home_for_tests(Some(tmp.clone()));
         let r = add_connector(
             "héllo".into(),
             HarnessType::Codex,
@@ -520,6 +812,353 @@ mod tests {
             false,
             false,
         );
+        crate::providers::set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(&tmp);
         assert!(r.is_err(), "non-ASCII connector name should be rejected");
+    }
+
+    #[test]
+    fn test_validate_connector_command_accepts_harnesses() {
+        for cmd in [
+            "codex exec --json {prompt}",
+            "claude --print {prompt}",
+            "opencode run {prompt}",
+            "hermes -z {prompt}",
+            "pi {prompt}",
+            "omp {prompt}",
+            "/usr/local/bin/codex exec --json {prompt}",
+        ] {
+            assert!(
+                validate_connector_command(cmd).is_ok(),
+                "{cmd} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_connector_command_rejects_wrappers_and_interpreters() {
+        for cmd in [
+            "env sh -c {prompt}",
+            "env python -c {prompt}",
+            "nice codex {prompt}",
+            "chrt 1 codex {prompt}",
+            "stdbuf -o0 sh -c {prompt}",
+            "timeout 10 python -c {prompt}",
+            "setsid sh -c {prompt}",
+            "xargs sh -c {prompt}",
+            "find . -exec sh {} {prompt} ;",
+            "sh -c {prompt}",
+            "bash {prompt}",
+            "python3 -c {prompt}",
+        ] {
+            assert!(
+                validate_connector_command(cmd).is_err(),
+                "{cmd} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_connector_command_rejects_arbitrary_and_missing_prompt() {
+        assert!(validate_connector_command("myagent {prompt}").is_err());
+        assert!(validate_connector_command("codex exec --json").is_err());
+        assert!(validate_connector_command("").is_err());
+    }
+
+    fn temp_dir_for_test() -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!("omgb-harness-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_connector_executable_rejects_symlink_to_denied() {
+        use std::os::unix::fs::symlink;
+        let tmp = temp_dir_for_test();
+        let denied = tmp.join("sh");
+        std::fs::write(&denied, "#!/bin/sh\n").unwrap();
+        let codex = tmp.join("codex");
+        symlink(&denied, &codex).unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&tmp));
+        assert!(r.is_err(), "symlink to denied binary should be rejected");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn outside_dir_for_test(tmp: &std::path::Path) -> PathBuf {
+        tmp.parent()
+            .unwrap_or(&std::env::temp_dir())
+            .join(format!("omgb-harness-outside-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_connector_executable_rejects_script_in_cwd() {
+        let tmp = temp_dir_for_test();
+        let codex = tmp.join("codex");
+        std::fs::write(&codex, "#!/usr/bin/env node\n").unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&tmp));
+        assert!(r.is_err(), "script in connector cwd should be rejected");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_connector_executable_rejects_script_in_subdir() {
+        let tmp = temp_dir_for_test();
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(&codex, "#!/usr/bin/env node\n").unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&tmp));
+        assert!(
+            r.is_err(),
+            "script in a subdirectory of connector cwd should be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_connector_executable_rejects_symlink_in_cwd() {
+        use std::os::unix::fs::symlink;
+        let tmp = temp_dir_for_test();
+        let outside = outside_dir_for_test(&tmp);
+        std::fs::create_dir_all(&outside).unwrap();
+        let real = outside.join("codex");
+        std::fs::write(&real, "#!/usr/bin/env node\n").unwrap();
+        let link = tmp.join("codex");
+        symlink(&real, &link).unwrap();
+
+        let r = validate_connector_executable(&link, "codex", Some(&tmp));
+        assert!(
+            r.is_err(),
+            "symlink to a script in connector cwd should be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_connector_executable_accepts_script_outside_cwd() {
+        let tmp = temp_dir_for_test();
+        let resolve_dir = tmp.join("cwd");
+        std::fs::create_dir_all(&resolve_dir).unwrap();
+        let outside = outside_dir_for_test(&tmp);
+        std::fs::create_dir_all(&outside).unwrap();
+        let codex = outside.join("codex");
+        std::fs::write(&codex, "#!/usr/bin/env node\n").unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&resolve_dir));
+        assert!(
+            r.is_ok(),
+            "script outside connector cwd should be accepted: {r:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_connector_executable_accepts_symlink_outside_cwd() {
+        use std::os::unix::fs::symlink;
+        let tmp = temp_dir_for_test();
+        let resolve_dir = tmp.join("cwd");
+        std::fs::create_dir_all(&resolve_dir).unwrap();
+        let outside = outside_dir_for_test(&tmp);
+        std::fs::create_dir_all(&outside).unwrap();
+        let real = outside.join("codex");
+        std::fs::write(&real, "#!/usr/bin/env node\n").unwrap();
+        let link = outside.join("codex-link");
+        symlink(&real, &link).unwrap();
+
+        let r = validate_connector_executable(&link, "codex", Some(&resolve_dir));
+        assert!(
+            r.is_ok(),
+            "symlink to a script outside connector cwd should be accepted: {r:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_connector_executable_rejects_binary_in_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = temp_dir_for_test();
+        let codex = tmp.join("codex");
+        std::fs::write(&codex, &[0x7f, b'E', b'L', b'F']).unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&tmp));
+        assert!(
+            r.is_err(),
+            "binary in connector cwd should be rejected: {r:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_connector_executable_accepts_binary_outside_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = temp_dir_for_test();
+        let resolve_dir = tmp.join("cwd");
+        std::fs::create_dir_all(&resolve_dir).unwrap();
+        let outside = outside_dir_for_test(&tmp);
+        std::fs::create_dir_all(&outside).unwrap();
+        let codex = outside.join("codex");
+        std::fs::write(&codex, &[0x7f, b'E', b'L', b'F']).unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&resolve_dir));
+        assert!(
+            r.is_ok(),
+            "binary outside connector cwd should be accepted: {r:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_connector_executable_rejects_cmd_in_cwd() {
+        let tmp = temp_dir_for_test();
+        let codex = tmp.join("codex.cmd");
+        std::fs::write(&codex, "@echo off\n").unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&tmp));
+        assert!(
+            r.is_err(),
+            ".cmd script in connector cwd should be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_connector_executable_rejects_cmd_in_subdir() {
+        let tmp = temp_dir_for_test();
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex.cmd");
+        std::fs::write(&codex, "@echo off\n").unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&tmp));
+        assert!(
+            r.is_err(),
+            ".cmd script in a subdirectory of connector cwd should be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_connector_executable_accepts_cmd_outside_cwd() {
+        let tmp = temp_dir_for_test();
+        let resolve_dir = tmp.join("cwd");
+        std::fs::create_dir_all(&resolve_dir).unwrap();
+        let outside = outside_dir_for_test(&tmp);
+        std::fs::create_dir_all(&outside).unwrap();
+        let codex = outside.join("codex.cmd");
+        std::fs::write(&codex, "@echo off\n").unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&resolve_dir));
+        assert!(
+            r.is_ok(),
+            ".cmd script outside connector cwd should be accepted: {r:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_connector_executable_rejects_binary_in_cwd() {
+        let tmp = temp_dir_for_test();
+        let codex = tmp.join("codex.exe");
+        std::fs::write(&codex, b"MZ\x90\x00").unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&tmp));
+        assert!(
+            r.is_err(),
+            ".exe binary in connector cwd should be rejected: {r:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_connector_executable_accepts_binary_outside_cwd() {
+        let tmp = temp_dir_for_test();
+        let resolve_dir = tmp.join("cwd");
+        std::fs::create_dir_all(&resolve_dir).unwrap();
+        let outside = outside_dir_for_test(&tmp);
+        std::fs::create_dir_all(&outside).unwrap();
+        let codex = outside.join("codex.exe");
+        std::fs::write(&codex, b"MZ\x90\x00").unwrap();
+
+        let r = validate_connector_executable(&codex, "codex", Some(&resolve_dir));
+        assert!(
+            r.is_ok(),
+            ".exe binary outside connector cwd should be accepted: {r:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn test_add_connector_allows_harness_and_rejects_wrapper() {
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let tmp = temp_dir_for_test();
+        crate::providers::set_omg_home_for_tests(Some(tmp.clone()));
+
+        let ok = add_connector(
+            "codex-test".into(),
+            HarnessType::Codex,
+            Some("codex exec --json {prompt}".into()),
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(
+            ok.is_ok(),
+            "valid codex connector should be accepted: {ok:?}"
+        );
+
+        let bad = add_connector(
+            "bad".into(),
+            HarnessType::Codex,
+            Some("env python -c {prompt}".into()),
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(bad.is_err(), "wrapper connector should be rejected");
+
+        crate::providers::set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

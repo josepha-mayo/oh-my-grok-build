@@ -66,7 +66,7 @@ The `omgb` binary is produced at `target/release/omgb` (`target\release\omgb.exe
 
 ## Mobile app (separate `grok-build-app` repo)
 
-The React Native + Expo mobile app lives in its own repository and is not part of the Rust workspace. When working on it, run these checks before committing:
+The React Native + Expo mobile app lives in its own repository (`grok-build-app`) and is not part of the Rust workspace. When working on it in the `grok-build-app` directory, run these checks before committing:
 
 ```bash
 npm run lint

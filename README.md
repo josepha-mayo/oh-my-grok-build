@@ -36,7 +36,7 @@ Use a BYOK provider:
 
 ```bash
 omgb provider catalog
-omgb provider add openai --api-key "$OPENAI_API_KEY" --default
+OMGB_API_KEY="$OPENAI_API_KEY" omgb provider add openai --default
 omgb exec "write a rust fibonacci" --model omgb-openai
 ```
 
@@ -65,21 +65,42 @@ omgb connect ws://127.0.0.1:9999 --secret <pairing-secret>
 
 | Command | Description |
 | --- | --- |
+| `omgb` / `omgb tui` | Start the Grok pager UI (default when no subcommand is given). |
 | `omgb exec "<prompt>"` | Run a single headless turn. Use `--output-file` to capture stdout, `--yolo` to auto-approve tools. |
-| `omgb tui` | Start the Grok pager UI. |
-| `omgb provider list|catalog|add|remove|discover|test` | Manage 100+ BYOK/local provider templates and keys, including Ollama, LM Studio, vLLM, and SGLang. |
-| `omgb model switch <model>` | Set the default model (provider id or `omgb-<id>`). |
-| `omgb research "<topic>"` | Search arXiv and, if `--model` is given, generate a `.patch`. |
 | `omgb loop "<prompt>"` | Iterate until the git working tree is clean (anti-loop guard). |
-| `omgb swarm "<prompt>"` | Parallel subagents with task splitting and majority-vote fallback. |
-| `omgb workflow run|list|show|new` | Run YAML/JSON workflows with exec/fan_out/shell steps. |
-| `omgb subagent spawn|list|kill|logs|trace` | Spawn and manage child subagents with depth limits. |
+| `omgb autonomous "<prompt>"` | High-autonomy mode with guard checks and auto-approval. |
+| `omgb provider list|catalog|add|remove|discover|test` | Manage BYOK/local provider templates and keys. |
+| `omgb model list` / `omgb model switch <model>` | List models or set the default model (provider id or `omgb-<id>`). |
 | `omgb cron "<expr>" "<prompt>"` | Schedule a repeating job (cron or interval expression). |
-| `omgb schedule list|run|delete|start|stop` | Manage scheduled jobs. |
-| `omgb use` / `omgb browser` | Desktop/browser control. Gated by `--yolo` or `OMGB_ALLOW_DESKTOP_CONTROL=1`. |
-| `omgb serve` / `omgb connect` | WebSocket relay server and client. |
-| `omgb harness` | Register and run cross-harness connectors. |
+| `omgb schedule list|add|run|delete|start|stop|set-expiry|cleanup-expired` | Manage scheduled jobs. |
+| `omgb team` | Team mode with isolated git worktrees. |
+| `omgb swarm "<prompt>"` | Parallel subagent swarm with task splitting and majority-vote fallback. |
+| `omgb subagent spawn|list|kill|logs|trace` | Spawn and manage child subagents with depth limits. |
+| `omgb thread` | Multi-agent thread orchestration across sessions. |
+| `omgb meta` | Meta-harness autonomous planning, execution, and learning. |
+| `omgb research "<topic>"` | Search arXiv and, if `--model` is given, generate a `.patch`. |
 | `omgb timeline` | Show recent session/job events. |
+| `omgb harness` | Register and run cross-harness connectors (Codex, Claude, OpenCode, Hermes, Pi, OMP). |
+| `omgb serve` | Start the ACP WebSocket relay for the mobile app. |
+| `omgb connect <url>` | Connect to an ACP relay. |
+| `omgb session` | List, resume, or fork persistent sessions. |
+| `omgb memory` | Remember, recall, or manage persistent cross-session memory. |
+| `omgb hashline` | Apply hashline-anchored, token-efficient file patches. |
+| `omgb pr status|create|update|merge|checks|merge-queue` | GitHub PR helpers. |
+| `omgb lsp` | List or start LSP language servers. |
+| `omgb dap` | List or start DAP debug adapters. |
+| `omgb plugin list|install|uninstall` | Browse and install plugins from the marketplace. |
+| `omgb playbook` | Run deterministic CI playbooks. |
+| `omgb workflow run|list|show|new` | Run YAML/JSON workflows with exec/fan_out/shell steps. |
+| `omgb group` | Multi-agent group chat with humans and agents. |
+| `omgb use` / `omgb browser` | Computer / browser use (gated by `--yolo` or `OMGB_ALLOW_DESKTOP_CONTROL=1`). |
+| `omgb mcp` | Manage MCP servers. |
+| `omgb doctor` | Environment diagnostics and remediation. |
+| `omgb taste` | Remember a coding-style preference. |
+| `omgb skill` | Manage auto-generated skills. |
+| `omgb commit` | Commit the current working tree. |
+| `omgb review` | Review current changes (git status + diff). |
+| `omgb undo` | Undo the last omgb commit. |
 | `omgb feedback "<message>"` | Open a GitHub issue to submit feedback (`--open` to launch browser). |
 
 ## Mobile app

@@ -380,33 +380,222 @@ pub(crate) async fn run_tui(args: TuiArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn scratch_dir() -> Result<PathBuf> {
+    Ok(crate::providers::omg_dir()?.join("tmp"))
+}
+
+/// Resolve a user-supplied path (for `--output-file` / `--prompt-file`) to an
+/// absolute path that stays inside the current working directory or the omgb
+/// scratch directory. Rejects `..` components, symlinks (including broken ones),
+/// and directories.
 fn resolve_path(raw: &std::path::Path) -> Result<std::path::PathBuf> {
-    let mut has_normal = false;
+    let cwd = std::env::current_dir()?;
+    let canonical_cwd =
+        dunce::canonicalize(&cwd).unwrap_or_else(|_| dunce::simplified(&cwd).to_path_buf());
+    if !canonical_cwd.is_dir() {
+        bail!("cannot resolve current directory: {}", cwd.display());
+    }
+
+    if raw.is_absolute() {
+        if raw
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            bail!("path must not contain '..' components: {}", raw.display());
+        }
+        let scratch = scratch_dir()?;
+        let canonical_scratch = dunce::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+
+        // Find the longest existing prefix of the absolute path so we can
+        // canonicalize it and verify it is under an allowed root.
+        let mut existing = raw;
+        let mut missing = std::path::PathBuf::new();
+        let meta = loop {
+            if existing.as_os_str().is_empty() {
+                break None;
+            }
+            match std::fs::symlink_metadata(existing) {
+                Ok(m) => break Some(m),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(name) = existing.file_name() {
+                        missing = std::path::PathBuf::from(name).join(&missing);
+                        existing = existing.parent().unwrap_or(std::path::Path::new(""));
+                    } else {
+                        break None;
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let Some(meta) = meta else {
+            bail!(
+                "path does not have an existing parent directory: {}",
+                raw.display()
+            );
+        };
+        if meta.is_symlink() {
+            bail!("path must not contain a symlink: {}", raw.display());
+        }
+        if !missing.as_os_str().is_empty() && !meta.is_dir() {
+            bail!("path prefix is not a directory: {}", existing.display());
+        }
+        let canonical_existing = dunce::canonicalize(existing)
+            .with_context(|| format!("cannot canonicalize path: {}", existing.display()))?;
+        if !canonical_existing.starts_with(&canonical_cwd)
+            && !canonical_existing.starts_with(&canonical_scratch)
+        {
+            bail!(
+                "path must be under the current working directory or omgb scratch directory: {}",
+                raw.display()
+            );
+        }
+        let canonical = canonical_existing.join(&missing);
+        if let Ok(meta) = std::fs::symlink_metadata(&canonical) {
+            if meta.is_symlink() {
+                bail!("path must not be a symlink: {}", raw.display());
+            }
+            if meta.is_dir() {
+                bail!("path must not be a directory: {}", raw.display());
+            }
+        }
+        return Ok(canonical);
+    }
+
+    let mut clean = std::path::PathBuf::new();
     for comp in raw.components() {
         match comp {
-            std::path::Component::Normal(_) => has_normal = true,
+            std::path::Component::Normal(n) => clean.push(n),
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                bail!("path must not contain '..' components: {}", raw.display())
+            _ => {
+                bail!(
+                    "path must be relative and not contain '..' or absolute components: {}",
+                    raw.display()
+                );
             }
-            _ => {}
         }
     }
-    if !has_normal {
+    if clean.as_os_str().is_empty() {
         bail!(
-            "path must contain at least one file or directory component: {}",
+            "path must contain at least one file or directory name: {}",
             raw.display()
         );
     }
-    if raw.is_absolute() {
-        Ok(raw.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(raw))
+
+    let mut current = canonical_cwd.clone();
+    let mut components = clean.components().peekable();
+    while let Some(comp) = components.next() {
+        let std::path::Component::Normal(name) = comp else {
+            continue;
+        };
+        current.push(name);
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.is_symlink() {
+                    bail!("path must not contain a symlink: {}", raw.display());
+                }
+                let is_last = components.peek().is_none();
+                if is_last {
+                    if meta.is_dir() {
+                        bail!("path must not be a directory: {}", raw.display());
+                    }
+                } else if !meta.is_dir() {
+                    bail!("path component is not a directory: {}", current.display());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Missing intermediate directories or the final file are fine.
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
     }
+
+    Ok(canonical_cwd.join(&clean))
+}
+
+/// Read a prompt file without following a symlink (Unix: O_NOFOLLOW).
+/// On Windows, this is a best-effort check because `std::fs` cannot open
+/// without following reparse points.
+#[cfg(unix)]
+fn read_prompt_file(path: &std::path::Path) -> Result<String> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let cstr = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        anyhow::anyhow!("prompt file path contains a null byte: {}", path.display())
+    })?;
+    let fd = unsafe {
+        libc::open(
+            cstr.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        bail!("failed to open prompt file {}: {err}", path.display());
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut s = String::new();
+    f.read_to_string(&mut s)
+        .with_context(|| format!("failed to read prompt file: {}", path.display()))?;
+    Ok(s)
+}
+
+#[cfg(windows)]
+fn read_prompt_file(path: &std::path::Path) -> Result<String> {
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.is_symlink()
+    {
+        bail!("prompt file must not be a symlink: {}", path.display());
+    }
+    std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read prompt file: {}", path.display()))
+}
+
+/// Write output to `path` without following a final symlink by writing to a
+/// temporary file in the same directory and atomically renaming it into place.
+fn write_output_file(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output path has no file name: {}", path.display()))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(".{}.tmp.{}", name, uuid::Uuid::new_v4()));
+    if let Err(e) = std::fs::write(&tmp, contents.as_ref()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, std::fs::rename will not replace an existing file.
+        // Remove an existing target first (symlinks/directories are rejected by
+        // resolve_path, but leave directories untouched as a defensive measure).
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && !meta.is_dir()
+            && let Err(e) = std::fs::remove_file(path)
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 pub(crate) async fn write_prompt_temp(prompt: &str) -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("omgb-prompt-{}.txt", uuid::Uuid::new_v4()));
+    let dir = scratch_dir()?;
+    let file_name = format!("omgb-prompt-{}.txt", uuid::Uuid::new_v4());
+    let path = dir.join(&file_name);
+    tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::write(&path, prompt.as_bytes()).await?;
     let path2 = path.clone();
     tokio::task::spawn_blocking(move || restrict_temp_permissions(&path2)).await??;
@@ -430,11 +619,7 @@ pub(crate) struct PromptFileGuard(PathBuf);
 impl Drop for PromptFileGuard {
     fn drop(&mut self) {
         let path = std::mem::take(&mut self.0);
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            std::mem::drop(rt.spawn_blocking(move || std::fs::remove_file(&path)));
-        } else {
-            let _ = std::fs::remove_file(&path);
-        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -583,7 +768,11 @@ pub(crate) fn process_alive(pid: u32) -> bool {
         let comm = String::from_utf8_lossy(&output.stdout)
             .trim()
             .to_lowercase();
-        return comm.contains(&exe) || exe.contains(&comm);
+        let comm_stem = std::path::Path::new(&comm)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        return comm_stem == exe;
     }
     false
 }
@@ -682,9 +871,8 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
     };
 
     let prompt = if let Some(p) = &prompt_file {
-        tokio::fs::read_to_string(p)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read prompt file: {e}"))?
+        let p = p.clone();
+        tokio::task::spawn_blocking(move || read_prompt_file(&p)).await??
     } else if let Some(p) = &args.prompt {
         p.clone()
     } else {
@@ -692,9 +880,6 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
     };
 
     if let Some(path) = output_path {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let own_prompt = args.prompt_file_own || prompt_file.is_none();
         let child_prompt_file = if let Some(p) = prompt_file {
             p
@@ -718,7 +903,9 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
             let stderr = String::from_utf8_lossy(&out.stderr);
             bail!("exec failed: {stderr}");
         }
-        std::fs::write(&path, &out.stdout)?;
+        let out_stdout = out.stdout;
+        let output_path = path.clone();
+        tokio::task::spawn_blocking(move || write_output_file(&output_path, &out_stdout)).await??;
         println!("wrote output to {}", path.display());
         if args.commit || args.commit_untracked {
             git_commit_all("omgb exec", args.commit_untracked, Some(path.as_path())).await?;
@@ -1475,17 +1662,42 @@ async fn run_undo(args: UndoArgs) -> Result<()> {
 
 const FEEDBACK_REPO: &str = "josepha-mayo/oh-my-grok-build";
 
+fn is_valid_repo_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+fn feedback_repo_with(raw: Option<&str>) -> Result<String> {
+    if let Some(v) = raw.filter(|s| !s.is_empty()) {
+        let parts: Vec<&str> = v.split('/').collect();
+        if parts.len() == 2 && is_valid_repo_segment(parts[0]) && is_valid_repo_segment(parts[1]) {
+            return Ok(v.to_string());
+        }
+        bail!(
+            "OMGB_FEEDBACK_REPO must be in the form 'owner/repo' with only ASCII alphanumeric, '_', '-', and '.' characters"
+        );
+    }
+    Ok(FEEDBACK_REPO.to_string())
+}
+
+fn feedback_repo() -> Result<String> {
+    feedback_repo_with(std::env::var("OMGB_FEEDBACK_REPO").ok().as_deref())
+}
+
 async fn run_feedback(args: FeedbackArgs) -> Result<()> {
     let body = args
         .message
         .as_deref()
         .unwrap_or("<describe your issue or suggestion here>");
     let title = "Feedback from omgb user";
+    let repo = feedback_repo()?;
     let encoded_title = urlencoding::encode(title);
     let encoded_body = urlencoding::encode(body);
-    let url = format!(
-        "https://github.com/{FEEDBACK_REPO}/issues/new?title={encoded_title}&body={encoded_body}"
-    );
+    let url =
+        format!("https://github.com/{repo}/issues/new?title={encoded_title}&body={encoded_body}");
     if args.open {
         let mut cmd;
         if cfg!(target_os = "windows") {
@@ -1519,20 +1731,27 @@ fn load_brief() -> Option<String> {
         dirs.push(home);
     }
     for mut dir in dirs {
+        // Resolve the starting directory so we do not search through symlinked
+        // parents into unintended locations.
+        dir = dunce::canonicalize(&dir).unwrap_or(dir);
         loop {
             let path = dir.join("oh_my_grok_build_brief.md");
-            if path.is_file() {
-                if let Ok(meta) = std::fs::metadata(&path)
-                    && meta.len() > MAX_BRIEF_BYTES
-                {
-                    eprintln!(
-                        "warning: {} is larger than {} bytes; skipping brief",
-                        path.display(),
-                        MAX_BRIEF_BYTES
-                    );
+            // Use symlink_metadata so a symlink cannot point to an arbitrary file.
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                if meta.is_symlink() {
                     return None;
                 }
-                return std::fs::read_to_string(&path).ok();
+                if meta.is_file() {
+                    if meta.len() > MAX_BRIEF_BYTES {
+                        eprintln!(
+                            "warning: {} is larger than {} bytes; skipping brief",
+                            path.display(),
+                            MAX_BRIEF_BYTES
+                        );
+                        return None;
+                    }
+                    return read_prompt_file(&path).ok();
+                }
             }
             if !dir.pop() {
                 break;
@@ -1977,7 +2196,7 @@ async fn run_subagent(args: SubagentArgs) -> Result<()> {
     match args.command {
         SubagentCommand::Spawn { prompt, yolo } => subagents::spawn(&prompt, yolo).await,
         SubagentCommand::List => subagents::list(),
-        SubagentCommand::Kill { id } => subagents::kill(&id),
+        SubagentCommand::Kill { id } => subagents::kill(&id).await,
         SubagentCommand::Logs { id } => subagents::logs(&id).await,
         SubagentCommand::Trace { id } => subagents::trace(&id).await,
     }
@@ -2129,5 +2348,102 @@ mod tests {
         let replies = value.get("replies").unwrap().as_object().unwrap();
         assert_eq!(replies["Alice"].as_str().unwrap(), "ok {not closed");
         assert_eq!(replies["Bob"].as_str().unwrap(), "hi");
+    }
+
+    fn tmp_test_dir() -> PathBuf {
+        let tmp = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("tmp-tests-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    fn cleanup_tmp_dir(tmp: &PathBuf) {
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn test_resolve_path_accepts_relative_file() {
+        let tmp = tmp_test_dir();
+        let rel = std::path::Path::new("target")
+            .join(tmp.file_name().unwrap())
+            .join("out.txt");
+        let resolved = resolve_path(&rel).unwrap();
+        assert!(
+            resolved.ends_with(&rel),
+            "resolved path should end with the relative input"
+        );
+        cleanup_tmp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_dot_and_empty() {
+        assert!(resolve_path(std::path::Path::new(".")).is_err());
+        assert!(resolve_path(std::path::Path::new("./")).is_err());
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_absolute_and_parent_dir() {
+        assert!(resolve_path(std::path::Path::new("/etc/passwd")).is_err());
+        assert!(resolve_path(std::path::Path::new("foo/../bar")).is_err());
+        assert!(resolve_path(std::path::Path::new("../outside")).is_err());
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_directory() {
+        let tmp = tmp_test_dir();
+        let rel = std::path::Path::new("target").join(tmp.file_name().unwrap());
+        assert!(
+            resolve_path(&rel).is_err(),
+            "existing directory should be rejected"
+        );
+        cleanup_tmp_dir(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_path_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tmp_test_dir();
+        let real = tmp.join("real.txt");
+        std::fs::write(&real, "x").unwrap();
+        let link = tmp.join("link");
+        symlink(&real, &link).unwrap();
+        let rel = std::path::Path::new("target")
+            .join(tmp.file_name().unwrap())
+            .join("link");
+        assert!(resolve_path(&rel).is_err(), "symlink should be rejected");
+        cleanup_tmp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_feedback_repo_validation() {
+        assert_eq!(feedback_repo_with(None).unwrap(), FEEDBACK_REPO);
+        assert_eq!(
+            feedback_repo_with(Some("myorg/myrepo")).unwrap(),
+            "myorg/myrepo"
+        );
+        assert!(feedback_repo_with(Some("foo")).is_err());
+        assert!(feedback_repo_with(Some("foo/../bar")).is_err());
+        assert!(feedback_repo_with(Some("foo/bar?x=1")).is_err());
+        assert!(feedback_repo_with(Some("foo//bar")).is_err());
+    }
+
+    #[test]
+    fn test_process_alive_detects_current_process() {
+        assert!(
+            crate::process_alive(std::process::id()),
+            "current process should be alive"
+        );
+    }
+
+    #[test]
+    fn test_process_alive_nonexistent_pid() {
+        assert!(
+            !crate::process_alive(u32::MAX),
+            "non-existent PID should not be alive"
+        );
     }
 }

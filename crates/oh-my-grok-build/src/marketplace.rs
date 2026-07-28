@@ -310,7 +310,15 @@ async fn clone_shallow(url: &str, tmp: &Path, tmp_home: &Path) -> Result<()> {
     let tmp_str = tmp.to_string_lossy();
     let output = run_git(
         tmp_home,
-        &["clone", "--depth", "1", url, &tmp_str],
+        &[
+            "-c",
+            "http.followRedirects=false",
+            "clone",
+            "--depth",
+            "1",
+            url,
+            &tmp_str,
+        ],
         CLONE_TIMEOUT,
     )
     .await?;
@@ -345,7 +353,12 @@ async fn clone_with_sha(url: &str, tmp: &Path, tmp_home: &Path, sha: &str) -> Re
 
     // Do a full clone so we can check out an arbitrary SHA. Plugins are small,
     // and this avoids servers that do not support reachability SHA fetches.
-    let clone = run_git(tmp_home, &["clone", url, &tmp_str], CLONE_TIMEOUT).await?;
+    let clone = run_git(
+        tmp_home,
+        &["-c", "http.followRedirects=false", "clone", url, &tmp_str],
+        CLONE_TIMEOUT,
+    )
+    .await?;
     if !clone.status.success() {
         let stderr = String::from_utf8_lossy(&clone.stderr);
         bail!("git clone failed: {stderr}");

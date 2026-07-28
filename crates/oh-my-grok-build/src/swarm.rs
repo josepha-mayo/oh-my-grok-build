@@ -82,7 +82,7 @@ pub(crate) async fn exec_plain(
     let prompt_file = crate::write_prompt_temp(prompt).await?;
     let _prompt_guard = crate::PromptFileGuard(prompt_file.clone());
     let output_file =
-        std::env::temp_dir().join(format!("omgb-swarm-out-{}.txt", uuid::Uuid::new_v4()));
+        crate::scratch_dir()?.join(format!("omgb-swarm-out-{}.txt", uuid::Uuid::new_v4()));
     let exe = std::env::current_exe()?;
 
     let mut cmd = Command::new(&exe);

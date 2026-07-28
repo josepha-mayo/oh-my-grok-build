@@ -797,6 +797,7 @@ pub enum PluginCommand {
     /// Install a plugin from a git URL or local directory
     Install(PluginInstallArgs),
     /// Remove an installed plugin by name
+    #[command(alias = "uninstall")]
     Remove { name: String },
     /// Refresh installed plugins from their git sources
     Refresh(PluginRefreshArgs),

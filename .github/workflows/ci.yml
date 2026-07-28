@@ -39,6 +39,8 @@ jobs:
       - run: cargo fmt --check -p oh-my-grok-build
       - run: ${{ matrix.clippy }}
       - run: ${{ matrix.test }}
+      - run: cargo build -p oh-my-grok-build
+      - run: cargo build -p oh-my-grok-build --profile release-dist
       - name: Build and install safe-shell-guard hook binary
         shell: bash
         run: |
