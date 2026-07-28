@@ -6959,6 +6959,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "which",
+ "windows 0.61.3",
  "xai-crash-handler",
  "xai-grok-config",
  "xai-grok-pager",

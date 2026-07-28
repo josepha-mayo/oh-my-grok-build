@@ -387,7 +387,9 @@ pub(crate) fn scratch_dir() -> Result<PathBuf> {
 /// Resolve a user-supplied path (for `--output-file` / `--prompt-file`) to an
 /// absolute path that stays inside the current working directory or the omgb
 /// scratch directory. Rejects `..` components, symlinks (including broken ones),
-/// and directories.
+/// and directories. Symlinks are never followed: each existing component is
+/// checked before traversal, and absolute paths are resolved component by
+/// component from the filesystem root.
 fn resolve_path(raw: &std::path::Path) -> Result<std::path::PathBuf> {
     let cwd = std::env::current_dir()?;
     let canonical_cwd =
@@ -396,123 +398,99 @@ fn resolve_path(raw: &std::path::Path) -> Result<std::path::PathBuf> {
         bail!("cannot resolve current directory: {}", cwd.display());
     }
 
-    if raw.is_absolute() {
-        if raw
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            bail!("path must not contain '..' components: {}", raw.display());
-        }
-        let scratch = scratch_dir()?;
-        let canonical_scratch = dunce::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+    let is_absolute = raw.is_absolute();
+    let mut current = if is_absolute {
+        std::path::PathBuf::new()
+    } else {
+        canonical_cwd.clone()
+    };
+    let mut saw_prefix = false;
+    let mut saw_name = false;
+    let mut components = raw.components().peekable();
 
-        // Find the longest existing prefix of the absolute path so we can
-        // canonicalize it and verify it is under an allowed root.
-        let mut existing = raw;
-        let mut missing = std::path::PathBuf::new();
-        let meta = loop {
-            if existing.as_os_str().is_empty() {
-                break None;
-            }
-            match std::fs::symlink_metadata(existing) {
-                Ok(m) => break Some(m),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if let Some(name) = existing.file_name() {
-                        missing = std::path::PathBuf::from(name).join(&missing);
-                        existing = existing.parent().unwrap_or(std::path::Path::new(""));
-                    } else {
-                        break None;
+    while let Some(comp) = components.next() {
+        match comp {
+            std::path::Component::Prefix(p) => {
+                saw_prefix = true;
+                match p.kind() {
+                    std::path::Prefix::Disk(d) | std::path::Prefix::VerbatimDisk(d) => {
+                        current = std::path::PathBuf::from(format!("{}:\\", d as char));
+                    }
+                    _ => {
+                        bail!(
+                            "path must not use network/verbatim prefixes: {}",
+                            raw.display()
+                        );
                     }
                 }
-                Err(e) => return Err(e.into()),
             }
-        };
-        let Some(meta) = meta else {
-            bail!(
-                "path does not have an existing parent directory: {}",
-                raw.display()
-            );
-        };
-        if meta.is_symlink() {
-            bail!("path must not contain a symlink: {}", raw.display());
-        }
-        if !missing.as_os_str().is_empty() && !meta.is_dir() {
-            bail!("path prefix is not a directory: {}", existing.display());
-        }
-        let canonical_existing = dunce::canonicalize(existing)
-            .with_context(|| format!("cannot canonicalize path: {}", existing.display()))?;
-        if !canonical_existing.starts_with(&canonical_cwd)
-            && !canonical_existing.starts_with(&canonical_scratch)
-        {
-            bail!(
-                "path must be under the current working directory or omgb scratch directory: {}",
-                raw.display()
-            );
-        }
-        let canonical = canonical_existing.join(&missing);
-        if let Ok(meta) = std::fs::symlink_metadata(&canonical) {
-            if meta.is_symlink() {
-                bail!("path must not be a symlink: {}", raw.display());
+            std::path::Component::RootDir => {
+                if current.as_os_str().is_empty() {
+                    current = std::path::PathBuf::from("/");
+                } else if cfg!(windows) && saw_prefix {
+                    // Root dir after a Windows drive letter is already represented.
+                } else {
+                    bail!(
+                        "path must be relative and not contain absolute components: {}",
+                        raw.display()
+                    );
+                }
             }
-            if meta.is_dir() {
-                bail!("path must not be a directory: {}", raw.display());
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !is_absolute {
+                    bail!("path must not contain '..' components: {}", raw.display());
+                }
+                if !current.pop() {
+                    bail!("path must not escape the root directory: {}", raw.display());
+                }
+            }
+            std::path::Component::Normal(name) => {
+                saw_name = true;
+                current.push(name);
+
+                match std::fs::symlink_metadata(&current) {
+                    Ok(meta) => {
+                        if meta.is_symlink() {
+                            bail!("path must not contain a symlink: {}", raw.display());
+                        }
+                        let is_last = components.peek().is_none();
+                        if is_last {
+                            if meta.is_dir() {
+                                bail!("path must not be a directory: {}", raw.display());
+                            }
+                        } else if !meta.is_dir() {
+                            bail!("path component is not a directory: {}", current.display());
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Missing intermediate directories or the final file are fine.
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
-        return Ok(canonical);
     }
 
-    let mut clean = std::path::PathBuf::new();
-    for comp in raw.components() {
-        match comp {
-            std::path::Component::Normal(n) => clean.push(n),
-            std::path::Component::CurDir => {}
-            _ => {
-                bail!(
-                    "path must be relative and not contain '..' or absolute components: {}",
-                    raw.display()
-                );
-            }
-        }
-    }
-    if clean.as_os_str().is_empty() {
+    if !saw_name {
         bail!(
             "path must contain at least one file or directory name: {}",
             raw.display()
         );
     }
 
-    let mut current = canonical_cwd.clone();
-    let mut components = clean.components().peekable();
-    while let Some(comp) = components.next() {
-        let std::path::Component::Normal(name) = comp else {
-            continue;
-        };
-        current.push(name);
-
-        match std::fs::symlink_metadata(&current) {
-            Ok(meta) => {
-                if meta.is_symlink() {
-                    bail!("path must not contain a symlink: {}", raw.display());
-                }
-                let is_last = components.peek().is_none();
-                if is_last {
-                    if meta.is_dir() {
-                        bail!("path must not be a directory: {}", raw.display());
-                    }
-                } else if !meta.is_dir() {
-                    bail!("path component is not a directory: {}", current.display());
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Missing intermediate directories or the final file are fine.
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
+    if is_absolute {
+        let scratch = scratch_dir()?;
+        let canonical_scratch = dunce::canonicalize(&scratch).unwrap_or_else(|_| scratch.clone());
+        if !current.starts_with(&canonical_cwd) && !current.starts_with(&canonical_scratch) {
+            bail!(
+                "path must be under the current working directory or omgb scratch directory: {}",
+                raw.display()
+            );
         }
     }
 
-    Ok(canonical_cwd.join(&clean))
+    Ok(current)
 }
 
 /// Read a prompt file without following a symlink (Unix: O_NOFOLLOW).
@@ -547,13 +525,30 @@ fn read_prompt_file(path: &std::path::Path) -> Result<String> {
 
 #[cfg(windows)]
 fn read_prompt_file(path: &std::path::Path) -> Result<String> {
-    if let Ok(meta) = std::fs::symlink_metadata(path)
-        && meta.is_symlink()
-    {
-        bail!("prompt file must not be a symlink: {}", path.display());
+    use std::io::Read;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("failed to open prompt file: {}", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("failed to stat prompt file: {}", path.display()))?;
+    if meta.is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        bail!(
+            "prompt file must not be a symlink or reparse point: {}",
+            path.display()
+        );
     }
-    std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read prompt file: {}", path.display()))
+    let mut s = String::new();
+    file.read_to_string(&mut s)
+        .with_context(|| format!("failed to read prompt file: {}", path.display()))?;
+    Ok(s)
 }
 
 /// Write output to `path` without following a final symlink by writing to a

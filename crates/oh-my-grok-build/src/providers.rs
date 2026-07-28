@@ -339,63 +339,89 @@ pub(crate) fn restrict_omg_file_permissions(path: &std::path::Path) -> Result<()
 
 #[cfg(windows)]
 fn windows_restrict_file_permissions(path: &std::path::Path) -> Result<()> {
-    let user = windows_username()?;
-    // icacls argument syntax uses `:`, `,`, `*` and `?` as separators/wildcards,
-    // and several other characters are unsafe in command-line arguments.
-    const FORBIDDEN: &[char] = &[
-        '"', ':', '*', '?', '<', '>', '|', '&', ';', ',', '%', '!', '\'', '(', ')',
-    ];
-    if user
-        .chars()
-        .any(|c| c.is_control() || FORBIDDEN.contains(&c))
-    {
-        bail!("Windows user name contains unsafe characters");
-    }
-    let grant = if user.contains(' ') {
-        format!("\"{user}\":F")
-    } else {
-        format!("{user}:F")
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{CloseHandle, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
+        TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
+    use windows::Win32::Security::{
+        ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, GetTokenInformation,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::PCWSTR;
 
-    let run = |label: &str, extra: &[&str]| -> Result<()> {
-        let output = std::process::Command::new("icacls")
-            .arg(path)
-            .args(extra)
-            .arg("/Q")
-            .output()
-            .map_err(|e| anyhow::anyhow!("failed to run icacls {label}: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("icacls {label} failed for {}: {stderr}", path.display());
+    unsafe {
+        let mut token_handle = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
+            .map_err(|e| anyhow::anyhow!("OpenProcessToken failed: {e}"))?;
+
+        let mut return_length = 0u32;
+        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut return_length);
+
+        let mut token_user_buffer = vec![0u8; return_length as usize];
+        GetTokenInformation(
+            token_handle,
+            TokenUser,
+            Some(token_user_buffer.as_mut_ptr() as *mut _),
+            return_length,
+            &mut return_length,
+        )
+        .map_err(|e| {
+            let _ = CloseHandle(token_handle);
+            anyhow::anyhow!("GetTokenInformation failed: {e}")
+        })?;
+
+        let token_user = &*(token_user_buffer.as_ptr() as *const TOKEN_USER);
+        let user_sid = token_user.User.Sid;
+
+        let explicit_access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: 0x10000000, // GENERIC_ALL
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: ACE_FLAGS(0),
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation:
+                    windows::Win32::Security::Authorization::NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER,
+                ptstrName: windows::core::PWSTR(user_sid.0 as *mut u16),
+            },
+        };
+
+        let mut new_acl: *mut ACL = std::ptr::null_mut();
+        let result = SetEntriesInAclW(Some(&[explicit_access]), None, &mut new_acl);
+        if result.0 != 0 {
+            let _ = CloseHandle(token_handle);
+            bail!("SetEntriesInAclW failed: {}", result.0);
         }
-        Ok(())
-    };
 
-    // Remove inherited and broad-group ACEs, then grant the current user full control.
-    run("inheritance", &["/inheritance:r"])?;
-    run(
-        "remove",
-        &["/remove", "*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545", "/C"],
-    )?;
-    run("grant", &["/grant:r", grant.as_str()])?;
+        let wide_path: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let result = SetNamedSecurityInfoW(
+            PCWSTR::from_raw(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        );
+
+        let _ = LocalFree(Some(HLOCAL(new_acl as *mut _)));
+        let _ = CloseHandle(token_handle);
+
+        if result.0 != 0 {
+            bail!("SetNamedSecurityInfoW failed: {}", result.0);
+        }
+    }
+
     Ok(())
-}
-
-#[cfg(windows)]
-fn windows_username() -> Result<String> {
-    let out = std::process::Command::new("whoami")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()?;
-    if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        let s = s.trim();
-        if !s.is_empty() {
-            return Ok(s.to_string());
-        }
-    }
-    std::env::var("USERNAME")
-        .map_err(|_| anyhow::anyhow!("could not determine Windows user (whoami/USERNAME missing)"))
 }
 
 pub(crate) fn env_var_name(provider_id: &str) -> String {

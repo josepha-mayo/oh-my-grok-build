@@ -43,7 +43,7 @@ omgb exec "write a rust fibonacci" --model omgb-openai
 Run deep arXiv research (with optional model patch):
 
 ```bash
-omgb research "quantum error correction" --count 5 --model omgb-openai
+omgb research "quantum error correction" --count 5 --model omgb-openai --yolo
 ```
 
 Start the WebSocket relay server:
@@ -91,7 +91,7 @@ omgb connect ws://127.0.0.1:9999 --secret <pairing-secret>
 | `omgb dap` | List or start DAP debug adapters. |
 | `omgb plugin list|install|uninstall` | Browse and install plugins from the marketplace. |
 | `omgb playbook` | Run deterministic CI playbooks. |
-| `omgb workflow run|list|show|new` | Run YAML/JSON workflows with exec/fan_out/shell steps. |
+| `omgb workflow run|list|show|new|create` | Run YAML/JSON workflows with exec/fan_out/shell steps. |
 | `omgb group` | Multi-agent group chat with humans and agents. |
 | `omgb use` / `omgb browser` | Computer / browser use (gated by `--yolo` or `OMGB_ALLOW_DESKTOP_CONTROL=1`). |
 | `omgb mcp` | Manage MCP servers. |

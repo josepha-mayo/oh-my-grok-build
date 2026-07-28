@@ -17,7 +17,7 @@ This file is the single source of truth for what `oh-my-grok-build` is and what 
 | Path | Purpose |
 |------|---------|
 | `crates/codegen/xai-grok-*` | Upstream Grok Build Rust source. Edits kept minimal and clearly marked (`omgb:` comments or new extension crates). |
-| `crates/oh-my-grok-build` | New composition-root binary `oh-my-grok-build` / `omgb`. It imports `xai-grok-pager` plus the `omgb-*` crates and registers the extra subcommands/slash commands. |
+| `crates/oh-my-grok-build` | New composition-root binary `oh-my-grok-build` / `omgb`. It imports the upstream `xai-grok-*` crates and contains all new subcommands (provider, model, exec, team, workflow, research, serve, dap, lsp, etc.). |
 | `crates/omgb-providers` | BYOK providers, local model discovery, model-switching, provider connectivity tests. |
 | `crates/omgb-scheduler` | Cron/scheduled prompt execution, background daemon, safe lifecycle. |
 | `crates/omgb-subagents` | `team`, `swarm`, `subagent spawn/list/kill/logs/trace`, worktree isolation. |

@@ -4,7 +4,7 @@
 //! JSON-RPC stdio lifecycles.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -414,6 +414,7 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
 }
 
 pub async fn dap_attach(program: &Path, pid: u32, extra_args: &[String]) -> Result<()> {
+    validate_dap_target(program, pid)?;
     let (id, cmd) = pick_adapter(program)?;
     let adapter = which::which(cmd[0]).with_context(|| format!("DAP adapter {id} not found"))?;
 
@@ -469,6 +470,217 @@ pub async fn dap_attach(program: &Path, pid: u32, extra_args: &[String]) -> Resu
 
     let _ = client.dap_request("attach", attach_args).await?;
     client.relay().await
+}
+
+fn validate_dap_target(program: &Path, pid: u32) -> Result<()> {
+    if pid == 0 {
+        bail!("cannot attach to PID 0");
+    }
+    if pid == std::process::id() {
+        bail!("cannot attach to the current process");
+    }
+    if !crate::process_alive(pid) {
+        bail!("process {pid} is not alive");
+    }
+    if !is_process_owned_by_current_user(pid)? {
+        bail!("process {pid} is not owned by the current user");
+    }
+    let expected = resolve_program_path(program)?;
+    let actual = process_image_path(pid)?;
+    if !same_executable(&expected, &actual) {
+        bail!(
+            "process {pid} image ({}) does not match program {}",
+            actual.display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+fn resolve_program_path(program: &Path) -> Result<PathBuf> {
+    let candidate = if program.is_absolute() {
+        program.to_path_buf()
+    } else {
+        which::which(program)
+            .or_else(|_| dunce::canonicalize(program))
+            .with_context(|| format!("program not found: {}", program.display()))?
+    };
+    dunce::canonicalize(&candidate)
+        .with_context(|| format!("program path is not resolvable: {}", candidate.display()))
+}
+
+fn same_executable(a: &Path, b: &Path) -> bool {
+    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        (Ok(a), Ok(b)) => {
+            if cfg!(windows) {
+                a.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+            } else {
+                a == b
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn is_process_owned_by_current_user(pid: u32) -> Result<bool> {
+    let me = unsafe { libc::getuid() } as u32;
+    let status_path = format!("/proc/{pid}/status");
+    if let Ok(status) = std::fs::read_to_string(&status_path) {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                let uid = rest
+                    .split_whitespace()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("malformed Uid line for {pid}"))?
+                    .parse::<u32>()
+                    .with_context(|| format!("parse Uid for {pid}"))?;
+                return Ok(uid == me);
+            }
+        }
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-o", "uid=", "-p", &pid.to_string()])
+        .output()
+        .context("failed to run ps for process ownership")?;
+    if !out.status.success() {
+        bail!("ps failed to query process ownership");
+    }
+    let uid = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u32>()
+        .context("ps output is not a uid")?;
+    Ok(uid == me)
+}
+
+#[cfg(unix)]
+fn process_image_path(pid: u32) -> Result<PathBuf> {
+    let exe = format!("/proc/{pid}/exe");
+    if let Ok(path) = std::fs::read_link(&exe) {
+        return Ok(path);
+    }
+    let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .with_context(|| format!("cannot read /proc/{pid}/cmdline"))?;
+    let first = cmdline
+        .split_terminator('\0')
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty cmdline for {pid}"))?;
+    Ok(PathBuf::from(first))
+}
+
+#[cfg(windows)]
+fn is_process_owned_by_current_user(pid: u32) -> Result<bool> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        fn sid_ptr(buf: &[u8]) -> windows::Win32::Security::PSID {
+            let token_user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+            token_user.User.Sid
+        }
+
+        fn sid_bytes(sid: windows::Win32::Security::PSID) -> Vec<u8> {
+            let ptr = sid.0 as *const u8;
+            let count = unsafe { *ptr.add(1) } as usize;
+            let len = 2 + 6 + count * 4;
+            unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+        }
+
+        let mut current_token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut current_token)
+            .map_err(|e| anyhow::anyhow!("OpenProcessToken(current): {e}"))?;
+        let mut current_len = 0u32;
+        let _ = GetTokenInformation(current_token, TokenUser, None, 0, &mut current_len);
+        let mut current_buf = vec![0u8; current_len as usize];
+        GetTokenInformation(
+            current_token,
+            TokenUser,
+            Some(current_buf.as_mut_ptr() as *mut _),
+            current_len,
+            &mut current_len,
+        )
+        .map_err(|e| anyhow::anyhow!("GetTokenInformation(current): {e}"))?;
+        let current_sid = sid_ptr(&current_buf);
+
+        let handle = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+        .map_err(|e| anyhow::anyhow!("OpenProcess({pid}): {e}"))?;
+        let mut target_token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(handle, TOKEN_QUERY, &mut target_token).map_err(|e| {
+            let _ = CloseHandle(handle);
+            anyhow::anyhow!("OpenProcessToken({pid}): {e}")
+        })?;
+        let mut target_len = 0u32;
+        let _ = GetTokenInformation(target_token, TokenUser, None, 0, &mut target_len);
+        let mut target_buf = vec![0u8; target_len as usize];
+        GetTokenInformation(
+            target_token,
+            TokenUser,
+            Some(target_buf.as_mut_ptr() as *mut _),
+            target_len,
+            &mut target_len,
+        )
+        .map_err(|e| {
+            let _ = CloseHandle(target_token);
+            let _ = CloseHandle(handle);
+            anyhow::anyhow!("GetTokenInformation({pid}): {e}")
+        })?;
+        let target_sid = sid_ptr(&target_buf);
+
+        let equal = sid_bytes(current_sid) == sid_bytes(target_sid);
+
+        let _ = CloseHandle(target_token);
+        let _ = CloseHandle(handle);
+        let _ = CloseHandle(current_token);
+        Ok(equal)
+    }
+}
+
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Result<PathBuf> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| anyhow::anyhow!("OpenProcess({pid}): {e}"))?;
+        let mut buf: Vec<u16> = vec![0; 1024];
+        let mut size: u32 = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(handle);
+        result.map_err(|e| anyhow::anyhow!("QueryFullProcessImageNameW({pid}): {e}"))?;
+        Ok(PathBuf::from(String::from_utf16_lossy(
+            &buf[..size as usize],
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_process_owned_by_current_user(_pid: u32) -> Result<bool> {
+    bail!("DAP attach is not supported on this platform")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_image_path(_pid: u32) -> Result<PathBuf> {
+    bail!("DAP attach is not supported on this platform")
 }
 
 pub async fn run_lsp(cmd: LspCommand) -> Result<()> {

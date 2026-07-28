@@ -481,7 +481,44 @@ fn find_workspace_root() -> Option<PathBuf> {
     None
 }
 
+fn verify_safe_shell_guard_source(root: &Path) -> Result<()> {
+    let expected = [
+        root.join("Cargo.toml"),
+        root.join("crates")
+            .join("oh-my-grok-build")
+            .join("Cargo.toml"),
+        root.join("crates")
+            .join("oh-my-grok-build")
+            .join("src")
+            .join("bin")
+            .join("safe_shell_guard.rs"),
+        root.join("crates")
+            .join("oh-my-grok-build")
+            .join("src")
+            .join("lib.rs"),
+    ];
+    for p in &expected {
+        if !p.is_file() {
+            bail!(
+                "{} does not look like the oh-my-grok-build source tree (missing {})",
+                root.display(),
+                p.display()
+            );
+        }
+    }
+    let cargo_toml = std::fs::read_to_string(&expected[1])
+        .with_context(|| format!("read {}", expected[1].display()))?;
+    if !cargo_toml.contains("name = \"oh-my-grok-build\"") {
+        bail!(
+            "{} is not the oh-my-grok-build crate",
+            expected[1].display()
+        );
+    }
+    Ok(())
+}
+
 async fn build_and_copy_safe_shell_guard(root: &Path, dst: &Path) -> Result<()> {
+    verify_safe_shell_guard_source(root)?;
     let profile = build_profile();
     let cargo = which::which("cargo").context("`cargo` not found on PATH")?;
     let mut cmd = tokio::process::Command::new(cargo);

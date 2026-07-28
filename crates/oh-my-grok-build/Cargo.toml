@@ -54,6 +54,9 @@ xai-tool-runtime = { path = "../common/xai-tool-runtime" }
 xai-tool-types = { path = "../common/xai-tool-types" }
 croner = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
 [[bin]]
 name = "safe-shell-guard"
 path = "src/bin/safe_shell_guard.rs"

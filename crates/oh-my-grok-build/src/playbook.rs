@@ -236,6 +236,37 @@ pub(crate) fn resolve_shell_command(command: &str) -> Result<PathBuf> {
         }
     }
 
+    #[cfg(windows)]
+    {
+        let parent = resolved.parent().with_context(|| {
+            format!(
+                "{resolved} has no parent directory",
+                resolved = resolved.display()
+            )
+        })?;
+        let canonical_parent = dunce::canonicalize(parent).with_context(|| {
+            format!("failed to canonicalize {parent}", parent = parent.display())
+        })?;
+        let mut trusted = vec![
+            std::path::PathBuf::from(r"C:\Program Files"),
+            std::path::PathBuf::from(r"C:\Program Files (x86)"),
+            std::path::PathBuf::from(r"C:\Windows"),
+        ];
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            trusted.push(std::path::PathBuf::from(profile));
+        }
+        if !trusted
+            .iter()
+            .any(|root| canonical_parent.starts_with(root))
+        {
+            bail!(
+                "resolved command {resolved} is in an untrusted directory {parent}; it must be under the user profile, Program Files, or Windows",
+                resolved = resolved.display(),
+                parent = parent.display()
+            );
+        }
+    }
+
     Ok(resolved)
 }
 
