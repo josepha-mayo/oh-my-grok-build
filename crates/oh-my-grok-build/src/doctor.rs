@@ -413,16 +413,13 @@ fn check_env_permissions(fix: bool) -> Result<Check> {
         return Ok(warn("env permissions", "~/.omgb/.env does not exist"));
     }
 
-    if let Some(reason) = env_permissions_not_restricted(&path) {
+    if let Some(reason) = env_permissions_not_restricted(&path)? {
         if fix {
-            let raw = std::fs::read_to_string(&path).with_context(|| {
-                format!("failed to read {} to rewrite permissions", path.display())
-            })?;
-            crate::providers::write_file_atomic(&path, raw.as_bytes(), true)
-                .context("failed to rewrite ~/.omgb/.env")?;
+            crate::providers::restrict_omg_file_permissions(&path)
+                .context("failed to restrict ~/.omgb/.env")?;
             return Ok(fixed_ok(
                 "env permissions",
-                format!("rewrote ~/.omgb/.env with restricted permissions ({reason})"),
+                format!("restricted ~/.omgb/.env permissions ({reason})"),
             ));
         }
         return Ok(warn("env permissions", reason));
@@ -435,27 +432,25 @@ fn check_env_permissions(fix: bool) -> Result<Check> {
 }
 
 #[cfg(unix)]
-fn env_permissions_not_restricted(path: &Path) -> Option<String> {
+fn env_permissions_not_restricted(path: &Path) -> Result<Option<String>> {
     use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = std::fs::metadata(path)?;
     let mode = meta.permissions().mode() & 0o777;
     if mode == 0o600 {
-        None
+        Ok(None)
     } else {
-        Some(format!("mode is {mode:03o}, expected 600"))
+        Ok(Some(format!("mode is {mode:03o}, expected 600")))
     }
 }
 
 #[cfg(windows)]
-fn env_permissions_not_restricted(_path: &Path) -> Option<String> {
-    // Windows uses ACLs rather than Unix modes; --fix will still enforce the
-    // project-standard ACLs via write_file_atomic/restrict_omg_file_permissions.
-    None
+fn env_permissions_not_restricted(path: &Path) -> Result<Option<String>> {
+    crate::providers::windows_permissions_restriction_issue(path)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn env_permissions_not_restricted(_path: &Path) -> Option<String> {
-    None
+fn env_permissions_not_restricted(_path: &Path) -> Result<Option<String>> {
+    Ok(None)
 }
 
 async fn check_safe_shell_guard(fix: bool) -> Result<Check> {
@@ -820,6 +815,27 @@ mod tests {
     fn failed_checks_make_doctor_fail() {
         assert!(ensure_no_failed_checks(&[fail("broken", "nope")]).is_err());
         assert!(ensure_no_failed_checks(&[ok("good", "ok")]).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn doctor_detects_and_repairs_a_broad_windows_env_acl() {
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home =
+            std::env::temp_dir().join(format!("omgb-doctor-env-acl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".env"), b"TOKEN=secret\n").unwrap();
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
+
+        let before = check_env_permissions(false).unwrap();
+        assert!(matches!(before.status, Status::Warn));
+        let fixed = check_env_permissions(true).unwrap();
+        assert!(fixed.fixed);
+        let after = check_env_permissions(false).unwrap();
+        assert!(matches!(after.status, Status::Ok));
+
+        crate::providers::set_omg_home_for_tests(None);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

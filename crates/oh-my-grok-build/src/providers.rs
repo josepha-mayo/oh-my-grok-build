@@ -358,6 +358,12 @@ pub(crate) fn write_file_atomic(
     std::fs::create_dir_all(parent)?;
     if restrict {
         restrict_omg_directory_permissions(parent)?;
+        if path.exists() {
+            // ReplaceFileW intentionally preserves an existing destination's
+            // DACL. Tighten it before publishing secret bytes so there is no
+            // broad-access window between replacement and a later ACL update.
+            restrict_omg_file_permissions(path)?;
+        }
     }
     let tmp = path.with_extension(format!(
         "tmp.{}.{}",
@@ -391,6 +397,11 @@ pub(crate) fn write_file_atomic(
         replace_file_atomic_windows(&tmp, path)?;
         #[cfg(not(windows))]
         std::fs::rename(&tmp, path)?;
+        if restrict {
+            // Verify the final path has the intended metadata even on
+            // platforms whose atomic replacement inherits destination state.
+            restrict_omg_file_permissions(path)?;
+        }
         #[cfg(unix)]
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
@@ -752,6 +763,116 @@ fn windows_restrict_file_permissions(path: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_permissions_restriction_issue(
+    path: &std::path::Path,
+) -> Result<Option<String>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED,
+    };
+    use windows::core::PCWSTR;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect permissions target {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "permissions target is not a regular file: {}",
+            path.display()
+        );
+    }
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut owner = PSID::default();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let status = GetNamedSecurityInfoW(
+            PCWSTR::from_raw(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            Some(&mut dacl),
+            None,
+            &mut descriptor,
+        );
+        if status.0 != 0 {
+            bail!("GetNamedSecurityInfoW failed: {}", status.0);
+        }
+
+        let inspection = (|| -> Result<Option<String>> {
+            if descriptor.is_invalid() || owner.is_invalid() || dacl.is_null() {
+                return Ok(Some("Windows file ACL is missing an owner or DACL".into()));
+            }
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)
+                .map_err(|error| anyhow::anyhow!("GetSecurityDescriptorControl failed: {error}"))?;
+            if control & SE_DACL_PROTECTED.0 == 0 {
+                return Ok(Some(
+                    "Windows file ACL inherits access from its parent".into(),
+                ));
+            }
+
+            let mut info = ACL_SIZE_INFORMATION::default();
+            GetAclInformation(
+                dacl,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+            .map_err(|error| anyhow::anyhow!("GetAclInformation failed: {error}"))?;
+            if info.AceCount != 1 {
+                return Ok(Some(format!(
+                    "Windows file ACL grants access through {} entries; expected only the owner",
+                    info.AceCount
+                )));
+            }
+
+            let mut raw_ace = std::ptr::null_mut();
+            GetAce(dacl, 0, &mut raw_ace)
+                .map_err(|error| anyhow::anyhow!("GetAce failed: {error}"))?;
+            if raw_ace.is_null() {
+                return Ok(Some("Windows file ACL has an empty access entry".into()));
+            }
+            let header = &*(raw_ace as *const windows::Win32::Security::ACE_HEADER);
+            if header.AceType != 0
+                || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            {
+                return Ok(Some(
+                    "Windows file ACL does not contain one owner allow entry".into(),
+                ));
+            }
+            let allowed = &*(raw_ace as *const ACCESS_ALLOWED_ACE);
+            if allowed.Mask != 0x001F01FF {
+                return Ok(Some(
+                    "Windows owner ACL does not grant the expected private file access".into(),
+                ));
+            }
+            let ace_sid = PSID(std::ptr::addr_of!(allowed.SidStart) as *mut _);
+            if EqualSid(owner, ace_sid).is_err() {
+                return Ok(Some(
+                    "Windows file ACL grants access to an identity other than its owner".into(),
+                ));
+            }
+            Ok(None)
+        })();
+
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        inspection
+    }
 }
 
 pub(crate) fn env_var_name(provider_id: &str) -> String {
@@ -2530,6 +2651,27 @@ mod tests {
         assert!(err.to_string().contains("no configured model"));
         crate::providers::set_omg_home_for_tests(None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_atomic_rewrite_replaces_a_broad_windows_acl() {
+        let root =
+            std::env::temp_dir().join(format!("omgb-private-file-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("secret.env");
+        std::fs::write(&file, b"TOKEN=secret\n").unwrap();
+
+        assert!(
+            windows_permissions_restriction_issue(&file)
+                .unwrap()
+                .is_some()
+        );
+        write_file_atomic(&file, b"TOKEN=updated\n", true).unwrap();
+        assert_eq!(windows_permissions_restriction_issue(&file).unwrap(), None);
+        assert_eq!(std::fs::read(&file).unwrap(), b"TOKEN=updated\n");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
