@@ -99,7 +99,8 @@ checks and CORS for the authenticated HTTP group API. An HTTPS-hosted web
 companion requires `wss://`; use the native app for a local `ws://` relay.
 The secret-free `GET /healthz` endpoint is available for local liveness checks.
 `GET /capabilities` exposes the versioned, secret-free mobile contract and its
-group limits; the mobile app verifies it before saving pairing credentials.
+group limits; the mobile app verifies it before saving OMGB pairing credentials,
+while a 404 remains the documented upstream ACP-only compatibility path.
 The relay exits if its embedded ACP agent stops, so a service manager does not
 keep advertising a listener that cannot accept sessions.
 

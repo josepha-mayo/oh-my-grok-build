@@ -130,9 +130,10 @@ cannot serve.
 
 `GET /capabilities` returns the relay API version, supported ACP/group/voice
 features, and group message limits without exposing credentials. Current mobile
-clients verify this contract before storing a pairing profile, so an outdated or
-unrelated server fails with one compatibility error rather than later protocol
-failures.
+clients verify this contract before storing an OMGB pairing profile. A 404 keeps
+the documented upstream `grok serve` ACP-only path available, but a malformed or
+incompatible advertised OMGB contract fails with one compatibility error rather
+than later protocol failures.
 
 For LAN access:
 
