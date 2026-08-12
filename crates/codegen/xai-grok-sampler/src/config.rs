@@ -21,6 +21,8 @@ pub enum AuthScheme {
     #[default]
     Bearer,
     XApiKey,
+    /// Intentionally omit authentication headers for a keyless endpoint.
+    None,
 }
 
 /// All knobs that control a single sampling request.

@@ -2693,6 +2693,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             api_backend: Some("responses".into()),
             env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            no_auth: false,
             extra_headers: None,
             context_window: None,
             auto_compact_threshold_percent: None,

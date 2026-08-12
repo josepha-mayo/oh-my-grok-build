@@ -12,6 +12,10 @@ use crate::args::{AddProviderArgs, DiscoverArgs};
 use crate::net::{http_get_text, http_post_json, is_url_host_private, validate_url};
 use url::Url;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 pub mod catalog;
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
@@ -161,6 +165,11 @@ pub struct ProviderConfig {
     pub api_backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_key: Option<Vec<String>>,
+    /// The endpoint intentionally accepts requests without credentials.
+    /// This is inferred only for verified loopback providers so a Grok
+    /// session token is never substituted for a missing local-provider key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_auth: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1013,6 +1022,11 @@ fn provider_execution_fingerprint_unlocked(model: &str) -> Result<Option<String>
         hash.update(value.as_bytes());
         hash.update(b"\0");
     }
+    hash.update(if provider.no_auth {
+        b"no_auth\0"
+    } else {
+        b"auth\0"
+    });
     for value in [
         provider.context_window.map(|value| value.to_string()),
         provider
@@ -1168,6 +1182,15 @@ fn provider_from_grok_table(
         }
         Some(_) => bail!("model.{key}.env_key must be a valid string or string array"),
     };
+    let no_auth = match section.get("auth_scheme") {
+        None => false,
+        Some(toml::Value::String(value)) if value == "none" => true,
+        Some(toml::Value::String(value)) if value == "bearer" || value == "x_api_key" => false,
+        Some(toml::Value::String(_)) => {
+            bail!("model.{key}.auth_scheme must be bearer, x_api_key, or none")
+        }
+        Some(_) => bail!("model.{key}.auth_scheme must be a string"),
+    };
     let extra_headers = match section.get("extra_headers") {
         None => None,
         Some(toml::Value::Table(headers)) => {
@@ -1209,6 +1232,7 @@ fn provider_from_grok_table(
             .and_then(toml::Value::as_str)
             .map(str::to_string),
         env_key,
+        no_auth,
         extra_headers,
         context_window: optional_u64("context_window")?,
         auto_compact_threshold_percent: threshold,
@@ -1237,10 +1261,15 @@ fn ensure_provider_configured_unlocked(id: &str) -> Result<ProviderConfig> {
         if p.model.trim().is_empty() {
             bail!("provider '{id}' has no configured model; pass --model or discover local models");
         }
+        // `no_auth` is an explicit, security-sensitive boundary. It is set
+        // only after add/discovery successfully probes a loopback endpoint,
+        // or loaded from an explicit `auth_scheme = "none"` Grok entry. A
+        // temporarily missing key must never downgrade an existing provider.
         sync_provider_to_grok_config_unlocked(&p)?;
         return Ok(p);
     }
     if let Some(provider) = provider_from_grok_config(&id)? {
+        sync_provider_to_grok_config_unlocked(&provider)?;
         return Ok(provider);
     }
     let provider = provider_template(&id).ok_or_else(|| {
@@ -1362,6 +1391,7 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
                     .unwrap_or_else(|| "chat_completions".into()),
             ),
             env_key: None,
+            no_auth: false,
             extra_headers: None,
             context_window: None,
             auto_compact_threshold_percent: Some(80),
@@ -1430,6 +1460,7 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
     let allow_private = is_url_host_private(&provider.base_url).await;
     // Reject insecure public HTTP before the provider is saved.
     validate_url(&provider.base_url, allow_local, allow_private).await?;
+    provider.no_auth = is_url_host_loopback(&provider.base_url) && api_key_for_fetch.is_none();
     let is_ollama = provider.id == "ollama" || is_ollama_url(&provider.base_url);
     let models = fetch_model_list(
         &provider.base_url,
@@ -1583,6 +1614,9 @@ fn apply_provider_to_grok_table(
             }
         }
     }
+    if provider.no_auth {
+        section.insert("auth_scheme".into(), toml::Value::String("none".into()));
+    }
     if let Some(headers) = &provider.extra_headers {
         let mut h = toml::map::Map::new();
         for (k, v) in headers {
@@ -1727,6 +1761,7 @@ pub fn add_discovered_providers(
                 base_url: base_url.into(),
                 api_backend: Some("chat_completions".into()),
                 env_key: provider_env_keys(&id, None),
+                no_auth: true,
                 extra_headers: None,
                 context_window: Some(model.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)),
                 auto_compact_threshold_percent: Some(80),
@@ -2132,6 +2167,7 @@ mod tests {
             base_url: "https://current.example/v1".into(),
             api_backend: None,
             env_key: None,
+            no_auth: false,
             extra_headers: None,
             context_window: None,
             auto_compact_threshold_percent: None,
@@ -2217,6 +2253,7 @@ mod tests {
             base_url: "http://localhost/v1".into(),
             api_backend: None,
             env_key: Some(vec!["OMGB_TEST_API_KEY".into()]),
+            no_auth: false,
             extra_headers: None,
             context_window: None,
             auto_compact_threshold_percent: Some(80),
@@ -2253,6 +2290,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             api_backend: Some("responses".into()),
             env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            no_auth: false,
             extra_headers: None,
             context_window: None,
             auto_compact_threshold_percent: None,
@@ -2311,6 +2349,7 @@ mod tests {
             base_url: "https://example.com/v1".into(),
             api_backend: None,
             env_key: None,
+            no_auth: false,
             extra_headers: None,
             context_window: Some(128_000),
             auto_compact_threshold_percent: Some(80),
@@ -2331,7 +2370,8 @@ mod tests {
         let grok = root.join("grok");
         set_omg_home_for_tests(Some(omg));
         set_grok_home_for_tests(Some(grok));
-        let provider = test_provider("repair");
+        let mut provider = test_provider("repair");
+        provider.no_auth = true;
         save_omg_config(&OmgConfig {
             default_model: Some("omgb-repair".into()),
             providers: HashMap::from([("repair".into(), provider)]),
@@ -2340,7 +2380,41 @@ mod tests {
         .unwrap();
 
         ensure_provider_configured("repair").unwrap();
-        assert!(provider_from_grok_config("repair").unwrap().is_some());
+        assert!(
+            provider_from_grok_config("repair")
+                .unwrap()
+                .unwrap()
+                .no_auth
+        );
+
+        set_grok_home_for_tests(None);
+        set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_provider_never_downgrades_missing_loopback_credentials() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "omgb-provider-auth-boundary-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        set_omg_home_for_tests(Some(root.join("omg")));
+        set_grok_home_for_tests(Some(root.join("grok")));
+        let mut provider = test_provider("keyed-local");
+        provider.base_url = "http://127.0.0.1:12345/v1".into();
+        provider.env_key = Some(vec!["OMGB_KEYED_LOCAL_API_KEY".into()]);
+        save_omg_config(&OmgConfig {
+            default_model: Some("omgb-keyed-local".into()),
+            providers: HashMap::from([("keyed-local".into(), provider)]),
+            relay: None,
+        })
+        .unwrap();
+
+        let configured = ensure_provider_configured("keyed-local").unwrap();
+        assert!(!configured.no_auth);
+        let grok_provider = provider_from_grok_config("keyed-local").unwrap().unwrap();
+        assert!(!grok_provider.no_auth);
 
         set_grok_home_for_tests(None);
         set_omg_home_for_tests(None);
@@ -2435,6 +2509,7 @@ mod tests {
             base_url: "https://example.com/v1".into(),
             api_backend: None,
             env_key: None,
+            no_auth: false,
             extra_headers: None,
             context_window: None,
             auto_compact_threshold_percent: None,

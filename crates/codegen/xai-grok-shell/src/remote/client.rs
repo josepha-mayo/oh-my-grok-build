@@ -872,7 +872,9 @@ pub fn parse_remote_model_value(
             .or_else(|| meta.and_then(|m| m.get("supportedInApi")))
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
-        auth_scheme: None,
+        auth_scheme: get_string(obj, "authScheme")
+            .or_else(|| get_string(obj, "auth_scheme"))
+            .and_then(|value| serde_json::from_value(serde_json::Value::String(value)).ok()),
         reasoning_effort: get_string(obj, "reasoningEffort")
             .or_else(|| get_string(obj, "reasoning_effort"))
             .or_else(|| meta.and_then(|m| get_string(m, "reasoningEffort")))
@@ -1416,6 +1418,19 @@ mod tests {
         assert_eq!(result.model, "actual-model-id");
         assert_eq!(result.name.as_deref(), Some("Display Name"));
     }
+
+    #[test]
+    fn parse_remote_model_preserves_keyless_auth_boundary() {
+        let value = serde_json::json!({
+            "model": "local-model",
+            "baseUrl": "http://127.0.0.1:12345/v1",
+            "contextWindow": 8192,
+            "authScheme": "none"
+        });
+        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+        assert_eq!(result.auth_scheme, Some(xai_grok_sampler::AuthScheme::None));
+    }
+
     #[test]
     fn parse_reads_reasoning_effort_fields() {
         use xai_grok_sampling_types::ReasoningEffort;

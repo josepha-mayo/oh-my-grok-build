@@ -46,6 +46,7 @@ impl ProviderTemplate {
             base_url: self.base_url.into(),
             api_backend: self.api_backend.map(|s| s.into()),
             env_key: provider_env_keys(self.id, self.env_key),
+            no_auth: false,
             extra_headers: self.extra_headers.map(|h| {
                 h.iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))

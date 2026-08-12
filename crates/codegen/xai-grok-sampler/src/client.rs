@@ -430,6 +430,7 @@ impl SamplingClient {
                     })?;
                     headers.insert(AUTHORIZATION, header_value);
                 }
+                AuthScheme::None => {}
             }
         }
 
@@ -565,6 +566,10 @@ impl SamplingClient {
                         headers.insert(AUTHORIZATION, v);
                     }
                 }
+                AuthScheme::None => {
+                    headers.remove(AUTHORIZATION);
+                    headers.remove(HeaderName::from_static("x-api-key"));
+                }
             }
         }
         {
@@ -623,6 +628,7 @@ impl SamplingClient {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer "))
                 .map(|s| s.to_string()),
+            AuthScheme::None => None,
         };
         raw.map(|mut s| {
             // Truncate in-place so we never materialize a heap-resident
@@ -658,6 +664,7 @@ impl SamplingClient {
     pub fn auth_info(&self) -> crate::sampling_log::AuthInfo {
         let auth_prefix = self.current_sent_bearer_prefix();
         let auth_type = match (&self.defaults.auth_scheme, &auth_prefix) {
+            (AuthScheme::None, _) => "none",
             (AuthScheme::XApiKey, Some(_)) => "x-api-key",
             (AuthScheme::Bearer, Some(_)) => "bearer",
             (_, None) => "none",
@@ -2113,6 +2120,45 @@ mod tests {
                 .get(HeaderName::from_static("x-api-key"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn no_auth_scheme_never_emits_a_credential_header() {
+        #[derive(Debug)]
+        struct StaticResolver;
+        impl crate::config::BearerResolver for StaticResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some("session-secret-that-must-not-leak".to_string())
+            }
+        }
+
+        let cfg = SamplerConfig {
+            api_key: Some("configured-secret-that-must-not-leak".to_string()),
+            auth_scheme: AuthScheme::None,
+            bearer_resolver: Some(std::sync::Arc::new(StaticResolver)),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        assert!(client.default_headers.get(AUTHORIZATION).is_none());
+        assert!(
+            client
+                .default_headers
+                .get(HeaderName::from_static("x-api-key"))
+                .is_none()
+        );
+
+        let request = client
+            .post("http://127.0.0.1:12345/v1/chat/completions")
+            .build()
+            .expect("request should build");
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+        assert!(
+            request
+                .headers()
+                .get(HeaderName::from_static("x-api-key"))
+                .is_none()
+        );
+        assert_eq!(client.auth_info().auth_type, "none");
     }
 
     // Regression: a past change dropped User-Agent from sampling requests.

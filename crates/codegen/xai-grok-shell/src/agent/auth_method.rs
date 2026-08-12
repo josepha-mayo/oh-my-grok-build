@@ -67,7 +67,10 @@ where
     if disable_api_key_auth {
         return false;
     }
-    has_xai_api_key_env() || models.into_iter().any(ModelEntry::has_own_credentials)
+    has_xai_api_key_env()
+        || models
+            .into_iter()
+            .any(ModelEntry::uses_external_auth_boundary)
 }
 
 /// Inputs to [`build_auth_methods`].
@@ -835,6 +838,40 @@ mod tests {
                  uses to decide whether to show the login screen",
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn keyless_local_model_is_noninteractive_without_a_grok_login() {
+        let _global = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        let dm = crate::models::default_model();
+        let toml: toml::Value = toml::from_str(&format!(
+            r#"
+            [model."{dm}"]
+            model = "local-model"
+            base_url = "http://127.0.0.1:12345/v1"
+            context_window = 8192
+            auth_scheme = "none"
+            "#,
+        ))
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&toml).expect("config should parse");
+        let models = resolve_model_list(&cfg, None);
+        let model = models.get(dm).expect("local model should exist");
+        assert_eq!(model.info.auth_scheme, xai_grok_sampler::AuthScheme::None);
+
+        let has_external_api_key = should_advertise_xai_api_key(false, models.values());
+        assert!(has_external_api_key);
+        let built = build_auth_methods(AuthMethodsBuildInputs {
+            has_external_api_key,
+            has_cached_token: false,
+            ..default_inputs()
+        });
+        assert_eq!(
+            first_kind(&built.methods),
+            Some(AuthMethodKind::XaiApiKey),
+            "keyless local execution must not be routed into interactive Grok login",
+        );
     }
 
     /// `XAI_API_KEY` alone (no per-model creds) also triggers

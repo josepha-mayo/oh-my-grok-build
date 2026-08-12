@@ -3587,6 +3587,7 @@ pub struct ConfigModelOverride {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: Option<ApiBackend>,
+    pub auth_scheme: Option<AuthScheme>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
     pub context_window: Option<u64>,
@@ -3650,6 +3651,9 @@ impl ConfigModelOverride {
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = v.clone();
         }
+        if let Some(auth_scheme) = self.auth_scheme {
+            entry.info.auth_scheme = auth_scheme;
+        }
         if !self.extra_headers.is_empty() {
             entry.info.extra_headers = self.extra_headers.clone();
         }
@@ -3711,7 +3715,11 @@ impl ConfigModelOverride {
         if self.api_base_url.is_some() {
             entry.api_base_url.clone_from(&self.api_base_url);
         }
-        if self.supported_in_api.is_none() && (self.api_key.is_some() || self.env_key.is_some()) {
+        if self.supported_in_api.is_none()
+            && (self.api_key.is_some()
+                || self.env_key.is_some()
+                || self.auth_scheme == Some(AuthScheme::None))
+        {
             entry.info.supported_in_api = true;
         }
         entry
@@ -3933,6 +3941,10 @@ impl ModelEntry {
     /// Probes `std::env::var` at call time — result is not stable across env changes.
     pub fn has_own_credentials(&self) -> bool {
         self.own_credential().is_some()
+    }
+    /// True when this model must never inherit Grok session/global auth.
+    pub fn uses_external_auth_boundary(&self) -> bool {
+        self.info.auth_scheme == AuthScheme::None || self.has_own_credentials()
     }
 }
 impl std::ops::Deref for ModelEntry {
@@ -4312,7 +4324,13 @@ pub(crate) fn first_own_credential(
 /// When `env_key` lists multiple names, the first set non-empty value is used.
 pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
-    let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
+    let (api_key, base_url, auth_type) = if info.auth_scheme == AuthScheme::None {
+        (
+            None,
+            info.base_url.clone(),
+            xai_chat_state::AuthType::ApiKey,
+        )
+    } else if let Some(key) = model.own_credential() {
         (
             Some(key),
             info.base_url.clone(),
@@ -4447,7 +4465,7 @@ pub fn resolve_model_auth_facts(model_id: &str) -> ModelAuthFacts {
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
     match lookup {
         ModelLookup::ConfigUnavailable => ModelByok::Unknown,
-        ModelLookup::Loaded(Some(e)) if e.has_own_credentials() => ModelByok::Byok,
+        ModelLookup::Loaded(Some(e)) if e.uses_external_auth_boundary() => ModelByok::Byok,
         ModelLookup::Loaded(_) => ModelByok::NotByok,
     }
 }
@@ -5657,6 +5675,25 @@ reasoning_effort = "low"
         let creds = resolve_credentials(&model, Some("session-jwt"));
         assert_eq!(creds.auth_type, AuthType::SessionToken);
         assert_eq!(creds.api_key.as_deref(), Some("session-jwt"));
+    }
+    #[test]
+    #[serial]
+    fn no_auth_model_never_inherits_session_or_global_credentials() {
+        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        use xai_chat_state::AuthType;
+        use xai_grok_test_support::EnvGuard;
+
+        let _global = EnvGuard::set(XAI_API_KEY_ENV_VAR, "global-secret");
+        let _legacy = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "legacy-secret");
+        let mut model =
+            test_model_entry("local-model", "http://127.0.0.1:12345/v1", None, None, None);
+        model.info.auth_scheme = AuthScheme::None;
+
+        let creds = resolve_credentials(&model, Some("session-secret"));
+        assert_eq!(creds.auth_type, AuthType::ApiKey);
+        assert_eq!(creds.base_url, "http://127.0.0.1:12345/v1");
+        assert_eq!(creds.api_key, None, "no credential may cross this boundary");
+        assert!(model.uses_external_auth_boundary());
     }
     #[test]
     #[serial]

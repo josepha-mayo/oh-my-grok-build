@@ -545,7 +545,7 @@ impl acp::Agent for MvpAgent {
                         .models_manager
                         .models()
                         .values()
-                        .any(|m| m.has_own_credentials())
+                        .any(|m| m.uses_external_auth_boundary())
                     {
                         emit_login_span(false, "api_key", None, Some("no_credentials"));
                         return Err(
