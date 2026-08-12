@@ -146,6 +146,14 @@ keep advertising a listener that cannot accept sessions.
 | `omgb undo` | Undo the last omgb commit. |
 | `omgb feedback "<message>"` | Open a GitHub issue to submit feedback (`--open` to launch browser). |
 
+Thread inbox delivery is durable and fail-closed after an interrupted model/tool turn. For a send that may need to be retried, pass the same stable identifier each time:
+
+```bash
+omgb thread send planner implementer "review the patch" --message-id review-patch-42
+```
+
+Within the bounded receipt history, an exact retry is acknowledged without adding a second inbox item; reusing the identifier with a different sender or payload is rejected.
+
 ## Mobile app
 
 A separate React Native + Expo mobile app lives in the `grok-build-app` repository. The `omgb serve` QR includes the harness's absolute working directory so the app can create a valid ACP session on both Windows and Unix without guessing a path.

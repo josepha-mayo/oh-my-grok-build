@@ -4,7 +4,7 @@
 //! create a thread, list threads, peek at output, prompt them, open them in the
 //! TUI, send messages between threads, and pick the best model for a task.
 
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -22,6 +22,7 @@ use xai_grok_pager::headless::OutputFormat;
 const MAX_THREAD_ID_BYTES: usize = 128;
 const MAX_THREAD_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_THREAD_INBOX_MESSAGES: usize = 500;
+const MAX_THREAD_MESSAGE_RECEIPTS: usize = 512;
 const MAX_THREADS_STORE_BYTES: u64 = 8 * 1024 * 1024;
 const TURN_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -34,6 +35,14 @@ pub struct ThreadMessage {
     pub timestamp: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "ThreadDelivery::is_pending")]
     pub delivery: ThreadDelivery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadMessageReceipt {
+    pub id: String,
+    pub from: String,
+    pub content_sha256: String,
+    pub acknowledged_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -74,6 +83,10 @@ pub struct ThreadRecord {
     pub initial_assistant_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inbox: Vec<ThreadMessage>,
+    /// Bounded tombstones make a stable message ID idempotent even after the
+    /// corresponding inbox item has been handled and removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_receipts: Vec<ThreadMessageReceipt>,
 }
 
 fn threads_path() -> Result<PathBuf> {
@@ -393,6 +406,7 @@ pub async fn create(
             summary: summary.clone(),
             initial_assistant_sha256: None,
             inbox: Vec::new(),
+            message_receipts: Vec::new(),
         });
         Ok(())
     })?;
@@ -516,7 +530,7 @@ pub async fn prompt(id: &str, prompt_text: &str, model: Option<String>, yolo: bo
         record.last_message_at = Utc::now();
         record.model = model;
         if let Some(attempt) = attempt.as_deref() {
-            acknowledge_attempt(&mut record.inbox, attempt)?;
+            acknowledge_attempt(record, attempt)?;
         }
         Ok(())
     })?;
@@ -598,7 +612,7 @@ async fn run_chat(id: &str) -> Result<()> {
                     .find(|record| record.id == id)
                     .ok_or_else(|| anyhow::anyhow!("thread '{id}' not found"))?;
                 record.last_message_at = Utc::now();
-                acknowledge_attempt(&mut record.inbox, attempt)?;
+                acknowledge_attempt(record, attempt)?;
                 Ok(())
             })?;
         }
@@ -669,12 +683,29 @@ fn print_conversation_item(item: &xai_grok_shell::sampling::ConversationItem) {
     }
 }
 
-pub fn send_message(from: &str, to: &str, content: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadMessageAdmission {
+    Accepted,
+    Duplicate,
+}
+
+fn thread_message_content_sha256(content: &str) -> String {
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+pub fn send_message_with_id(
+    from: &str,
+    to: &str,
+    content: &str,
+    message_id: &str,
+) -> Result<ThreadMessageAdmission> {
     validate_id(from)?;
     validate_id(to)?;
+    validate_id(message_id).context("invalid thread message id")?;
     let content = content.trim();
     validate_thread_message(content)?;
-    with_records_mut(|records| {
+    let content_sha256 = thread_message_content_sha256(content);
+    let admission = with_records_mut(|records| {
         if !records.iter().any(|r| r.id == from) {
             bail!("sender thread '{from}' not found");
         }
@@ -682,27 +713,51 @@ pub fn send_message(from: &str, to: &str, content: &str) -> Result<()> {
             .iter_mut()
             .find(|r| r.id == to)
             .ok_or_else(|| anyhow::anyhow!("recipient thread '{to}' not found"))?;
+        if let Some(existing) = record.inbox.iter().find(|message| message.id == message_id) {
+            if existing.from == from && existing.content == content {
+                return Ok(ThreadMessageAdmission::Duplicate);
+            }
+            bail!("thread message id '{message_id}' is already used by a different payload");
+        }
+        if let Some(existing) = record
+            .message_receipts
+            .iter()
+            .find(|receipt| receipt.id == message_id)
+        {
+            if existing.from == from && existing.content_sha256 == content_sha256 {
+                return Ok(ThreadMessageAdmission::Duplicate);
+            }
+            bail!("thread message id '{message_id}' is already used by a different payload");
+        }
         if record.inbox.len() >= MAX_THREAD_INBOX_MESSAGES {
             bail!(
                 "recipient thread '{to}' inbox is full (max {MAX_THREAD_INBOX_MESSAGES} messages)"
             );
         }
         record.inbox.push(ThreadMessage {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: message_id.to_string(),
             from: from.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
             delivery: ThreadDelivery::Pending,
         });
         record.last_message_at = Utc::now();
-        Ok(())
+        Ok(ThreadMessageAdmission::Accepted)
     })?;
-    if let Err(e) = crate::notifications::push(
-        "thread_message",
-        serde_json::json!({"from": from, "to": to}),
-    ) {
-        eprintln!("warning: thread message was delivered but notification failed: {e}");
+    if admission == ThreadMessageAdmission::Accepted {
+        if let Err(e) = crate::notifications::push(
+            "thread_message",
+            serde_json::json!({"from": from, "to": to, "message_id": message_id}),
+        ) {
+            eprintln!("warning: thread message was delivered but notification failed: {e}");
+        }
     }
+    Ok(admission)
+}
+
+pub fn send_message(from: &str, to: &str, content: &str) -> Result<()> {
+    let message_id = uuid::Uuid::new_v4().to_string();
+    send_message_with_id(from, to, content, &message_id)?;
     Ok(())
 }
 
@@ -764,20 +819,53 @@ fn stage_inbox_delivery(
     Ok((pending, Some(attempt)))
 }
 
-fn acknowledge_attempt(inbox: &mut Vec<ThreadMessage>, attempt: &str) -> Result<()> {
-    if !inbox
+fn acknowledge_attempt(record: &mut ThreadRecord, attempt: &str) -> Result<()> {
+    let handled: Vec<ThreadMessageReceipt> = record
+        .inbox
         .iter()
-        .any(|message| message.delivery.attempt_id() == Some(attempt))
-    {
+        .filter(|message| message.delivery.attempt_id() == Some(attempt))
+        .map(|message| ThreadMessageReceipt {
+            id: message.id.clone(),
+            from: message.from.clone(),
+            content_sha256: thread_message_content_sha256(&message.content),
+            acknowledged_at: Utc::now(),
+        })
+        .collect();
+    if handled.is_empty() {
         bail!("inbox delivery attempt '{attempt}' is no longer present");
     }
-    inbox.retain(|message| message.delivery.attempt_id() != Some(attempt));
+    for receipt in handled {
+        if !record
+            .message_receipts
+            .iter()
+            .any(|existing| existing.id == receipt.id)
+        {
+            record.message_receipts.push(receipt);
+        }
+    }
+    if record.message_receipts.len() > MAX_THREAD_MESSAGE_RECEIPTS {
+        let excess = record.message_receipts.len() - MAX_THREAD_MESSAGE_RECEIPTS;
+        record.message_receipts.drain(..excess);
+    }
+    record
+        .inbox
+        .retain(|message| message.delivery.attempt_id() != Some(attempt));
     Ok(())
 }
 
 fn run_send(args: ThreadSendArgs) -> Result<()> {
-    send_message(&args.from, &args.to, &args.content)?;
-    println!("sent message to thread {}", args.to);
+    let message_id = args
+        .message_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    validate_id(&message_id).context("invalid thread message id")?;
+    println!("thread message id: {message_id}");
+    std::io::stdout().flush()?;
+    match send_message_with_id(&args.from, &args.to, &args.content, &message_id)? {
+        ThreadMessageAdmission::Accepted => println!("sent message to thread {}", args.to),
+        ThreadMessageAdmission::Duplicate => {
+            println!("thread {} already accepted that message", args.to)
+        }
+    }
     Ok(())
 }
 
@@ -845,9 +933,7 @@ async fn resolve_inbox(
         }
         match action {
             ThreadInboxResolution::Acknowledge => {
-                record
-                    .inbox
-                    .retain(|message| message.delivery.attempt_id() != Some(attempt));
+                acknowledge_attempt(record, attempt)?;
             }
             ThreadInboxResolution::Retry => {
                 for message in &mut record.inbox {
@@ -980,6 +1066,7 @@ mod tests {
                 summary: "test thread".into(),
                 initial_assistant_sha256: None,
                 inbox: vec![],
+                message_receipts: vec![],
             });
             Ok(("t1".into(), "s1".into()))
         })
@@ -1017,6 +1104,7 @@ mod tests {
                 summary: "from".into(),
                 initial_assistant_sha256: None,
                 inbox: vec![],
+                message_receipts: vec![],
             });
             records.push(ThreadRecord {
                 id: "to".into(),
@@ -1028,12 +1116,27 @@ mod tests {
                 summary: "to".into(),
                 initial_assistant_sha256: None,
                 inbox: vec![],
+                message_receipts: vec![],
             });
             Ok(())
         })
         .unwrap();
 
         send_message("from", "to", "hello").unwrap();
+        assert_eq!(
+            send_message_with_id("from", "to", "review this", "stable-message-1").unwrap(),
+            ThreadMessageAdmission::Accepted
+        );
+        assert_eq!(
+            send_message_with_id("from", "to", "review this", "stable-message-1").unwrap(),
+            ThreadMessageAdmission::Duplicate
+        );
+        assert!(
+            send_message_with_id("from", "to", "different payload", "stable-message-1")
+                .unwrap_err()
+                .to_string()
+                .contains("different payload")
+        );
 
         let inbox = with_records(|records| {
             records
@@ -1044,10 +1147,31 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox.len(), 2);
         assert_eq!(inbox[0].from, "from");
         assert_eq!(inbox[0].content, "hello");
         assert!(!inbox[0].id.is_empty());
+
+        with_records_mut(|records| {
+            let recipient = records.iter_mut().find(|r| r.id == "to").unwrap();
+            let (_, attempt) = stage_inbox_delivery(recipient, false)?;
+            acknowledge_attempt(recipient, attempt.as_deref().unwrap())?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            send_message_with_id("from", "to", "review this", "stable-message-1").unwrap(),
+            ThreadMessageAdmission::Duplicate
+        );
+        let recipient = with_records(|records| {
+            records
+                .into_iter()
+                .find(|r| r.id == "to")
+                .ok_or_else(|| anyhow::anyhow!("to not found"))
+        })
+        .unwrap();
+        assert!(recipient.inbox.is_empty());
+        assert_eq!(recipient.message_receipts.len(), 2);
 
         assert!(send_message("from", "to", " \n ").is_err());
         assert!(send_message("from", "to", &"x".repeat(MAX_THREAD_MESSAGE_BYTES + 1)).is_err());
@@ -1098,6 +1222,7 @@ mod tests {
             summary: "test".into(),
             initial_assistant_sha256: None,
             inbox: vec![first.clone()],
+            message_receipts: vec![],
         };
         let (staged, attempt) = stage_inbox_delivery(&mut record, true).unwrap();
         let attempt = attempt.unwrap();
@@ -1108,8 +1233,10 @@ mod tests {
         ));
         assert!(stage_inbox_delivery(&mut record, false).is_err());
         record.inbox.push(second.clone());
-        acknowledge_attempt(&mut record.inbox, &attempt).unwrap();
+        acknowledge_attempt(&mut record, &attempt).unwrap();
         assert_eq!(record.inbox, vec![second]);
+        assert_eq!(record.message_receipts.len(), 1);
+        assert_eq!(record.message_receipts[0].id, "m1");
 
         let legacy = serde_json::json!({
             "id": "legacy",
@@ -1119,6 +1246,48 @@ mod tests {
         });
         let legacy: ThreadMessage = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.delivery, ThreadDelivery::Pending);
+    }
+
+    #[test]
+    fn acknowledged_message_receipts_stay_bounded() {
+        let now = Utc::now();
+        let attempt = "attempt-1";
+        let mut record = ThreadRecord {
+            id: "implementer".into(),
+            session_id: "session".into(),
+            cwd: "/tmp".into(),
+            model: "omgb-test".into(),
+            created_at: now,
+            last_message_at: now,
+            summary: "test".into(),
+            initial_assistant_sha256: None,
+            inbox: vec![ThreadMessage {
+                id: "new-message".into(),
+                from: "planner".into(),
+                content: "continue".into(),
+                timestamp: now,
+                delivery: ThreadDelivery::InFlight {
+                    attempt_id: attempt.into(),
+                    started_at: now,
+                    yolo: false,
+                },
+            }],
+            message_receipts: (0..MAX_THREAD_MESSAGE_RECEIPTS)
+                .map(|index| ThreadMessageReceipt {
+                    id: format!("receipt-{index}"),
+                    from: "planner".into(),
+                    content_sha256: thread_message_content_sha256("handled"),
+                    acknowledged_at: now,
+                })
+                .collect(),
+        };
+
+        acknowledge_attempt(&mut record, attempt).unwrap();
+
+        assert!(record.inbox.is_empty());
+        assert_eq!(record.message_receipts.len(), MAX_THREAD_MESSAGE_RECEIPTS);
+        assert_eq!(record.message_receipts[0].id, "receipt-1");
+        assert_eq!(record.message_receipts.last().unwrap().id, "new-message");
     }
 
     #[test]
@@ -1140,6 +1309,7 @@ mod tests {
                 summary: "from".into(),
                 initial_assistant_sha256: None,
                 inbox: vec![],
+                message_receipts: vec![],
             });
             records.push(ThreadRecord {
                 id: "to".into(),
@@ -1159,6 +1329,7 @@ mod tests {
                         delivery: ThreadDelivery::Pending,
                     })
                     .collect(),
+                message_receipts: vec![],
             });
             Ok(())
         })
@@ -1202,6 +1373,7 @@ mod tests {
                         summary: format!("thread {i}"),
                         initial_assistant_sha256: None,
                         inbox: vec![],
+                        message_receipts: vec![],
                     });
                     Ok(())
                 })

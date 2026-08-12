@@ -496,6 +496,9 @@ pub struct ThreadSendArgs {
     pub from: String,
     pub to: String,
     pub content: String,
+    /// Stable identifier for safely retrying an ambiguously completed send
+    #[arg(long)]
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]

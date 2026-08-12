@@ -66,7 +66,7 @@ When called without a command, `omgb` starts the interactive TUI.
   Spawn, list, kill, and inspect subagents.
 
 - `thread`
-  Multi-agent thread orchestration with persistent, bounded peer inboxes.
+  Multi-agent thread orchestration with persistent, bounded peer inboxes. `thread send --message-id <id>` makes ambiguous sender retries idempotent within the retained receipt history; an exact retry is accepted without duplication, while an identifier collision with a different payload is rejected.
 
 - `research`
   Deep arXiv / web research.
