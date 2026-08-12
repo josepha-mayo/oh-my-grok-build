@@ -744,17 +744,18 @@ pub fn send_message_with_id(
         record.last_message_at = Utc::now();
         Ok(ThreadMessageAdmission::Accepted)
     })?;
-    if admission == ThreadMessageAdmission::Accepted {
-        if let Err(e) = crate::notifications::push(
+    if admission == ThreadMessageAdmission::Accepted
+        && let Err(e) = crate::notifications::push(
             "thread_message",
             serde_json::json!({"from": from, "to": to, "message_id": message_id}),
-        ) {
-            eprintln!("warning: thread message was delivered but notification failed: {e}");
-        }
+        )
+    {
+        eprintln!("warning: thread message was delivered but notification failed: {e}");
     }
     Ok(admission)
 }
 
+#[cfg(test)]
 pub fn send_message(from: &str, to: &str, content: &str) -> Result<()> {
     let message_id = uuid::Uuid::new_v4().to_string();
     send_message_with_id(from, to, content, &message_id)?;
