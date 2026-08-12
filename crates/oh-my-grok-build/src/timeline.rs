@@ -98,14 +98,59 @@ pub fn add_event(
             .append(true)
             .open(&path)?;
         let size = file.metadata()?.len();
-        if size.saturating_add(line.len() as u64 + 1) > MAX_TIMELINE_BYTES {
+        if size > MAX_TIMELINE_BYTES {
             bail!("timeline store exceeds the {MAX_TIMELINE_BYTES} byte safety limit");
+        }
+        if size.saturating_add(line.len() as u64 + 1) > MAX_TIMELINE_BYTES {
+            drop(file);
+            let raw = std::fs::read_to_string(&path)?;
+            let compacted = compact_timeline(&path, &raw, &line, MAX_TIMELINE_BYTES / 2)?;
+            return crate::providers::write_file_atomic(&path, compacted, true);
         }
         crate::providers::restrict_omg_file_permissions(&path)?;
         writeln!(file, "{line}")?;
         file.sync_data()?;
         Ok(())
     })
+}
+
+fn compact_timeline(path: &Path, raw: &str, new_line: &str, target: u64) -> Result<String> {
+    let target = usize::try_from(target).unwrap_or(usize::MAX);
+    if new_line.len().saturating_add(1) > target {
+        bail!("timeline event cannot fit in the retention target");
+    }
+    let lines = raw
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str::<TimelineEvent>(line).with_context(|| {
+                format!(
+                    "invalid JSON record in timeline store {} at line {}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+            Ok(line)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut kept = Vec::new();
+    let mut bytes = new_line.len() + 1;
+    for line in lines.into_iter().rev() {
+        if bytes.saturating_add(line.len() + 1) > target {
+            break;
+        }
+        bytes += line.len() + 1;
+        kept.push(line);
+    }
+    kept.reverse();
+    let mut compacted = String::with_capacity(bytes);
+    for line in kept {
+        compacted.push_str(line);
+        compacted.push('\n');
+    }
+    compacted.push_str(new_line);
+    compacted.push('\n');
+    Ok(compacted)
 }
 
 fn parse_events(path: &Path, raw: &str) -> Result<Vec<TimelineEvent>> {
@@ -189,5 +234,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("line 2"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn timeline_compaction_keeps_the_newest_valid_events() {
+        let line = |message: &str| {
+            serde_json::to_string(&TimelineEvent {
+                timestamp: DateTime::UNIX_EPOCH,
+                category: "test".into(),
+                message: message.into(),
+                data: None,
+            })
+            .unwrap()
+        };
+        let oldest = line("oldest");
+        let recent = line("recent");
+        let newest = line("newest");
+        let raw = format!("{oldest}\n{recent}\n");
+        let target = (recent.len() + newest.len() + 2) as u64;
+
+        let compacted =
+            compact_timeline(Path::new("timeline.jsonl"), &raw, &newest, target).unwrap();
+        let events = parse_events(Path::new("timeline.jsonl"), &compacted).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent", "newest"]
+        );
+        assert!(compacted.len() as u64 <= target);
     }
 }
