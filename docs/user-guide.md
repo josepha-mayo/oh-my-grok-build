@@ -128,6 +128,12 @@ managers and local diagnostics. The relay supervises its embedded ACP agent and
 exits if that agent stops instead of continuing to accept connections that it
 cannot serve.
 
+`GET /capabilities` returns the relay API version, supported ACP/group/voice
+features, and group message limits without exposing credentials. Current mobile
+clients verify this contract before storing a pairing profile, so an outdated or
+unrelated server fails with one compatibility error rather than later protocol
+failures.
+
 For LAN access:
 
 ```bash

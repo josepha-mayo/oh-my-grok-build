@@ -551,11 +551,51 @@ struct HealthResponse {
     version: &'static str,
 }
 
+const RELAY_API_VERSION: u32 = 1;
+const RELAY_CAPABILITIES: &[&str] = &[
+    "acp.session.resume",
+    "acp.session.page",
+    "group.dispatch.status.v1",
+    "group.history.cursor.v1",
+    "group.join.ack.v1",
+    "voice.pcm.v1",
+];
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayLimits {
+    group_message_bytes: usize,
+    group_message_page: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCapabilitiesResponse {
+    service: &'static str,
+    version: &'static str,
+    api_version: u32,
+    capabilities: &'static [&'static str],
+    limits: RelayLimits,
+}
+
 async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "oh-my-grok-build-relay",
         version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+async fn capabilities_handler() -> Json<RelayCapabilitiesResponse> {
+    Json(RelayCapabilitiesResponse {
+        service: "oh-my-grok-build-relay",
+        version: env!("CARGO_PKG_VERSION"),
+        api_version: RELAY_API_VERSION,
+        capabilities: RELAY_CAPABILITIES,
+        limits: RelayLimits {
+            group_message_bytes: crate::group::MAX_GROUP_MESSAGE_BYTES,
+            group_message_page: MAX_GROUP_MESSAGE_PAGE,
+        },
     })
 }
 
@@ -3008,6 +3048,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(health_handler))
+        .route("/capabilities", get(capabilities_handler))
         .route("/ws", get(ws_handler))
         .route("/acp", get(ws_handler))
         .route("/voice", get(voice_ws_handler))
@@ -3204,6 +3245,20 @@ mod tests {
         assert_eq!(health.status, "ok");
         assert_eq!(health.service, "oh-my-grok-build-relay");
         assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_endpoint_versions_the_mobile_contract_and_limits() {
+        let response = capabilities_handler().await.0;
+        assert_eq!(response.service, "oh-my-grok-build-relay");
+        assert_eq!(response.api_version, RELAY_API_VERSION);
+        assert!(response.capabilities.contains(&"acp.session.resume"));
+        assert!(response.capabilities.contains(&"group.join.ack.v1"));
+        assert_eq!(
+            response.limits.group_message_bytes,
+            crate::group::MAX_GROUP_MESSAGE_BYTES
+        );
+        assert_eq!(response.limits.group_message_page, MAX_GROUP_MESSAGE_PAGE);
     }
 
     #[tokio::test]
