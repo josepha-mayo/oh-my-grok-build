@@ -164,6 +164,8 @@ possible.
 | `omgb workflow` | Reusable agent workflows |
 | `omgb doctor` | Environment diagnostics |
 
+Enter provider API keys only in your own local terminal (for example through the one-command `OMGB_API_KEY` environment variable used by `omgb provider add`). Never paste a model-provider key into chat, a prompt, or a group message. Keyless local endpoints can be added with `omgb provider discover --add`, and Grok subscription sign-in remains optional.
+
 ## Slash commands in the TUI
 
 The TUI and mobile app support these slash commands:
