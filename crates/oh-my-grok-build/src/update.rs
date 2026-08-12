@@ -1065,8 +1065,7 @@ fn recover_incomplete_release_transaction(install_dir: &Path, current_exe: &Path
             bail!("release transaction journal contains duplicate paths");
         }
         let _ = transaction_destination(install_dir, &entry.destination)?;
-        let _ =
-            release_transaction_artifact(&root, &entry.staged, "staged release transaction file")?;
+        validate_staged_release_path(&entry.staged)?;
     }
     rollback_release_journal(install_dir, current_exe, &root, &journal)?;
     remove_release_transaction(&root)
@@ -1148,6 +1147,23 @@ fn release_transaction_artifact(root: &Path, relative: &str, label: &str) -> Res
         bail!("unsafe {label} path: {}", path.display());
     }
     Ok(canonical)
+}
+
+fn validate_staged_release_path(relative: &str) -> Result<()> {
+    let relative = Path::new(relative);
+    let mut components = relative.components();
+    if relative.as_os_str().is_empty()
+        || !is_safe_archive_path(relative)
+        || !matches!(components.next(), Some(Component::Normal(part)) if part == "new")
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+    {
+        bail!(
+            "unsafe staged release transaction path: {}",
+            relative.display()
+        );
+    }
+    Ok(())
 }
 
 fn remove_release_transaction(root: &Path) -> Result<()> {
@@ -1623,6 +1639,41 @@ mod tests {
         .unwrap();
 
         assert!(recover_incomplete_release_transaction(&install, &binary).is_err());
+    }
+
+    #[test]
+    fn recovery_rejects_unsafe_staged_paths_without_touching_the_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("install");
+        std::fs::create_dir(&install).unwrap();
+        let binary = install.join("omgb");
+        let plugin = install.join("plugin-file");
+        std::fs::write(&binary, "current binary").unwrap();
+        std::fs::write(&plugin, "current plugin").unwrap();
+        let transaction = install.join(RELEASE_TRANSACTION_DIR);
+        std::fs::create_dir(&transaction).unwrap();
+        std::fs::create_dir(transaction.join("backup")).unwrap();
+        std::fs::write(transaction.join("backup/binary"), "old binary").unwrap();
+        std::fs::write(transaction.join("backup/0"), "old plugin").unwrap();
+        let journal = ReleaseJournal {
+            state: "applying".into(),
+            binary_backup: "backup/binary".into(),
+            entries: vec![ReleaseJournalEntry {
+                destination: "plugin-file".into(),
+                backup: Some("backup/0".into()),
+                staged: "../outside".into(),
+            }],
+        };
+        std::fs::write(
+            transaction.join("journal.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+
+        assert!(recover_incomplete_release_transaction(&install, &binary).is_err());
+        assert_eq!(std::fs::read_to_string(binary).unwrap(), "current binary");
+        assert_eq!(std::fs::read_to_string(plugin).unwrap(), "current plugin");
+        assert!(transaction.exists());
     }
 
     #[test]

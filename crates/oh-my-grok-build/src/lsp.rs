@@ -1229,13 +1229,15 @@ fn remove_transaction(root: &Path) -> Result<()> {
 }
 
 fn recover_workspace_transaction(root: &Path) -> Result<()> {
-    let dir = safe_transaction_dir(root, false)?;
+    let root = dunce::canonicalize(root)
+        .with_context(|| format!("workspace root does not exist: {}", root.display()))?;
+    let dir = safe_transaction_dir(&root, false)?;
     let journal = transaction_file(&dir);
     match std::fs::symlink_metadata(&journal) {
         Ok(_) => reject_link(&journal, false)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if dir.exists() {
-                remove_transaction(root)?;
+                remove_transaction(&root)?;
             }
             return Ok(());
         }
@@ -1260,9 +1262,9 @@ fn recover_workspace_transaction(root: &Path) -> Result<()> {
         bail!("invalid incomplete workspace edit journal");
     }
     if transaction.state == "applying" {
-        rollback_transaction(root, &transaction)?;
+        rollback_transaction(&root, &transaction)?;
     }
-    remove_transaction(root)
+    remove_transaction(&root)
 }
 
 fn commit_workspace_edit(root: &Path, writes: Vec<(PathBuf, (String, String))>) -> Result<()> {
@@ -1350,6 +1352,8 @@ fn commit_workspace_edit(root: &Path, writes: Vec<(PathBuf, (String, String))>) 
 }
 
 async fn apply_workspace_edit(edit: &serde_json::Value, root: &Path) -> Result<()> {
+    let root = dunce::canonicalize(root)
+        .with_context(|| format!("workspace root does not exist: {}", root.display()))?;
     let mut requested = Vec::new();
     if let Some(changes) = edit.get("changes") {
         let changes = changes
@@ -1386,7 +1390,7 @@ async fn apply_workspace_edit(edit: &serde_json::Value, root: &Path) -> Result<(
     let mut prepared: std::collections::BTreeMap<std::path::PathBuf, (String, String)> =
         std::collections::BTreeMap::new();
     for (uri, edits) in requested {
-        let path = url_to_path(uri, root)?;
+        let path = url_to_path(uri, &root)?;
         if let Some((_, current)) = prepared.get_mut(&path) {
             *current = apply_text_edits(current, edits)?;
         } else {
@@ -1397,7 +1401,6 @@ async fn apply_workspace_edit(edit: &serde_json::Value, root: &Path) -> Result<(
     }
 
     let prepared: Vec<_> = prepared.into_iter().collect();
-    let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || commit_workspace_edit(&root, prepared))
         .await
         .context("workspace edit transaction task panicked")??;
@@ -1499,6 +1502,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_edit_commits_under_a_canonicalized_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("main.rs");
+        std::fs::write(&file, "old\n").unwrap();
+        let uri = Url::from_file_path(&file).unwrap().to_string();
+        let edit = serde_json::json!({
+            "changes": {
+                (uri): [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3}
+                    },
+                    "newText": "new"
+                }]
+            }
+        });
+
+        apply_workspace_edit(&edit, temp.path()).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "new\n");
+        assert!(!transaction_dir(temp.path()).exists());
+    }
+
+    #[tokio::test]
     async fn unknown_document_change_shape_is_rejected() {
         let temp = tempfile::TempDir::new().unwrap();
         let edit = serde_json::json!({
@@ -1520,6 +1547,7 @@ mod tests {
 
     fn incomplete_transaction(root: &Path, path: &Path, original: &str, updated: &str) {
         let root = dunce::canonicalize(root).unwrap();
+        let path = dunce::canonicalize(path).unwrap();
         let dir = safe_transaction_dir(&root, true).unwrap();
         let relative = path
             .strip_prefix(&root)
