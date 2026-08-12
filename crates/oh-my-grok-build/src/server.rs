@@ -558,6 +558,7 @@ const RELAY_CAPABILITIES: &[&str] = &[
     "group.dispatch.status.v1",
     "group.history.cursor.v1",
     "group.join.ack.v1",
+    "relay.status.v1",
     "voice.pcm.v1",
 ];
 
@@ -576,6 +577,20 @@ struct RelayCapabilitiesResponse {
     api_version: u32,
     capabilities: &'static [&'static str],
     limits: RelayLimits,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayStatusResponse {
+    status: &'static str,
+    service: &'static str,
+    version: &'static str,
+    api_version: u32,
+    uptime_seconds: u64,
+    active_connections: usize,
+    connection_limit: usize,
+    local_hosted_dispatches: usize,
+    rate_limit_per_minute: Option<u32>,
 }
 
 async fn health_handler() -> Json<HealthResponse> {
@@ -597,6 +612,29 @@ async fn capabilities_handler() -> Json<RelayCapabilitiesResponse> {
             group_message_page: MAX_GROUP_MESSAGE_PAGE,
         },
     })
+}
+
+async fn relay_status(state: &ProxyState) -> RelayStatusResponse {
+    let active_connections =
+        MAX_ACTIVE_PROXY_CONNECTIONS.saturating_sub(state.connection_limit.available_permits());
+    let local_hosted_dispatches = state
+        .hosted_dispatch_gates
+        .lock()
+        .await
+        .values()
+        .filter(|gate| Arc::strong_count(gate) > 1)
+        .count();
+    RelayStatusResponse {
+        status: "ready",
+        service: "oh-my-grok-build-relay",
+        version: env!("CARGO_PKG_VERSION"),
+        api_version: RELAY_API_VERSION,
+        uptime_seconds: state.started_at.elapsed().as_secs(),
+        active_connections,
+        connection_limit: MAX_ACTIVE_PROXY_CONNECTIONS,
+        local_hosted_dispatches,
+        rate_limit_per_minute: state.rate_limit_per_minute,
+    }
 }
 
 fn relay_voice_config(
@@ -629,6 +667,7 @@ struct ProxyState {
     voice_config: xai_grok_voice::VoiceConfig,
     voice_auth: xai_grok_voice::SharedVoiceAuth,
     hosted_dispatch_gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    started_at: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1334,6 +1373,27 @@ fn server_token_valid(state: &ProxyState, token: &str) -> bool {
         state.secret_hash.as_ref(),
         blake3::hash(token.as_bytes()).as_bytes(),
     )
+}
+
+async fn relay_status_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<RelayStatusResponse>, (StatusCode, String)> {
+    if let Err(message) =
+        check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Rate limit exceeded for {}: {}", addr, message);
+        return Err((StatusCode::TOO_MANY_REQUESTS, message.to_string()));
+    }
+    if let Err(message) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Origin check failed for {}: {}", addr, message);
+        return Err((StatusCode::FORBIDDEN, message.to_string()));
+    }
+    if !server_token_valid(&state, &extract_server_token(&headers)) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid server token".to_string()));
+    }
+    Ok(Json(relay_status(&state).await))
 }
 
 async fn admin_create_group_handler(
@@ -3039,6 +3099,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
         voice_config,
         voice_auth,
         hosted_dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+        started_at: Instant::now(),
     });
 
     let rate_limiter_task = tokio::spawn(cleanup_rate_limiter(
@@ -3049,6 +3110,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(health_handler))
         .route("/capabilities", get(capabilities_handler))
+        .route("/status", get(relay_status_handler))
         .route("/ws", get(ws_handler))
         .route("/acp", get(ws_handler))
         .route("/voice", get(voice_ws_handler))
@@ -3254,11 +3316,48 @@ mod tests {
         assert_eq!(response.api_version, RELAY_API_VERSION);
         assert!(response.capabilities.contains(&"acp.session.resume"));
         assert!(response.capabilities.contains(&"group.join.ack.v1"));
+        assert!(response.capabilities.contains(&"relay.status.v1"));
         assert_eq!(
             response.limits.group_message_bytes,
             crate::group::MAX_GROUP_MESSAGE_BYTES
         );
         assert_eq!(response.limits.group_message_page, MAX_GROUP_MESSAGE_PAGE);
+    }
+
+    #[tokio::test]
+    async fn relay_status_is_authenticated_and_contains_only_bounded_operational_data() {
+        let state = test_state("operator-secret");
+        let address: SocketAddr = "127.0.0.1:41234".parse().unwrap();
+        let unauthorized =
+            relay_status_handler(HeaderMap::new(), State(state.clone()), ConnectInfo(address))
+                .await
+                .unwrap_err();
+        assert_eq!(unauthorized.0, StatusCode::UNAUTHORIZED);
+
+        let _connection = state.connection_limit.acquire().await.unwrap();
+        let dispatch_gate = Arc::new(Mutex::new(()));
+        state
+            .hosted_dispatch_gates
+            .lock()
+            .await
+            .insert("dispatch-1".into(), dispatch_gate.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-server-token", "operator-secret".parse().unwrap());
+        let status = relay_status_handler(headers, State(state.clone()), ConnectInfo(address))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status.status, "ready");
+        assert_eq!(status.api_version, RELAY_API_VERSION);
+        assert_eq!(status.active_connections, 1);
+        assert_eq!(status.connection_limit, MAX_ACTIVE_PROXY_CONNECTIONS);
+        assert_eq!(status.local_hosted_dispatches, 1);
+        assert_eq!(status.rate_limit_per_minute, None);
+
+        let encoded = serde_json::to_string(&status).unwrap();
+        assert!(!encoded.contains("operator-secret"));
+        assert!(!encoded.contains("upstream_secret"));
+        assert!(!encoded.contains("group"));
     }
 
     #[tokio::test]
@@ -3663,6 +3762,7 @@ mod tests {
             voice_auth: xai_grok_voice::StaticVoiceAuth::shared("test-token")
                 .expect("test voice token is non-empty"),
             hosted_dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+            started_at: Instant::now(),
         })
     }
 

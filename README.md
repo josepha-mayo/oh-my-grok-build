@@ -101,6 +101,10 @@ The secret-free `GET /healthz` endpoint is available for local liveness checks.
 `GET /capabilities` exposes the versioned, secret-free mobile contract and its
 group limits; the mobile app verifies it before saving OMGB pairing credentials,
 while a 404 remains the documented upstream ACP-only compatibility path.
+Authenticated `GET /status` (send the pairing secret as `x-server-token`) reports
+bounded operational state such as uptime, active connection capacity, local
+hosted-dispatch activity, and the configured rate limit. It never returns
+pairing secrets, provider credentials, prompts, paths, or group contents.
 The relay exits if its embedded ACP agent stops, so a service manager does not
 keep advertising a listener that cannot accept sessions.
 

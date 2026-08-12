@@ -135,6 +135,13 @@ the documented upstream `grok serve` ACP-only path available, but a malformed or
 incompatible advertised OMGB contract fails with one compatibility error rather
 than later protocol failures.
 
+`GET /status` is an authenticated operator endpoint. Send the relay pairing
+secret in `x-server-token` to receive bounded uptime, connection-capacity,
+local hosted-dispatch, rate-limit, version, and API-version fields. The response
+does not include credentials, prompts, filesystem paths, group names, members,
+or message content. Use `/healthz` for public liveness probes and `/status` only
+for trusted diagnostics.
+
 For LAN access:
 
 ```bash

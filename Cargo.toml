@@ -273,7 +273,7 @@ uuid = { version = "1", features = ["serde", "v4", "v5"] }
 vte = "0.15.0"
 wait-timeout = "0.2"
 walkdir = "2"
-webbrowser = { version = "1.0.4" }
+webbrowser = { version = "1.2.2" }
 which = "8"
 whoami = "1.4"
 windows = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Diagnostics_ToolHelp"] }

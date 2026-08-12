@@ -1176,7 +1176,6 @@ fn remove_release_transaction(root: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 fn copy_release_tree(source: &Path, destination: &Path) -> Result<usize> {
     let source_meta = std::fs::symlink_metadata(source).with_context(|| {
         format!(
