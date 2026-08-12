@@ -51,8 +51,11 @@ const MAX_HOSTED_DISPATCH_GATES: usize = 4096;
 const MAX_GROUP_MESSAGE_PAGE: usize = 500;
 const UPSTREAM_PORT_ATTEMPTS: usize = 20;
 const VOICE_START_TIMEOUT: Duration = Duration::from_secs(15);
+const VOICE_STT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const VOICE_SESSION_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const VOICE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const VOICE_PCM_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+const VOICE_CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_VOICE_SAMPLE_RATE: u32 = 8_000;
 const MAX_VOICE_SAMPLE_RATE: u32 = 48_000;
 
@@ -642,8 +645,42 @@ async fn send_voice_event(
     event: VoiceServerMessage<'_>,
 ) -> bool {
     match serde_json::to_string(&event) {
-        Ok(body) => writer.send(Message::Text(body.into())).await.is_ok(),
+        Ok(body) => tokio::time::timeout(
+            VOICE_CLIENT_SEND_TIMEOUT,
+            writer.send(Message::Text(body.into())),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok()),
         Err(_) => false,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VoicePcmForwardError {
+    SessionDeadline,
+    Backpressure,
+    Closed,
+}
+
+async fn bounded_voice_pcm_forward<F, E>(
+    session_deadline: tokio::time::Instant,
+    forward_timeout: Duration,
+    send: F,
+) -> std::result::Result<(), VoicePcmForwardError>
+where
+    F: std::future::Future<Output = std::result::Result<(), E>>,
+{
+    let remaining = session_deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(VoicePcmForwardError::SessionDeadline);
+    }
+    match tokio::time::timeout(remaining.min(forward_timeout), send).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(VoicePcmForwardError::Closed),
+        Err(_) if tokio::time::Instant::now() >= session_deadline => {
+            Err(VoicePcmForwardError::SessionDeadline)
+        }
+        Err(_) => Err(VoicePcmForwardError::Backpressure),
     }
 }
 
@@ -797,14 +834,30 @@ async fn handle_voice(client_ws: WebSocket, state: Arc<ProxyState>) {
     };
     let mut config = state.voice_config.clone();
     config.sample_rate = sample_rate;
-    let mut stt = match StreamingSttSession::connect(&config, &bearer).await {
-        Ok(session) => session,
-        Err(error) => {
+    let mut stt = match tokio::time::timeout(
+        VOICE_STT_CONNECT_TIMEOUT,
+        StreamingSttSession::connect(&config, &bearer),
+    )
+    .await
+    {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => {
             warn!("Voice STT connection failed: {error}");
             let _ = send_voice_event(
                 &mut write,
                 VoiceServerMessage::Error {
                     message: "voice transcription service is unavailable",
+                },
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            warn!("Voice STT connection timed out");
+            let _ = send_voice_event(
+                &mut write,
+                VoiceServerMessage::Error {
+                    message: "voice transcription service connection timed out",
                 },
             )
             .await;
@@ -832,11 +885,35 @@ async fn handle_voice(client_ws: WebSocket, state: Arc<ProxyState>) {
                             }).await;
                             break;
                         }
-                        if stt.send_pcm(pcm.to_vec()).await.is_err() {
-                            let _ = send_voice_event(&mut write, VoiceServerMessage::Error {
-                                message: "voice transcription connection closed",
-                            }).await;
-                            break;
+                        match bounded_voice_pcm_forward(
+                            session_deadline,
+                            VOICE_PCM_FORWARD_TIMEOUT,
+                            stt.send_pcm(pcm.to_vec()),
+                        ).await {
+                            Ok(()) => {}
+                            Err(VoicePcmForwardError::SessionDeadline) => {
+                                stt.finish_audio();
+                                accepting_audio = false;
+                                drain_deadline = Some(tokio::time::Instant::now() + VOICE_DRAIN_TIMEOUT);
+                                if !send_voice_event(&mut write, VoiceServerMessage::Error {
+                                    message: "voice session reached its five-minute limit",
+                                }).await {
+                                    break;
+                                }
+                            }
+                            Err(VoicePcmForwardError::Backpressure) => {
+                                stt.finish_audio();
+                                let _ = send_voice_event(&mut write, VoiceServerMessage::Error {
+                                    message: "voice transcription service stopped accepting audio",
+                                }).await;
+                                break;
+                            }
+                            Err(VoicePcmForwardError::Closed) => {
+                                let _ = send_voice_event(&mut write, VoiceServerMessage::Error {
+                                    message: "voice transcription connection closed",
+                                }).await;
+                                break;
+                            }
                         }
                     }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<VoiceClientMessage>(&text) {
@@ -853,7 +930,13 @@ async fn handle_voice(client_ws: WebSocket, state: Arc<ProxyState>) {
                         }
                     },
                     Some(Ok(Message::Ping(payload))) => {
-                        if write.send(Message::Pong(payload)).await.is_err() {
+                        if !tokio::time::timeout(
+                            VOICE_CLIENT_SEND_TIMEOUT,
+                            write.send(Message::Pong(payload)),
+                        )
+                        .await
+                        .is_ok_and(|result| result.is_ok())
+                        {
                             break;
                         }
                     }
@@ -3195,6 +3278,34 @@ mod tests {
         ] {
             assert!(validate_voice_start(message).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn voice_pcm_forwarding_obeys_backpressure_and_session_deadlines() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+        let result = bounded_voice_pcm_forward(
+            deadline,
+            Duration::from_secs(1),
+            std::future::pending::<std::result::Result<(), ()>>(),
+        )
+        .await;
+        assert_eq!(result, Err(VoicePcmForwardError::SessionDeadline));
+
+        let result = bounded_voice_pcm_forward(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(25),
+            std::future::pending::<std::result::Result<(), ()>>(),
+        )
+        .await;
+        assert_eq!(result, Err(VoicePcmForwardError::Backpressure));
+
+        let result = bounded_voice_pcm_forward(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(25),
+            std::future::ready(Err::<(), _>("closed")),
+        )
+        .await;
+        assert_eq!(result, Err(VoicePcmForwardError::Closed));
     }
 
     #[test]
