@@ -13,6 +13,10 @@ use url::Url;
 pub(crate) const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEBSOCKET_WRITE_BUFFER_BYTES: usize = 3 * 1024 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const WEBSOCKET_DNS_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const WEBSOCKET_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CLOUD_METADATA_HOSTS: &[&str] = &[
     "metadata.google.internal",
@@ -308,6 +312,37 @@ pub async fn is_url_host_private(raw: &str) -> bool {
         .is_ok_and(|addrs| !addrs.is_empty() && addrs.iter().all(|a| is_private_ip(a.ip())))
 }
 
+#[derive(Clone, Copy)]
+struct WebSocketTimeouts {
+    dns: Duration,
+    connect: Duration,
+    handshake: Duration,
+    total: Duration,
+}
+
+impl Default for WebSocketTimeouts {
+    fn default() -> Self {
+        Self {
+            dns: WEBSOCKET_DNS_TIMEOUT,
+            connect: WEBSOCKET_CONNECT_TIMEOUT,
+            handshake: WEBSOCKET_HANDSHAKE_TIMEOUT,
+            total: WEBSOCKET_TOTAL_TIMEOUT,
+        }
+    }
+}
+
+fn remaining_websocket_budget(
+    deadline: tokio::time::Instant,
+    phase_limit: Duration,
+    phase: &str,
+) -> anyhow::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("WebSocket connection timed out during {phase}");
+    }
+    Ok(remaining.min(phase_limit))
+}
+
 /// Open a WebSocket/WebSocket-over-TLS connection to `raw`, validating the
 /// host, scheme, and resolved addresses first. The stream is connected to the
 /// resolved `SocketAddr`s so the destination cannot be re-resolved to a
@@ -320,6 +355,18 @@ pub async fn connect_ws_url(
 ) -> anyhow::Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 > {
+    connect_ws_url_with_timeouts(raw, allow_private, auth, WebSocketTimeouts::default()).await
+}
+
+async fn connect_ws_url_with_timeouts(
+    raw: &str,
+    allow_private: bool,
+    auth: Option<&str>,
+    timeouts: WebSocketTimeouts,
+) -> anyhow::Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let deadline = tokio::time::Instant::now() + timeouts.total;
     let url = Url::parse(raw).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
     reject_userinfo(&url)?;
     let scheme = url.scheme();
@@ -329,7 +376,10 @@ pub async fn connect_ws_url(
     let host = normalize_host(url.host_str().unwrap_or(""));
     validate_host_name(&host)?;
     let port = lookup_port(&url);
-    let addrs = resolve_host(&host, port, true, allow_private).await?;
+    let dns_budget = remaining_websocket_budget(deadline, timeouts.dns, "DNS lookup")?;
+    let addrs = tokio::time::timeout(dns_budget, resolve_host(&host, port, true, allow_private))
+        .await
+        .map_err(|_| anyhow::anyhow!("WebSocket DNS lookup timed out after {dns_budget:?}"))??;
     if scheme == "ws" && !all_addrs_loopback_or_private(&addrs, allow_private) {
         anyhow::bail!("insecure WebSocket to a public host; use wss");
     }
@@ -355,21 +405,40 @@ pub async fn connect_ws_url(
 
     let mut last_err = None;
     for addr in addrs {
-        match tokio::net::TcpStream::connect(addr).await {
-            Ok(stream) => {
-                match tokio_tungstenite::client_async_tls_with_config(
-                    request.clone(),
-                    stream,
-                    Some(websocket_config()),
-                    None,
+        let connect_budget = remaining_websocket_budget(deadline, timeouts.connect, "TCP connect")?;
+        match tokio::time::timeout(connect_budget, tokio::net::TcpStream::connect(addr)).await {
+            Err(_) => {
+                last_err = Some(format!(
+                    "{addr}: connect timed out after {connect_budget:?}"
+                ))
+            }
+            Ok(Err(e)) => last_err = Some(format!("{addr}: connect {e}")),
+            Ok(Ok(stream)) => {
+                let handshake_budget = remaining_websocket_budget(
+                    deadline,
+                    timeouts.handshake,
+                    "WebSocket handshake",
+                )?;
+                match tokio::time::timeout(
+                    handshake_budget,
+                    tokio_tungstenite::client_async_tls_with_config(
+                        request.clone(),
+                        stream,
+                        Some(websocket_config()),
+                        None,
+                    ),
                 )
                 .await
                 {
-                    Ok((ws, _)) => return Ok(ws),
-                    Err(e) => last_err = Some(format!("{addr}: handshake {e}")),
+                    Err(_) => {
+                        last_err = Some(format!(
+                            "{addr}: handshake timed out after {handshake_budget:?}"
+                        ))
+                    }
+                    Ok(Ok((ws, _))) => return Ok(ws),
+                    Ok(Err(e)) => last_err = Some(format!("{addr}: handshake {e}")),
                 }
             }
-            Err(e) => last_err = Some(format!("{addr}: connect {e}")),
         }
     }
     anyhow::bail!(
@@ -608,6 +677,34 @@ mod tests {
 
         let request = websocket_request("wss://example.com/ws", None).unwrap();
         assert!(request.headers().get(AUTHORIZATION).is_none());
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_stall_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stalled_peer = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        let error = connect_ws_url_with_timeouts(
+            &format!("ws://{addr}/ws"),
+            false,
+            None,
+            WebSocketTimeouts {
+                dns: Duration::from_millis(100),
+                connect: Duration::from_millis(100),
+                handshake: Duration::from_millis(100),
+                total: Duration::from_millis(300),
+            },
+        )
+        .await
+        .unwrap_err();
+        stalled_peer.abort();
+
+        assert!(error.to_string().contains("handshake timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
