@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame as UpstreamCloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as UpstreamCloseCode;
@@ -484,10 +485,21 @@ async fn find_free_loopback_port() -> Result<SocketAddr> {
     socket.local_addr().context("get local address")
 }
 
+struct UpstreamAgent {
+    addr: SocketAddr,
+    task: JoinHandle<Result<()>>,
+}
+
+impl Drop for UpstreamAgent {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn spawn_upstream_agent(
     agent_config: xai_grok_shell::agent::config::Config,
     secret: &str,
-) -> Result<SocketAddr> {
+) -> Result<UpstreamAgent> {
     for _ in 0..UPSTREAM_PORT_ATTEMPTS {
         let addr = find_free_loopback_port().await?;
         let config = xai_grok_shell::agent::ServerConfig {
@@ -496,9 +508,9 @@ async fn spawn_upstream_agent(
         };
         let agent_config = agent_config.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = xai_grok_shell::agent::run_agent_server(config, agent_config).await {
-                warn!("upstream agent server exited: {e}");
-            }
+            xai_grok_shell::agent::run_agent_server(config, agent_config)
+                .await
+                .context("upstream agent server failed")
         });
 
         let mut connected = false;
@@ -511,13 +523,37 @@ async fn spawn_upstream_agent(
         }
 
         if connected {
-            // The handle keeps the upstream server alive; ignore its result.
-            std::mem::drop(handle);
-            return Ok(addr);
+            return Ok(UpstreamAgent { addr, task: handle });
         }
         handle.abort();
     }
     bail!("failed to find free loopback port for upstream agent server")
+}
+
+fn upstream_exit_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => bail!("upstream agent server exited unexpectedly"),
+        Ok(Err(error)) => Err(error),
+        Err(error) if error.is_cancelled() => bail!("upstream agent server was cancelled"),
+        Err(error) => Err(error).context("upstream agent server task failed"),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    service: &'static str,
+    version: &'static str,
+}
+
+async fn health_handler() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        service: "oh-my-grok-build-relay",
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
 
 fn relay_voice_config(
@@ -2865,10 +2901,10 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     let cors = cors_layer(&allowed_origins)?;
 
     let upstream_secret = generate_secret()?;
-    let upstream_addr = spawn_upstream_agent(agent_config, &upstream_secret).await?;
+    let mut upstream_agent = spawn_upstream_agent(agent_config, &upstream_secret).await?;
 
     let secret_hash = *blake3::hash(public_secret.as_bytes()).as_bytes();
-    let upstream_url = format!("ws://127.0.0.1:{}/ws", upstream_addr.port());
+    let upstream_url = format!("ws://127.0.0.1:{}/ws", upstream_agent.addr.port());
     let state = Arc::new(ProxyState {
         secret_hash,
         allowed_origins,
@@ -2882,12 +2918,13 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
         hosted_dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
     });
 
-    tokio::spawn(cleanup_rate_limiter(
+    let rate_limiter_task = tokio::spawn(cleanup_rate_limiter(
         state.rate_limit_per_minute,
         state.rate_limiter.clone(),
     ));
 
     let app = Router::new()
+        .route("/healthz", get(health_handler))
         .route("/ws", get(ws_handler))
         .route("/acp", get(ws_handler))
         .route("/voice", get(voice_ws_handler))
@@ -2965,12 +3002,20 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
         args.wss,
     );
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    let relay = async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    };
+    tokio::pin!(relay);
+    let result = tokio::select! {
+        relay_result = &mut relay => relay_result.context("relay server failed").map(|_| ()),
+        upstream_result = &mut upstream_agent.task => upstream_exit_result(upstream_result),
+    };
+    rate_limiter_task.abort();
+    result
 }
 
 pub async fn connect(args: &ConnectArgs) -> Result<()> {
@@ -3068,6 +3113,29 @@ mod tests {
     #[test]
     fn generated_pairing_secrets_are_not_reused() {
         assert_ne!(generate_secret().unwrap(), generate_secret().unwrap());
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_identifies_the_live_relay_without_secrets() {
+        let health = health_handler().await.0;
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.service, "oh-my-grok-build-relay");
+        assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn upstream_exit_is_always_a_relay_failure() {
+        let clean_exit = upstream_exit_result(Ok(Ok(()))).unwrap_err();
+        assert!(clean_exit.to_string().contains("exited unexpectedly"));
+
+        let failed_exit =
+            upstream_exit_result(Ok(Err(anyhow::anyhow!("agent crashed")))).unwrap_err();
+        assert!(failed_exit.to_string().contains("agent crashed"));
+
+        let task = tokio::spawn(async { std::future::pending::<Result<()>>().await });
+        task.abort();
+        let cancelled_exit = upstream_exit_result(task.await).unwrap_err();
+        assert!(cancelled_exit.to_string().contains("was cancelled"));
     }
 
     #[test]

@@ -90,6 +90,9 @@ when it is available, and replace `*` with exact browser origins when serving
 browser clients. The same `--allowed-origins` policy controls WebSocket origin
 checks and CORS for the authenticated HTTP group API. An HTTPS-hosted web
 companion requires `wss://`; use the native app for a local `ws://` relay.
+The secret-free `GET /healthz` endpoint is available for local liveness checks.
+The relay exits if its embedded ACP agent stops, so a service manager does not
+keep advertising a listener that cannot accept sessions.
 
 ## Configuration
 

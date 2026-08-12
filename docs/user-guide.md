@@ -123,6 +123,11 @@ omgb serve
 
 The terminal prints a WebSocket URL and a QR code. The QR includes the relay URL, pairing secret, and the harness's validated absolute working directory so Windows and Unix clients open the correct project. Open the `grok-build-app` mobile app and scan it; when pairing manually or with an older QR, enter an absolute working directory on the server. The relay stays on your local network by default.
 
+`GET /healthz` returns a small secret-free liveness document for service
+managers and local diagnostics. The relay supervises its embedded ACP agent and
+exits if that agent stops instead of continuing to accept connections that it
+cannot serve.
+
 For LAN access:
 
 ```bash

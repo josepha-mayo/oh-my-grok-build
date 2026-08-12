@@ -16,6 +16,7 @@
 
 - Pairing secrets are 256-bit values generated directly from the operating system's cryptographically secure random source, encoded as 64 hexadecimal characters, and compared with `blake3` + `constant_time_eq`.
 - `omgb serve` applies per-IP rate limiting and only upgrades the WebSocket after the secret is accepted. A non-loopback listener requires an explicit Origin allowlist; loopback listeners enforce one when configured.
+- The unauthenticated `GET /healthz` endpoint exposes only a fixed service name, package version, and `ok` status. The relay terminates if its embedded ACP agent exits, preventing a false-ready listener from lingering.
 - When `--allowed-origins` is configured, the same explicit allowlist controls browser WebSocket origins and CORS for authenticated group HTTP requests. CORS is disabled when no allowlist is configured; `*` is an explicit operator choice, not a default.
 - An HTTPS-hosted browser client must use a TLS-terminated `wss://` relay. The native app may use a local `ws://` relay on a trusted LAN; browsers cannot due to mixed-content protections.
 - The persisted pairing secret is stored with `0600` permissions on Unix and opened with `O_NOFOLLOW`. On Windows it is opened with `FILE_FLAG_OPEN_REPARSE_POINT`; reparse-point and symlink files are rejected.
