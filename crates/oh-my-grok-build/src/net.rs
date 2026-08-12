@@ -1,9 +1,18 @@
 //! URL validation and safe HTTP helpers for omgb commands.
 
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    http::{HeaderValue, header::AUTHORIZATION},
+};
 use url::Url;
+
+pub(crate) const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WEBSOCKET_WRITE_BUFFER_BYTES: usize = 3 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 const CLOUD_METADATA_HOSTS: &[&str] = &[
     "metadata.google.internal",
@@ -127,6 +136,28 @@ fn lookup_port(url: &Url) -> u16 {
         "https" | "wss" => 443,
         _ => 80,
     })
+}
+
+fn websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES))
+        .max_write_buffer_size(MAX_WEBSOCKET_WRITE_BUFFER_BYTES)
+}
+
+fn websocket_request(
+    raw: &str,
+    auth: Option<&str>,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut request = raw
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("invalid websocket request: {e}"))?;
+    if let Some(token) = auth {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| anyhow::anyhow!("invalid websocket authorization header: {e}"))?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
+    Ok(request)
 }
 
 /// A URL whose destination has been validated and pinned to a set of addresses.
@@ -320,24 +351,20 @@ pub async fn connect_ws_url(
         host.to_string()
     };
 
-    let request = if let Some(token) = auth {
-        http::Request::builder()
-            .uri(raw)
-            .header("Authorization", format!("Bearer {token}"))
-            .body(())
-            .map_err(|e| anyhow::anyhow!("invalid websocket request: {e}"))?
-    } else {
-        http::Request::builder()
-            .uri(raw)
-            .body(())
-            .map_err(|e| anyhow::anyhow!("invalid websocket request: {e}"))?
-    };
+    let request = websocket_request(raw, auth)?;
 
     let mut last_err = None;
     for addr in addrs {
         match tokio::net::TcpStream::connect(addr).await {
             Ok(stream) => {
-                match tokio_tungstenite::client_async_tls(request.clone(), stream).await {
+                match tokio_tungstenite::client_async_tls_with_config(
+                    request.clone(),
+                    stream,
+                    Some(websocket_config()),
+                    None,
+                )
+                .await
+                {
                     Ok((ws, _)) => return Ok(ws),
                     Err(e) => last_err = Some(format!("{addr}: handshake {e}")),
                 }
@@ -395,7 +422,7 @@ pub async fn http_get_text(
             resp.status().canonical_reason().unwrap_or("")
         );
     }
-    Ok(resp.text().await?)
+    response_text_limited(resp, MAX_HTTP_RESPONSE_BYTES).await
 }
 
 /// Perform a JSON POST to a validated URL.
@@ -405,6 +432,17 @@ pub async fn http_post_json(
     body: serde_json::Value,
     timeout: Duration,
 ) -> anyhow::Result<(u16, String)> {
+    http_post_json_limited(vurl, headers, body, timeout, MAX_HTTP_RESPONSE_BYTES).await
+}
+
+/// Perform a JSON POST and reject a response body larger than `max_response_bytes`.
+pub async fn http_post_json_limited(
+    vurl: &ValidatedUrl,
+    headers: &HashMap<String, String>,
+    body: serde_json::Value,
+    timeout: Duration,
+    max_response_bytes: usize,
+) -> anyhow::Result<(u16, String)> {
     let client = build_client(vurl, timeout)?;
     let mut req = client.post(vurl.url.as_str()).json(&body);
     for (k, v) in headers.iter() {
@@ -412,8 +450,30 @@ pub async fn http_post_json(
     }
     let resp = req.send().await?;
     let status = resp.status().as_u16();
-    let text = resp.text().await?;
+    let text = response_text_limited(resp, max_response_bytes).await?;
     Ok((status, text))
+}
+
+pub(crate) async fn response_text_limited(
+    response: reqwest::Response,
+    max_response_bytes: usize,
+) -> anyhow::Result<String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_response_bytes as u64)
+    {
+        anyhow::bail!("HTTP response exceeds the {max_response_bytes} byte limit");
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > max_response_bytes {
+            anyhow::bail!("HTTP response exceeds the {max_response_bytes} byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[allow(dead_code)]
@@ -518,6 +578,36 @@ mod tests {
             lookup_port(&Url::parse("http://example.com:8080").unwrap()),
             8080
         );
+    }
+
+    #[test]
+    fn websocket_limits_match_the_mobile_relay_contract() {
+        let config = websocket_config();
+        assert_eq!(config.max_message_size, Some(MAX_WEBSOCKET_MESSAGE_BYTES));
+        assert_eq!(config.max_frame_size, Some(MAX_WEBSOCKET_MESSAGE_BYTES));
+        assert_eq!(
+            config.max_write_buffer_size,
+            MAX_WEBSOCKET_WRITE_BUFFER_BYTES
+        );
+    }
+
+    #[test]
+    fn websocket_request_includes_handshake_and_optional_auth_headers() {
+        let request =
+            websocket_request("ws://127.0.0.1:2419/ws", Some("local-pairing-secret")).unwrap();
+        let headers = request.headers();
+        assert_eq!(headers.get("host").unwrap(), "127.0.0.1:2419");
+        assert_eq!(headers.get("connection").unwrap(), "Upgrade");
+        assert_eq!(headers.get("upgrade").unwrap(), "websocket");
+        assert_eq!(headers.get("sec-websocket-version").unwrap(), "13");
+        assert!(!headers.get("sec-websocket-key").unwrap().is_empty());
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer local-pairing-secret"
+        );
+
+        let request = websocket_request("wss://example.com/ws", None).unwrap();
+        assert!(request.headers().get(AUTHORIZATION).is_none());
     }
 
     #[tokio::test]

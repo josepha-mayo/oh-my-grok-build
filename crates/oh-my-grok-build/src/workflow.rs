@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -11,6 +12,8 @@ use xai_grok_pager::headless::OutputFormat;
 
 const MAX_WORKFLOW_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_FAN_OUT: usize = 1024;
+const MAX_FAN_OUT_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FAN_OUT_RESULT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Workflow {
@@ -170,6 +173,7 @@ async fn run(args: &WorkflowRunArgs) -> Result<()> {
             .map(|s| substitute_step_args(s, &args.args))
             .collect();
     }
+    smoke_check_workflow(&workflow).context("workflow validation failed after substitution")?;
     if let Some(name) = &workflow.name {
         println!("workflow: {name}");
     }
@@ -211,6 +215,34 @@ fn show(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn write_new_workflow(path: &std::path::Path, raw: &[u8]) -> Result<()> {
+    if raw.len() as u64 > MAX_WORKFLOW_SIZE {
+        bail!("workflow exceeds the {MAX_WORKFLOW_SIZE} byte limit");
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workflow path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let lock_path = path.with_extension("create.lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        bail!("workflow creation lock is not a regular file");
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    crate::providers::restrict_omg_file_permissions(&lock_path)?;
+    lock.lock_exclusive()?;
+    if path.exists() {
+        bail!("workflow already exists: {}", path.display());
+    }
+    crate::providers::write_file_atomic(path, raw, true)
+}
+
 fn new(args: &WorkflowNewArgs) -> Result<()> {
     let dir = workflows_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -231,7 +263,7 @@ fn new(args: &WorkflowNewArgs) -> Result<()> {
         })],
     };
     let raw = serde_json::to_string_pretty(&workflow)?;
-    crate::providers::write_file_atomic(&path, raw, true)?;
+    write_new_workflow(&path, raw.as_bytes())?;
     println!("created workflow {name} at {}", path.display());
     Ok(())
 }
@@ -239,18 +271,13 @@ fn new(args: &WorkflowNewArgs) -> Result<()> {
 pub(crate) async fn create_workflow(args: &WorkflowCreateArgs) -> Result<(String, PathBuf)> {
     let model = match &args.model {
         Some(m) => normalize_model(m),
-        None => {
-            let provider = crate::moe::select_provider_or_fallback(&args.prompt).await?;
-            format!("omgb-{provider}")
-        }
+        None => crate::resolve_model_candidates(&args.prompt, None)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no model is available for workflow creation"))?,
     };
-    let provider_id = model.strip_prefix("omgb-").unwrap_or(&model);
-    if crate::providers::get_provider(provider_id)
-        .ok()
-        .flatten()
-        .is_none()
-        && crate::providers::provider_template(provider_id).is_none()
-    {
+    if !crate::group::is_known_group_model(&model) {
         bail!(
             "unknown workflow model '{model}'; pass a provider id (e.g. xai, openai) or known model name"
         );
@@ -303,10 +330,8 @@ pub(crate) async fn create_workflow(args: &WorkflowCreateArgs) -> Result<(String
     let dir = workflows_dir()?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{safe_name}.json"));
-    if path.exists() {
-        bail!("workflow '{safe_name}' already exists");
-    }
-    crate::providers::write_file_atomic(&path, serde_json::to_string_pretty(&workflow)?, true)?;
+    let raw = serde_json::to_vec_pretty(&workflow)?;
+    write_new_workflow(&path, &raw)?;
     println!("{summary}");
     println!("created workflow {safe_name} at {}", path.display());
     Ok((safe_name, path))
@@ -433,16 +458,10 @@ async fn run_exec(step: &ExecStep, run_yolo: bool) -> Result<()> {
     let session = SessionParams::default();
     let yolo = run_yolo && step.yolo.unwrap_or(true);
     let model = step.model.as_deref().map(normalize_model);
-    if let Some(ref m) = model {
-        let provider_id = m.strip_prefix("omgb-").unwrap_or(m);
-        if crate::providers::get_provider(provider_id)
-            .ok()
-            .flatten()
-            .is_none()
-            && crate::providers::provider_template(provider_id).is_none()
-        {
-            bail!("workflow exec step references unknown model '{m}'");
-        }
+    if let Some(ref m) = model
+        && !crate::group::is_known_group_model(m)
+    {
+        bail!("workflow exec step references unknown model '{m}'");
     }
     run_single_turn_with(
         &step.prompt,
@@ -467,19 +486,15 @@ async fn run_fan_out(step: &FanOutStep, run_yolo: bool) -> Result<()> {
     }
     let yolo = run_yolo && step.yolo.unwrap_or(true);
     let model = step.model.as_deref().map(normalize_model);
-    if let Some(ref m) = model {
-        let provider_id = m.strip_prefix("omgb-").unwrap_or(m);
-        if crate::providers::get_provider(provider_id)
-            .ok()
-            .flatten()
-            .is_none()
-            && crate::providers::provider_template(provider_id).is_none()
-        {
-            bail!("workflow fan_out step references unknown model '{m}'");
-        }
+    if let Some(ref m) = model
+        && !crate::group::is_known_group_model(m)
+    {
+        bail!("workflow fan_out step references unknown model '{m}'");
     }
     let max_turns = step.max_turns.or(Some(5));
     let mut outputs: Vec<(usize, String)> = Vec::with_capacity(step.count);
+    let mut failures = Vec::new();
+    let mut output_bytes = 0_usize;
 
     let mut i = 0;
     while i < step.count {
@@ -493,31 +508,76 @@ async fn run_fan_out(step: &FanOutStep, run_yolo: bool) -> Result<()> {
             );
             let m = model.clone();
             let tools = step.tools.clone();
-            async move { crate::run_single_turn_capture(&prompt, m, yolo, max_turns, tools).await }
+            async move {
+                crate::run_single_turn_capture_with_limit(
+                    &prompt,
+                    m,
+                    yolo,
+                    max_turns,
+                    tools,
+                    MAX_FAN_OUT_RESULT_BYTES,
+                )
+                .await
+            }
         });
         let results = futures::future::join_all(futures).await;
         for (offset, res) in results.into_iter().enumerate() {
             let n = i + offset + 1;
             match res {
-                Ok(text) => outputs.push((n, text)),
-                Err(e) => eprintln!("warning: fan_out subtask {n} failed: {e}"),
+                Ok(text) => {
+                    let separator_bytes = usize::from(!outputs.is_empty()) * 2;
+                    let rendered_bytes = format!("--- Subtask {n} result ---\n").len()
+                        + text.len()
+                        + separator_bytes;
+                    output_bytes = output_bytes.saturating_add(rendered_bytes);
+                    if output_bytes > MAX_FAN_OUT_CONTEXT_BYTES {
+                        bail!(
+                            "fan_out results exceed the {MAX_FAN_OUT_CONTEXT_BYTES} byte aggregation/display limit"
+                        );
+                    }
+                    outputs.push((n, text));
+                }
+                Err(e) => {
+                    eprintln!("warning: fan_out subtask {n} failed: {e}");
+                    failures.push(n);
+                }
             }
         }
         i = end;
     }
 
+    if !failures.is_empty() {
+        bail!(
+            "fan_out failed: {} of {} subtasks did not complete",
+            failures.len(),
+            step.count
+        );
+    }
+    if outputs.is_empty() {
+        bail!("fan_out produced no results");
+    }
+
+    let context = format_fan_out_outputs(&outputs);
+    debug_assert!(context.len() <= MAX_FAN_OUT_CONTEXT_BYTES);
     if let Some(aggregate) = &step.aggregate {
-        let context = outputs
-            .iter()
-            .map(|(i, text)| format!("--- Subtask {i} result ---\n{text}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
         let prompt = format!("{aggregate}\n\n{context}");
-        let _ = crate::run_single_turn_capture(&prompt, model, yolo, max_turns, step.tools.clone())
-            .await
-            .map_err(|e| eprintln!("warning: fan_out aggregate failed: {e}"));
+        let result =
+            crate::run_single_turn_capture(&prompt, model, yolo, max_turns, step.tools.clone())
+                .await
+                .context("fan_out aggregate failed")?;
+        println!("{result}");
+    } else {
+        println!("{context}");
     }
     Ok(())
+}
+
+fn format_fan_out_outputs(outputs: &[(usize, String)]) -> String {
+    outputs
+        .iter()
+        .map(|(i, text)| format!("--- Subtask {i} result ---\n{text}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 async fn run_shell(step: &ShellStep, allow_shell: bool) -> Result<()> {
@@ -571,6 +631,54 @@ mod tests {
         assert!(resolve_workflow_path_in(&tmp, "missing").is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fan_out_results_are_rendered_in_task_order() {
+        let rendered = format_fan_out_outputs(&[
+            (1, "first".into()),
+            (2, "second".into()),
+            (3, "third".into()),
+        ]);
+        assert_eq!(
+            rendered,
+            "--- Subtask 1 result ---\nfirst\n\n--- Subtask 2 result ---\nsecond\n\n--- Subtask 3 result ---\nthird"
+        );
+    }
+
+    #[test]
+    fn new_workflow_does_not_overwrite_an_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("existing.json");
+        std::fs::write(&path, b"original").unwrap();
+        assert!(write_new_workflow(&path, b"replacement").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn concurrent_workflow_creators_have_exactly_one_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shared.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for raw in [b"first".as_slice(), b"second".as_slice()] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            let raw = raw.to_vec();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                write_new_workflow(&path, &raw).is_ok()
+            }));
+        }
+        barrier.wait();
+        let winners = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        let saved = std::fs::read(path).unwrap();
+        assert!(saved == b"first" || saved == b"second");
     }
 
     #[test]

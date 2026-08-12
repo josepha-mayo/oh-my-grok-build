@@ -11,7 +11,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -26,16 +25,121 @@ jobs:
             clippy: cargo clippy -p oh-my-grok-build --all-targets
             test: cargo test -p oh-my-grok-build
     steps:
-      - uses: actions/checkout@v4
-      - uses: arduino/setup-protoc@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: "1.92.0"
           components: rustfmt, clippy
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate Unix installer syntax
+        if: runner.os != 'Windows'
+        run: bash -n scripts/install.sh
+      - name: Validate Homebrew formula generator
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p target/formula-fixture
+          touch target/formula-fixture/omgb-x86_64-unknown-linux-gnu.tar.gz
+          touch target/formula-fixture/omgb-aarch64-unknown-linux-gnu.tar.gz
+          touch target/formula-fixture/omgb-x86_64-apple-darwin.tar.gz
+          touch target/formula-fixture/omgb-aarch64-apple-darwin.tar.gz
+          bash -n scripts/generate-homebrew-formula.sh
+          bash scripts/generate-homebrew-formula.sh target/formula-fixture v0.0.0
+          ruby -c target/formula-fixture/omgb.rb
+      - name: Validate Debian package generator
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          fixture=target/deb-fixture
+          target=x86_64-unknown-linux-gnu
+          mkdir -p "$fixture/plugin-$target/bin"
+          printf '#!/bin/sh\nexit 0\n' > "$fixture/omgb-$target"
+          printf '#!/bin/sh\nexit 0\n' > "$fixture/plugin-$target/bin/safe-shell-guard"
+          chmod +x "$fixture/omgb-$target" "$fixture/plugin-$target/bin/safe-shell-guard"
+          bash -n scripts/generate-deb-package.sh
+          bash scripts/generate-deb-package.sh "$fixture" "$target" 0.0.0-beta.1
+          package="$fixture/omgb_0.0.0~beta.1_amd64.deb"
+          dpkg-deb --info "$package"
+          mkdir -p "$fixture/extracted"
+          dpkg-deb --extract "$package" "$fixture/extracted"
+          test "$(readlink "$fixture/extracted/usr/bin/omgb")" = ../lib/omgb/omgb
+          test -x "$fixture/extracted/usr/lib/omgb/omgb"
+          test -x "$fixture/extracted/usr/lib/omgb/plugin/bin/safe-shell-guard"
+      - name: Install native packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y msitools rpm
+      - name: Validate RPM package generator
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          fixture=target/rpm-fixture
+          target=x86_64-unknown-linux-gnu
+          mkdir -p "$fixture/plugin-$target/bin"
+          printf '#!/bin/sh\nexit 0\n' > "$fixture/omgb-$target"
+          printf '#!/bin/sh\nexit 0\n' > "$fixture/plugin-$target/bin/safe-shell-guard"
+          chmod +x "$fixture/omgb-$target" "$fixture/plugin-$target/bin/safe-shell-guard"
+          bash -n scripts/generate-rpm-package.sh
+          bash scripts/generate-rpm-package.sh "$fixture" "$target" 0.0.0-beta.1
+          package=$(find "$fixture" -maxdepth 1 -type f -name 'omgb-*.rpm' -print -quit)
+          rpm -qip "$package"
+          rpm -qlp "$package" | grep -Fx /usr/bin/omgb
+          rpm -qlp "$package" | grep -Fx /usr/lib/omgb/plugin/bin/safe-shell-guard
+      - name: Validate MSI package generator
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          fixture=target/msi-fixture
+          target=x86_64-pc-windows-msvc
+          mkdir -p "$fixture/archive/plugin-$target/bin" "$fixture/output"
+          printf 'test binary\n' > "$fixture/archive/omgb-$target.exe"
+          printf 'test guard\n' > "$fixture/archive/safe-shell-guard-$target.exe"
+          printf 'test plugin guard\n' > "$fixture/archive/plugin-$target/bin/safe-shell-guard.exe"
+          tar -czf "$fixture/omgb-$target.tar.gz" -C "$fixture/archive" .
+          bash -n scripts/generate-msi-package.sh
+          bash scripts/generate-msi-package.sh "$fixture/omgb-$target.tar.gz" 0.0.0-beta.1 "$fixture/output"
+          package="$fixture/output/omgb-0.0.0-beta.1-x86_64.msi"
+          msiextract -l "$package" | grep -F 'OMGB/omgb.exe'
+          msiextract -l "$package" | grep -F 'OMGB/plugin/bin/safe-shell-guard.exe'
+      - name: Validate WinGet manifest generator
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          fixture=target/winget-fixture
+          mkdir -p "$fixture"
+          printf 'test msi\n' > "$fixture/omgb-0.0.0-x86_64.msi"
+          bash -n scripts/generate-winget-manifests.sh
+          bash scripts/generate-winget-manifests.sh \
+            "$fixture/omgb-0.0.0-x86_64.msi" 0.0.0 v0.0.0 JosephAyanda.OMGB "$fixture/manifests"
+          ruby - <<'RUBY'
+          require 'digest'
+          require 'yaml'
+          root = 'target/winget-fixture'
+          docs = Dir["#{root}/manifests/*.yaml"].map { |path| YAML.safe_load_file(path) }
+          raise 'manifest set mismatch' unless docs.map { |doc| doc['ManifestType'] }.sort == %w[defaultLocale installer version]
+          installer = docs.find { |doc| doc['ManifestType'] == 'installer' }
+          expected = Digest::SHA256.file("#{root}/omgb-0.0.0-x86_64.msi").hexdigest.upcase
+          raise 'installer checksum mismatch' unless installer['Installers'][0]['InstallerSha256'] == expected
+          RUBY
+      - name: Validate Windows installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1),
+            [ref]$null,
+            [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count) {
+            $parseErrors | Format-List
+            exit 1
+          }
       - run: cargo fmt --check -p oh-my-grok-build
       - run: ${{ matrix.clippy }}
       - run: ${{ matrix.test }}
@@ -54,14 +158,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: write
       checks: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: "1.92.0"
-      - uses: swatinem/rust-cache@v2
-      - uses: rustsec/audit-check@v2
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -44,6 +44,8 @@ pub enum OmgbCommand {
     Autonomous(AutonomousArgs),
     /// Manage BYOK / local model providers
     Provider(ProviderArgs),
+    /// Manage optional Grok subscription sign-in
+    Auth(AuthArgs),
     /// List or switch models
     Model(ModelArgs),
     /// Schedule background prompts (cron-style)
@@ -118,6 +120,8 @@ pub enum OmgbCommand {
     Undo(UndoArgs),
     /// Submit feedback or file an issue
     Feedback(FeedbackArgs),
+    /// Check for and optionally apply self-updates
+    Update(SelfUpdateArgs),
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -219,6 +223,26 @@ pub struct AutonomousArgs {
 pub struct ProviderArgs {
     #[command(subcommand)]
     pub command: ProviderCommand,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum AuthCommand {
+    /// Show BYOK/local and Grok subscription authentication status
+    Status,
+    /// Sign in with a Grok subscription (device code by default)
+    Login {
+        /// Use the local browser callback flow instead of a device code
+        #[arg(long)]
+        browser: bool,
+    },
+    /// Clear the cached Grok subscription session (BYOK keys are untouched)
+    Logout,
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -331,6 +355,12 @@ pub enum ScheduleCommand {
     Delete { name: String },
     /// Run a job now
     Run { name: String },
+    /// Clear an ambiguous completed/crashed run after verifying its effects
+    ResolveRun {
+        name: String,
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Set or clear a job's expiry time
     SetExpiry {
         name: String,
@@ -398,6 +428,21 @@ pub enum SubagentCommand {
     Logs { id: String },
     /// Trace subagent execution
     Trace { id: String },
+    #[command(hide = true)]
+    Worker {
+        #[arg(long)]
+        prompt_file: PathBuf,
+        #[arg(long)]
+        stdout_path: PathBuf,
+        #[arg(long)]
+        stderr_path: PathBuf,
+        #[arg(long)]
+        admission_path: PathBuf,
+        #[arg(long)]
+        admission_token: String,
+        #[arg(long)]
+        yolo: bool,
+    },
 }
 
 #[derive(Debug, Args, Clone)]
@@ -422,10 +467,28 @@ pub enum ThreadCommand {
     Send(ThreadSendArgs),
     /// Show unread messages for a thread
     Inbox { id: String },
+    /// Resolve messages left ambiguous by an interrupted thread turn
+    ResolveInbox {
+        id: String,
+        attempt: String,
+        #[arg(value_enum)]
+        action: ThreadInboxResolution,
+        /// Confirm that replaying or discarding the ambiguous messages is intentional
+        #[arg(long)]
+        confirm: bool,
+    },
     /// List models the user has configured
     Models,
     /// Pick the best available model for a task
     PickModel { task: String },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ThreadInboxResolution {
+    /// Treat the messages as handled and remove them from the inbox
+    Acknowledge,
+    /// Return the messages to pending so a later turn can deliver them again
+    Retry,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -479,8 +542,28 @@ pub enum MetaCommand {
     Show { id: String },
     /// Resume an existing meta plan
     Resume { id: String },
+    /// Resolve a subtask whose prior execution may already have produced effects
+    Resolve {
+        id: String,
+        subtask: String,
+        #[arg(value_enum)]
+        action: MetaResolution,
+        #[arg(long)]
+        result: Option<String>,
+        /// Confirm that retrying or accepting the ambiguous work is intentional
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Show recent meta-harness notifications
     Notifications(MetaNotificationsArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MetaResolution {
+    /// Accept the existing thread attempt as completed
+    Complete,
+    /// Preserve the old thread as evidence and start a new attempt on resume
+    Retry,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -527,7 +610,7 @@ pub struct SessionParams {
     /// Continue the most recent session for this workspace.
     #[arg(long = "continue", short = 'c')]
     pub continue_last: bool,
-    /// Use a specific session ID for a new or forked session.
+    /// Use a specific UUID for a new or forked session.
     #[arg(long = "session-id", short = 's', value_name = "SESSION_ID")]
     pub session_id: Option<String>,
     /// When resuming or continuing, fork to a new session instead of reusing.
@@ -543,7 +626,7 @@ pub enum SessionCommand {
     Resume(SessionResumeArgs),
     /// Fork a session into a new branch
     Fork(SessionForkArgs),
-    /// Start a fresh named session
+    /// Start a fresh session
     New(SessionNewArgs),
 }
 
@@ -562,7 +645,7 @@ pub struct SessionResumeArgs {
     pub continue_last: bool,
     #[arg(long = "fork-session")]
     pub fork_session: bool,
-    /// New session ID when forking (requires --fork-session).
+    /// New session UUID when forking (requires --fork-session).
     #[arg(long = "session-id", short = 's', value_name = "SESSION_ID")]
     pub target_session_id: Option<String>,
     /// Optional follow-up prompt (omit for an empty turn / TUI-less resume).
@@ -573,7 +656,7 @@ pub struct SessionResumeArgs {
 pub struct SessionForkArgs {
     /// Parent session ID to fork from.
     pub parent_session_id: String,
-    /// New session ID for the fork.
+    /// New session UUID for the fork.
     #[arg(long = "session-id", short = 's', value_name = "SESSION_ID")]
     pub new_session_id: Option<String>,
     #[arg(short, long)]
@@ -612,8 +695,26 @@ pub enum MemoryCommand {
     List(MemoryListArgs),
     /// Record a one-shot occurrence journal entry
     Oneshot(MemoryOneshotArgs),
+    /// List one-shot notes held for explicit post-turn reconciliation
+    Leases,
+    /// Resolve an ambiguous one-shot delivery attempt
+    ResolveOneshot {
+        lease: String,
+        #[arg(value_enum)]
+        action: MemoryLeaseResolution,
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Deduplicate near-duplicate notes
     Compact,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MemoryLeaseResolution {
+    /// Treat the delivered one-shot note as consumed
+    Consume,
+    /// Make the note eligible for a future turn again
+    Retry,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -903,8 +1004,9 @@ pub struct ServeArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub yolo: bool,
-    /// Comma-separated allowed Origin header values for WebSocket clients.
-    /// Use `*` to allow any origin. If unset, no origin check is performed.
+    /// Comma-separated allowed Origin values for browser WebSocket and group API clients.
+    /// This also enables matching CORS responses for the HTTP group API. Use `*` to
+    /// allow any origin. If unset, no browser-origin check or CORS response is performed.
     #[arg(long, value_delimiter = ',')]
     pub allowed_origins: Vec<String>,
     /// Maximum WebSocket upgrade requests per minute per IP. 0 disables rate limiting.
@@ -1046,6 +1148,44 @@ pub struct FeedbackArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+pub struct SelfUpdateArgs {
+    /// Only check whether an update is available; do not install
+    #[arg(long, conflicts_with = "apply")]
+    pub check: bool,
+    /// Release channel to query
+    #[arg(long, value_enum, default_value = "stable")]
+    pub channel: UpdateChannel,
+    /// Apply the update if one is available
+    #[arg(long)]
+    pub apply: bool,
+    /// Skip GitHub build-provenance attestation verification (not recommended)
+    #[arg(
+        long,
+        requires = "apply",
+        help = "Skip GitHub build-provenance attestation verification (not recommended)"
+    )]
+    pub insecure: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum UpdateChannel {
+    /// Latest stable release
+    #[default]
+    Stable,
+    /// Latest pre-release
+    Nightly,
+}
+
+impl std::fmt::Display for UpdateChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateChannel::Stable => write!(f, "stable"),
+            UpdateChannel::Nightly => write!(f, "nightly"),
+        }
+    }
+}
+
+#[derive(Debug, Args, Clone)]
 pub struct DoctorArgs {
     /// Apply safe remediations
     #[arg(long)]
@@ -1153,6 +1293,8 @@ pub enum GroupCommand {
     Join(GroupJoinArgs),
     /// Approve a pending join request for a group
     Approve(GroupApproveArgs),
+    /// Reject a pending join request for a group
+    Reject(GroupApproveArgs),
     /// Print an invite command/link for a group
     Invite { id: String },
     /// Add a remote agent to a group
@@ -1167,6 +1309,12 @@ pub enum GroupCommand {
     HostAgent(GroupHostAgentArgs),
     /// Print the token for a hosted agent registered on this machine
     HostedAgentToken(GroupHostedAgentTokenArgs),
+    /// Explicitly retire an unresolved hosted dispatch after operator reconciliation
+    HostedDispatchRetire {
+        dispatch_id: String,
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Check the status of a pending remote join request and save the membership token if approved
     JoinStatus(GroupJoinStatusArgs),
 }
@@ -1196,7 +1344,7 @@ pub struct GroupNewArgs {
     /// Host/creator human display name (defaults to $USER)
     #[arg(short = 'H', long)]
     pub human_name: Option<String>,
-    /// Auto-approve tool use for agents
+    /// Auto-approve tool use for agents in this group
     #[arg(long)]
     pub yolo: bool,
 }
@@ -1211,7 +1359,7 @@ pub struct GroupChatArgs {
     /// Member token for the group (or a previously saved membership will be used)
     #[arg(long)]
     pub token: Option<String>,
-    /// Auto-approve tool use for agents
+    /// Auto-approve tool use for agents responding to messages typed in this local chat
     #[arg(long)]
     pub yolo: bool,
     /// Remote server base URL
@@ -1225,6 +1373,9 @@ pub struct GroupSendArgs {
     pub id: String,
     /// Message text
     pub message: String,
+    /// Stable message id to reuse after an ambiguous remote failure
+    #[arg(long, value_name = "ID")]
+    pub message_id: Option<String>,
     /// Human display name
     #[arg(short = 'n', long, visible_alias = "human-name")]
     pub name: Option<String>,
@@ -1260,10 +1411,10 @@ pub struct GroupApproveArgs {
     pub id: String,
     /// Pending join request id
     pub request_id: String,
-    /// Your display name (used to verify the member token)
+    /// Host display name (used to verify the host member token)
     #[arg(short = 'n', long)]
     pub name: Option<String>,
-    /// Member token of the approver
+    /// Group host member token
     #[arg(long)]
     pub token: Option<String>,
     /// Remote server base URL
@@ -1303,6 +1454,9 @@ pub struct GroupHostAgentArgs {
     /// Shared secret token (generated if omitted)
     #[arg(long, value_name = "TOKEN")]
     pub token: Option<String>,
+    /// Allow this remote group host to request auto-approved tool execution
+    #[arg(long)]
+    pub yolo: bool,
 }
 
 #[derive(Debug, Args, Clone)]

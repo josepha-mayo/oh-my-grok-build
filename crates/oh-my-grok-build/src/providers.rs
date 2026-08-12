@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::args::{AddProviderArgs, DiscoverArgs};
@@ -86,11 +87,56 @@ fn omg_env_path() -> Result<PathBuf> {
 }
 
 fn grok_home() -> PathBuf {
+    #[cfg(test)]
+    if let Some(override_path) = GROK_HOME_OVERRIDE.lock().unwrap().as_ref() {
+        return override_path.clone();
+    }
     xai_grok_shell::util::grok_home::grok_home()
+}
+
+#[cfg(test)]
+static GROK_HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_grok_home_for_tests(path: Option<PathBuf>) {
+    *GROK_HOME_OVERRIDE.lock().unwrap() = path;
 }
 
 fn grok_config_path() -> PathBuf {
     grok_home().join("config.toml")
+}
+
+pub(crate) struct ProviderMutationGuard {
+    _files: Vec<std::fs::File>,
+}
+
+pub(crate) fn provider_mutation_lock() -> Result<ProviderMutationGuard> {
+    let mut dirs = vec![omg_dir()?, grok_home()];
+    for dir in &dirs {
+        std::fs::create_dir_all(dir)?;
+        restrict_omg_directory_permissions(dir)?;
+    }
+    dirs = dirs
+        .into_iter()
+        .map(|dir| dunce::canonicalize(&dir).unwrap_or(dir))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+
+    let mut files = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let path = dir.join("omgb-provider-mutation.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        restrict_omg_file_permissions(&path)?;
+        FileExt::lock_exclusive(&file)?;
+        files.push(file);
+    }
+    Ok(ProviderMutationGuard { _files: files })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -138,7 +184,13 @@ pub fn load_omg_config() -> Result<OmgConfig> {
     serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
+#[cfg(test)]
 pub fn save_omg_config(config: &OmgConfig) -> Result<()> {
+    let _lock = provider_mutation_lock()?;
+    save_omg_config_unlocked(config)
+}
+
+fn save_omg_config_unlocked(config: &OmgConfig) -> Result<()> {
     let path = omg_config_path()?;
     write_file_atomic(&path, serde_json::to_string_pretty(config)?, true)
 }
@@ -174,8 +226,8 @@ pub(crate) fn env_keys_to_load() -> HashSet<String> {
         keys.insert(k.to_string());
     }
 
-    if let Ok(cfg) = load_omg_config() {
-        for p in cfg.providers.values() {
+    if let Ok(providers) = list_providers() {
+        for p in &providers {
             for k in valid_env_keys(p) {
                 keys.insert(k);
             }
@@ -295,17 +347,43 @@ pub(crate) fn write_file_atomic(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent)?;
+    if restrict {
+        restrict_omg_directory_permissions(parent)?;
+    }
     let tmp = path.with_extension(format!(
         "tmp.{}.{}",
         std::process::id(),
         uuid::Uuid::new_v4().to_string().replace('-', "")
     ));
     let write = || -> Result<()> {
-        std::fs::write(&tmp, content.as_ref())?;
+        use std::io::Write as _;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            if restrict {
+                options.mode(0o600);
+            } else if let Ok(metadata) = std::fs::metadata(path) {
+                options.mode(metadata.permissions().mode());
+            }
+        }
+        let mut file = options.open(&tmp)?;
         if restrict {
             restrict_omg_file_permissions(&tmp)?;
         }
+        file.write_all(content.as_ref())?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        replace_file_atomic_windows(&tmp, path)?;
+        #[cfg(not(windows))]
         std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     };
     if let Err(e) = write() {
@@ -313,6 +391,213 @@ pub(crate) fn write_file_atomic(
         return Err(e);
     }
     Ok(())
+}
+
+/// Atomically publishes `content` only if the bytes displaced at the publish
+/// point equal `expected`. The platform swap keeps the previous file reachable
+/// until after it is verified, closing the read-then-rename lost-update window.
+pub(crate) fn write_file_atomic_if_unchanged(
+    path: &std::path::Path,
+    expected: &[u8],
+    content: &[u8],
+) -> Result<()> {
+    use std::io::Write as _;
+
+    #[cfg(unix)]
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    let token = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let staged = path.with_extension(format!("omgb-cas-{token}.new"));
+    let displaced = path.with_extension(format!("omgb-cas-{token}.old"));
+    let write = || -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(std::fs::metadata(path)?.permissions().mode());
+        }
+        let mut file = options.open(&staged)?;
+        file.write_all(content)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+
+        atomic_exchange_with_backup(&staged, path, &displaced)?;
+        let previous = std::fs::read(&displaced)?;
+        if previous != expected {
+            let current = std::fs::read(path)?;
+            if current == content {
+                atomic_exchange_with_backup(&displaced, path, &staged)?;
+                let _ = std::fs::remove_file(&staged);
+            } else {
+                bail!(
+                    "file changed during atomic publish; the displaced version is preserved at {}",
+                    displaced.display()
+                );
+            }
+            bail!("file changed during atomic publish: {}", path.display());
+        }
+        std::fs::remove_file(&displaced)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    };
+    if let Err(error) = write() {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_exchange_with_backup(
+    replacement: &std::path::Path,
+    destination: &std::path::Path,
+    backup: &std::path::Path,
+) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+    use windows::core::PCWSTR;
+
+    let wide = |path: &std::path::Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<u16>>()
+    };
+    let replacement = wide(replacement);
+    let destination = wide(destination);
+    let backup = wide(backup);
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(destination.as_ptr()),
+            PCWSTR(replacement.as_ptr()),
+            PCWSTR(backup.as_ptr()),
+            REPLACEFILE_WRITE_THROUGH,
+            None,
+            None,
+        )
+    }
+    .context("atomic conditional Windows file replacement failed")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_exchange_with_backup(
+    replacement: &std::path::Path,
+    destination: &std::path::Path,
+    backup: &std::path::Path,
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let replacement_path = replacement.to_path_buf();
+    let replacement = CString::new(replacement_path.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            replacement.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("atomic conditional file exchange failed");
+    }
+    // The displaced destination now occupies the replacement path.
+    std::fs::rename(replacement_path, backup)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_exchange_with_backup(
+    replacement: &std::path::Path,
+    destination: &std::path::Path,
+    backup: &std::path::Path,
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+    const RENAME_SWAP: u32 = 0x0000_0002;
+    let replacement_path = replacement.to_path_buf();
+    let replacement = CString::new(replacement_path.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let result = unsafe { renamex_np(replacement.as_ptr(), destination.as_ptr(), RENAME_SWAP) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("atomic conditional file exchange failed");
+    }
+    std::fs::rename(replacement_path, backup)?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn atomic_exchange_with_backup(
+    _replacement: &std::path::Path,
+    _destination: &std::path::Path,
+    _backup: &std::path::Path,
+) -> Result<()> {
+    bail!("atomic conditional file exchange is unsupported on this Unix platform")
+}
+
+#[cfg(windows)]
+fn replace_file_atomic_windows(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH,
+        ReplaceFileW,
+    };
+    use windows::core::PCWSTR;
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    if destination_exists(destination.as_slice()) {
+        unsafe {
+            ReplaceFileW(
+                PCWSTR(destination.as_ptr()),
+                PCWSTR(source.as_ptr()),
+                PCWSTR::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                None,
+                None,
+            )
+        }
+        .context("atomic Windows file replacement failed")?;
+    } else {
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(destination.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .context("atomic Windows file publication failed")?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn destination_exists(path: &[u16]) -> bool {
+    use windows::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
+    use windows::core::PCWSTR;
+    unsafe { GetFileAttributesW(PCWSTR(path.as_ptr())) != INVALID_FILE_ATTRIBUTES }
 }
 
 fn write_env_entries(entries: &[(String, String)]) -> Result<()> {
@@ -337,6 +622,19 @@ pub(crate) fn restrict_omg_file_permissions(path: &std::path::Path) -> Result<()
     Ok(())
 }
 
+pub(crate) fn restrict_omg_directory_permissions(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(windows)]
+    {
+        windows_restrict_file_permissions(path)?;
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn windows_restrict_file_permissions(path: &std::path::Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -347,10 +645,27 @@ fn windows_restrict_file_permissions(path: &std::path::Path) -> Result<()> {
     };
     use windows::Win32::Security::{
         ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, GetTokenInformation,
-        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TokenUser,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::PCWSTR;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect permissions target {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to change permissions through symlink: {}",
+            path.display()
+        );
+    }
+    // OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE. A protected directory DACL
+    // must pass the owner ACE to newly-created lock/temp files; otherwise they
+    // receive an empty DACL and become inaccessible on their next open.
+    let inheritance = if metadata.is_dir() {
+        ACE_FLAGS(0x1 | 0x2)
+    } else {
+        ACE_FLAGS(0)
+    };
 
     unsafe {
         let mut token_handle = windows::Win32::Foundation::HANDLE::default();
@@ -373,13 +688,19 @@ fn windows_restrict_file_permissions(path: &std::path::Path) -> Result<()> {
             anyhow::anyhow!("GetTokenInformation failed: {e}")
         })?;
 
-        let token_user = &*(token_user_buffer.as_ptr() as *const TOKEN_USER);
-        let user_sid = token_user.User.Sid;
+        // TOKEN_USER begins with a SID_AND_ATTRIBUTES whose first field is the PSID.
+        // Read it without creating an under-aligned reference.
+        let user_sid = crate::win_sid::sid_ptr(&token_user_buffer).inspect_err(|_| {
+            let _ = CloseHandle(token_handle);
+        })?;
 
         let explicit_access = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: 0x10000000, // GENERIC_ALL
+            // Use the concrete file access mask rather than GENERIC_ALL. A
+            // protected DACL containing an unmapped generic bit can deny the
+            // owner WRITE_DAC on the next attempt to tighten the same file.
+            grfAccessPermissions: 0x001F01FF, // FILE_ALL_ACCESS
             grfAccessMode: SET_ACCESS,
-            grfInheritance: ACE_FLAGS(0),
+            grfInheritance: inheritance,
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
                 MultipleTrusteeOperation:
@@ -474,7 +795,17 @@ fn api_key_target_var(provider_id: &str, env_keys: Option<&[String]>) -> String 
         .unwrap_or_else(|| env_var_name(provider_id))
 }
 
+#[cfg(test)]
 pub fn write_api_key(provider_id: &str, env_keys: Option<&[String]>, key: &str) -> Result<String> {
+    let _lock = provider_mutation_lock()?;
+    write_api_key_unlocked(provider_id, env_keys, key)
+}
+
+pub(crate) fn write_api_key_unlocked(
+    provider_id: &str,
+    env_keys: Option<&[String]>,
+    key: &str,
+) -> Result<String> {
     let target = api_key_target_var(provider_id, env_keys);
     if !is_valid_env_key(&target) {
         bail!("refusing to write API key for invalid env var {target}");
@@ -499,17 +830,16 @@ fn is_env_key_referenced(
     exclude_provider: Option<&str>,
     exclude_connector: Option<&str>,
 ) -> Result<bool> {
-    if let Ok(cfg) = load_omg_config() {
-        for (id, p) in &cfg.providers {
-            if exclude_provider == Some(id.as_str()) {
-                continue;
-            }
-            if p.env_key
-                .as_ref()
-                .is_some_and(|keys| keys.iter().any(|k| k == target))
-            {
-                return Ok(true);
-            }
+    for provider in list_providers()? {
+        if exclude_provider == Some(provider.id.as_str()) {
+            continue;
+        }
+        if provider
+            .env_key
+            .as_ref()
+            .is_some_and(|keys| keys.iter().any(|k| k == target))
+        {
+            return Ok(true);
         }
     }
     let connectors_path = omg_dir()?.join("connectors.json");
@@ -537,7 +867,11 @@ fn is_env_key_referenced(
     Ok(false)
 }
 
-pub fn remove_api_key(name: &str, is_connector: bool, env_keys: Option<&[String]>) -> Result<()> {
+pub(crate) fn remove_api_key_unlocked(
+    name: &str,
+    is_connector: bool,
+    env_keys: Option<&[String]>,
+) -> Result<()> {
     let path = omg_env_path()?;
     if !path.exists() {
         return Ok(());
@@ -595,16 +929,36 @@ fn resolve_api_key_with_maps(
 ) -> Option<String> {
     let keys = valid_env_keys(provider);
     for k in &keys {
-        if let Some(v) = env.get(k).filter(|v| !v.is_empty()) {
+        if let Some(v) = env
+            .get(k)
+            .filter(|value| api_key_value_is_usable(provider, value))
+        {
             return Some(v.clone());
         }
     }
     for k in &keys {
-        if let Some(v) = dotenv.get(k).filter(|v| !v.is_empty()) {
+        if let Some(v) = dotenv
+            .get(k)
+            .filter(|value| api_key_value_is_usable(provider, value))
+        {
             return Some(v.clone());
         }
     }
     None
+}
+
+pub(crate) fn api_key_value_is_usable(provider: &ProviderConfig, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let is_openai_api = Url::parse(&provider.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.openai.com");
+    // Codex desktop/frontend OAuth tokens are not OpenAI Platform API keys.
+    // Treating one as BYOK causes a predictable 401 from /v1/responses.
+    !(is_openai_api && value.starts_with("fe_oa_"))
 }
 
 pub fn resolve_api_key(provider: &ProviderConfig) -> Result<Option<String>> {
@@ -631,25 +985,263 @@ pub fn resolve_env_key(key: &str) -> Result<Option<String>> {
 
 pub fn list_providers() -> Result<Vec<ProviderConfig>> {
     let cfg = load_omg_config()?;
-    Ok(cfg.providers.values().cloned().collect())
+    effective_providers_from_tables(&cfg, &load_grok_config_table()?)
 }
 
 pub fn get_provider(id: &str) -> Result<Option<ProviderConfig>> {
     let cfg = load_omg_config()?;
-    Ok(cfg.providers.get(id).cloned())
+    if let Some(provider) = cfg.providers.get(id) {
+        return Ok(Some(provider.clone()));
+    }
+    provider_from_grok_config(id)
+}
+
+fn provider_execution_fingerprint_unlocked(model: &str) -> Result<Option<String>> {
+    let Some(id) = model.trim().strip_prefix("omgb-") else {
+        return Ok(None);
+    };
+    let Some(provider) = get_provider(id)? else {
+        bail!("provider '{id}' is not configured");
+    };
+    let mut hash = blake3::Hasher::new();
+    for value in [
+        provider.id.as_str(),
+        provider.model.as_str(),
+        provider.base_url.as_str(),
+        provider.api_backend.as_deref().unwrap_or(""),
+    ] {
+        hash.update(value.as_bytes());
+        hash.update(b"\0");
+    }
+    for value in [
+        provider.context_window.map(|value| value.to_string()),
+        provider
+            .auto_compact_threshold_percent
+            .map(|value| value.to_string()),
+        provider
+            .temperature
+            .map(|value| value.to_bits().to_string()),
+        provider.top_p.map(|value| value.to_bits().to_string()),
+        provider
+            .max_completion_tokens
+            .map(|value| value.to_string()),
+    ] {
+        hash.update(value.as_deref().unwrap_or("").as_bytes());
+        hash.update(b"\0");
+    }
+    let mut env_keys = provider.env_key.unwrap_or_default();
+    env_keys.sort();
+    for key in env_keys {
+        hash.update(key.as_bytes());
+        hash.update(b"\0");
+    }
+    let mut headers = provider
+        .extra_headers
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+    headers.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, value) in headers {
+        hash.update(name.as_bytes());
+        hash.update(b"\0");
+        hash.update(value.as_bytes());
+        hash.update(b"\0");
+    }
+    Ok(Some(hash.finalize().to_hex().to_string()))
+}
+
+pub(crate) fn provider_execution_fingerprint(model: &str) -> Result<Option<String>> {
+    if !model.trim().starts_with("omgb-") {
+        return Ok(None);
+    }
+    let _guard = provider_mutation_lock()?;
+    provider_execution_fingerprint_unlocked(model)
+}
+
+/// Prepare one immutable provider execution window. The mutation locks stay
+/// held until the returned guard drops, so config.json, .env and Grok's model
+/// table cannot change between identity validation and the model request.
+pub(crate) fn prepare_provider_execution(
+    model: &str,
+    expected_fingerprint: Option<&str>,
+) -> Result<Option<ProviderMutationGuard>> {
+    let Some(id) = model.trim().strip_prefix("omgb-") else {
+        if expected_fingerprint.is_some() {
+            bail!("persisted provider identity does not match model '{model}'");
+        }
+        return Ok(None);
+    };
+    let guard = provider_mutation_lock()?;
+    ensure_provider_configured_unlocked(id)?;
+    let current = provider_execution_fingerprint_unlocked(model)?
+        .with_context(|| format!("provider '{id}' has no execution fingerprint"))?;
+    if expected_fingerprint.is_some_and(|expected| expected != current) {
+        bail!("provider '{id}' changed after this execution was planned");
+    }
+    Ok(Some(guard))
+}
+
+fn effective_providers_from_tables(
+    cfg: &OmgConfig,
+    grok: &toml::map::Map<String, toml::Value>,
+) -> Result<Vec<ProviderConfig>> {
+    let mut providers = cfg.providers.clone();
+    if let Some(models) = grok.get("model").and_then(toml::Value::as_table) {
+        for key in models.keys() {
+            let Some(id) = key.strip_prefix("omgb-") else {
+                continue;
+            };
+            if id.is_empty() || sanitize_provider_id(id) != id {
+                bail!("model.{key} has an invalid provider id");
+            }
+            if !providers.contains_key(id) {
+                let provider = provider_from_grok_table(id, grok)?.with_context(|| {
+                    format!("model.{key} disappeared while loading provider configuration")
+                })?;
+                providers.insert(id.to_string(), provider);
+            }
+        }
+    }
+    let mut providers: Vec<_> = providers.into_values().collect();
+    providers.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(providers)
+}
+
+fn provider_from_grok_table(
+    id: &str,
+    config: &toml::map::Map<String, toml::Value>,
+) -> Result<Option<ProviderConfig>> {
+    let key = format!("omgb-{id}");
+    let Some(section) = config
+        .get("model")
+        .and_then(toml::Value::as_table)
+        .and_then(|models| models.get(&key))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(None);
+    };
+    let required_string = |field: &str| -> Result<String> {
+        section
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .with_context(|| format!("model.{key}.{field} must be a non-empty string"))
+    };
+    let optional_u64 = |field: &str| -> Result<Option<u64>> {
+        section
+            .get(field)
+            .map(|value| {
+                value
+                    .as_integer()
+                    .filter(|value| *value >= 0)
+                    .map(|value| value as u64)
+                    .with_context(|| format!("model.{key}.{field} must be a non-negative integer"))
+            })
+            .transpose()
+    };
+    let optional_f64 = |field: &str| -> Result<Option<f64>> {
+        section
+            .get(field)
+            .map(|value| {
+                value
+                    .as_float()
+                    .or_else(|| value.as_integer().map(|value| value as f64))
+                    .with_context(|| format!("model.{key}.{field} must be a number"))
+            })
+            .transpose()
+    };
+    let env_key = match section.get("env_key") {
+        None => None,
+        Some(toml::Value::String(value)) if is_valid_env_key(value) => Some(vec![value.clone()]),
+        Some(toml::Value::Array(values)) => {
+            let mut keys = Vec::with_capacity(values.len());
+            for value in values {
+                let key_name = value
+                    .as_str()
+                    .filter(|value| is_valid_env_key(value))
+                    .with_context(|| format!("model.{key}.env_key contains an invalid key name"))?;
+                keys.push(key_name.to_string());
+            }
+            Some(keys)
+        }
+        Some(_) => bail!("model.{key}.env_key must be a valid string or string array"),
+    };
+    let extra_headers = match section.get("extra_headers") {
+        None => None,
+        Some(toml::Value::Table(headers)) => {
+            let mut parsed = HashMap::with_capacity(headers.len());
+            for (name, value) in headers {
+                let value = value.as_str().with_context(|| {
+                    format!("model.{key}.extra_headers.{name} must be a string")
+                })?;
+                parsed.insert(name.clone(), value.to_string());
+            }
+            Some(parsed)
+        }
+        Some(_) => bail!("model.{key}.extra_headers must be a table"),
+    };
+    let threshold = optional_u64("auto_compact_threshold_percent")?
+        .map(|value| {
+            u8::try_from(value)
+                .ok()
+                .filter(|value| *value <= 100)
+                .with_context(|| {
+                    format!("model.{key}.auto_compact_threshold_percent must be between 0 and 100")
+                })
+        })
+        .transpose()?;
+
+    Ok(Some(ProviderConfig {
+        id: id.to_string(),
+        name: section
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(id)
+            .to_string(),
+        model: required_string("model")?,
+        base_url: required_string("base_url")?,
+        api_backend: section
+            .get("api_backend")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string),
+        env_key,
+        extra_headers,
+        context_window: optional_u64("context_window")?,
+        auto_compact_threshold_percent: threshold,
+        temperature: optional_f64("temperature")?,
+        top_p: optional_f64("top_p")?,
+        max_completion_tokens: optional_u64("max_completion_tokens")?,
+    }))
+}
+
+fn provider_from_grok_config(id: &str) -> Result<Option<ProviderConfig>> {
+    provider_from_grok_table(id, &load_grok_config_table()?)
 }
 
 /// If `id` is already in `~/.omgb/config.json`, return it. Otherwise try to
 /// materialise a known built-in or catalog template, persist it, and sync it to
 /// `~/.grok/config.toml` so upstream model resolution can use `omgb-{id}`.
 pub fn ensure_provider_configured(id: &str) -> Result<ProviderConfig> {
+    let _lock = provider_mutation_lock()?;
+    ensure_provider_configured_unlocked(id)
+}
+
+fn ensure_provider_configured_unlocked(id: &str) -> Result<ProviderConfig> {
     let id = sanitize_provider_id(id);
     let mut cfg = load_omg_config()?;
     if let Some(p) = cfg.providers.get(&id).cloned() {
         if p.model.trim().is_empty() {
             bail!("provider '{id}' has no configured model; pass --model or discover local models");
         }
+        sync_provider_to_grok_config_unlocked(&p)?;
         return Ok(p);
+    }
+    if let Some(provider) = provider_from_grok_config(&id)? {
+        return Ok(provider);
     }
     let provider = provider_template(&id).ok_or_else(|| {
         anyhow::anyhow!("provider '{id}' is not configured and has no known template")
@@ -658,24 +1250,30 @@ pub fn ensure_provider_configured(id: &str) -> Result<ProviderConfig> {
         bail!("provider '{id}' has no configured model; pass --model or discover local models");
     }
     cfg.providers.insert(id.clone(), provider.clone());
-    save_omg_config(&cfg)?;
-    sync_provider_to_grok_config(&provider)?;
+    save_omg_config_unlocked(&cfg)?;
+    sync_provider_to_grok_config_unlocked(&provider)?;
     Ok(provider)
 }
 
 pub fn remove_provider(id: &str) -> Result<()> {
+    let _lock = provider_mutation_lock()?;
     let mut cfg = load_omg_config()?;
-    let provider = cfg.providers.remove(id);
+    let mut gcfg = load_grok_config_table()?;
+    let provider = match cfg.providers.remove(id) {
+        Some(provider) => Some(provider),
+        None => provider_from_grok_table(id, &gcfg)?,
+    };
     if cfg.default_model.as_deref() == Some(&format!("omgb-{id}")) {
         cfg.default_model = None;
     }
-    save_omg_config(&cfg)?;
-    remove_api_key(
+    remove_provider_from_grok_table(id, &mut gcfg);
+    save_grok_config_table_unlocked(&gcfg)?;
+    save_omg_config_unlocked(&cfg)?;
+    remove_api_key_unlocked(
         id,
         false,
         provider.as_ref().and_then(|p| p.env_key.as_deref()),
     )?;
-    remove_provider_from_grok_config(id)?;
     Ok(())
 }
 
@@ -740,7 +1338,6 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
         bail!("provider id is required");
     }
 
-    let mut cfg = load_omg_config()?;
     let mut provider = if let Some(t) = &args.template {
         provider_template(t).ok_or_else(|| anyhow::anyhow!("unknown template '{t}'"))?
     } else if let Some(p) = provider_template(&id) {
@@ -876,30 +1473,50 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
         provider.auto_compact_threshold_percent = Some(80);
     }
 
+    let _lock = provider_mutation_lock()?;
+    let mut cfg = load_omg_config()?;
     if args.default || cfg.default_model.is_none() {
         cfg.default_model = Some(format!("omgb-{id}"));
     }
     cfg.providers.insert(id.clone(), provider.clone());
-    save_omg_config(&cfg)?;
-    sync_provider_to_grok_config(&provider)?;
+    save_omg_config_unlocked(&cfg)?;
+    sync_provider_to_grok_config_unlocked(&provider)?;
+    if args.default {
+        set_grok_default_model_unlocked(&format!("omgb-{id}"))?;
+    }
 
     // Persist the API key only after the provider config has been saved. This
     // avoids leaving orphaned secrets in ~/.omgb/.env if validation fails.
     if let Some(key) = api_key {
-        write_api_key(&id, provider.env_key.as_deref(), &key)?;
+        write_api_key_unlocked(&id, provider.env_key.as_deref(), &key)?;
     }
 
     Ok(provider)
 }
 
 pub fn set_default_provider(id: &str) -> Result<()> {
-    let mut cfg = load_omg_config()?;
-    if !cfg.providers.contains_key(id) {
-        bail!("provider '{id}' not found");
-    }
-    cfg.default_model = Some(format!("omgb-{id}"));
-    save_omg_config(&cfg)?;
+    let _lock = provider_mutation_lock()?;
+    let cfg = load_omg_config()?;
+    let provider = match cfg.providers.get(id).cloned() {
+        Some(provider) => provider,
+        None => provider_from_grok_config(id)?
+            .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?,
+    };
+    sync_provider_to_grok_config_unlocked(&provider)?;
+    set_grok_default_model_unlocked(&format!("omgb-{id}"))
+}
 
+pub fn set_grok_default_model(model: &str) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+        bail!("invalid model identifier");
+    }
+
+    let _lock = provider_mutation_lock()?;
+    set_grok_default_model_unlocked(model)
+}
+
+fn set_grok_default_model_unlocked(model: &str) -> Result<()> {
     let mut gcfg = load_grok_config_table()?;
     let models = gcfg
         .entry("models")
@@ -907,11 +1524,30 @@ pub fn set_default_provider(id: &str) -> Result<()> {
     if let toml::Value::Table(m) = models {
         m.insert(
             "default".to_string(),
-            toml::Value::String(format!("omgb-{id}")),
+            toml::Value::String(model.to_string()),
         );
     }
-    save_grok_config_table(&gcfg)?;
+    save_grok_config_table_unlocked(&gcfg)?;
+
+    let mut cfg = load_omg_config()?;
+    cfg.default_model = model.starts_with("omgb-").then(|| model.to_string());
+    save_omg_config_unlocked(&cfg)?;
     Ok(())
+}
+
+pub fn configured_default_model() -> Result<Option<String>> {
+    let gcfg = load_grok_config_table()?;
+    if let Some(default) = gcfg
+        .get("models")
+        .and_then(toml::Value::as_table)
+        .and_then(|models| models.get("default"))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        return Ok(Some(default.to_string()));
+    }
+    Ok(load_omg_config()?.default_model)
 }
 
 fn apply_provider_to_grok_table(
@@ -983,16 +1619,15 @@ fn set_grok_default_if_unset(gcfg: &mut toml::map::Map<String, toml::Value>, mod
     }
 }
 
-fn sync_provider_to_grok_config(provider: &ProviderConfig) -> Result<()> {
+fn sync_provider_to_grok_config_unlocked(provider: &ProviderConfig) -> Result<()> {
     let mut gcfg = load_grok_config_table()?;
     apply_provider_to_grok_table(provider, &mut gcfg);
     set_grok_default_if_unset(&mut gcfg, &format!("omgb-{}", provider.id));
-    save_grok_config_table(&gcfg)?;
+    save_grok_config_table_unlocked(&gcfg)?;
     Ok(())
 }
 
-fn remove_provider_from_grok_config(id: &str) -> Result<()> {
-    let mut gcfg = load_grok_config_table()?;
+fn remove_provider_from_grok_table(id: &str, gcfg: &mut toml::map::Map<String, toml::Value>) {
     let model_key = format!("omgb-{id}");
     if let Some(toml::Value::Table(m)) = gcfg.get_mut("model") {
         m.remove(&model_key);
@@ -1011,8 +1646,6 @@ fn remove_provider_from_grok_config(id: &str) -> Result<()> {
             m.remove("default");
         }
     }
-    save_grok_config_table(&gcfg)?;
-    Ok(())
 }
 
 fn load_grok_config_table() -> Result<toml::map::Map<String, toml::Value>> {
@@ -1028,17 +1661,10 @@ fn load_grok_config_table() -> Result<toml::map::Map<String, toml::Value>> {
         .ok_or_else(|| anyhow::anyhow!("grok config is not a table"))
 }
 
-fn save_grok_config_table(table: &toml::map::Map<String, toml::Value>) -> Result<()> {
+fn save_grok_config_table_unlocked(table: &toml::map::Map<String, toml::Value>) -> Result<()> {
     let path = grok_config_path();
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("grok config path has no parent directory"))?;
-    std::fs::create_dir_all(parent)?;
     let raw = toml::to_string_pretty(&toml::Value::Table(table.clone()))?;
-    let tmp = parent.join(format!("config.toml.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, raw)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    write_file_atomic(&path, raw, true)
 }
 
 async fn discover_one(base_url: &str, name: &str) -> Option<(String, String, Vec<ModelListEntry>)> {
@@ -1087,6 +1713,7 @@ pub async fn discover_local_models(
 pub fn add_discovered_providers(
     discovered: &[(String, String, Vec<ModelListEntry>)],
 ) -> Result<()> {
+    let _lock = provider_mutation_lock()?;
     let mut cfg = load_omg_config()?;
     let mut first_id: Option<String> = None;
     for (provider, base_url, models) in discovered {
@@ -1118,7 +1745,7 @@ pub fn add_discovered_providers(
     {
         cfg.default_model = Some(format!("omgb-{id}"));
     }
-    save_omg_config(&cfg)?;
+    save_omg_config_unlocked(&cfg)?;
 
     let mut gcfg = load_grok_config_table()?;
     for p in cfg.providers.values() {
@@ -1127,7 +1754,7 @@ pub fn add_discovered_providers(
     if let Some(default) = cfg.default_model.as_deref() {
         set_grok_default_if_unset(&mut gcfg, default);
     }
-    save_grok_config_table(&gcfg)?;
+    save_grok_config_table_unlocked(&gcfg)?;
     Ok(())
 }
 
@@ -1414,12 +2041,152 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conditional_atomic_write_publishes_only_over_expected_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.rs");
+        std::fs::write(&path, b"original").unwrap();
+        write_file_atomic_if_unchanged(&path, b"original", b"updated").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"updated");
+
+        let error = write_file_atomic_if_unchanged(&path, b"stale", b"clobber").unwrap_err();
+        assert!(error.to_string().contains("changed during atomic publish"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"updated");
+    }
+
+    #[test]
     fn test_sanitize_provider_id() {
         assert_eq!(sanitize_provider_id("OpenAI"), "openai");
         assert_eq!(sanitize_provider_id("my provider!"), "my-provider");
         assert_eq!(sanitize_provider_id("-llama-cpp-"), "llama-cpp");
         assert_eq!(sanitize_provider_id("café"), "caf");
         assert!(sanitize_provider_id("---").is_empty());
+    }
+
+    #[test]
+    fn effective_provider_loads_from_grok_model_table() {
+        let value: toml::Value = toml::from_str(
+            r#"
+                [model.omgb-localtest]
+                name = "Local Runtime Test"
+                model = "runtime-test-model"
+                base_url = "http://127.0.0.1:55478/v1"
+                api_backend = "chat_completions"
+                env_key = "OMGB_LOCALTEST_API_KEY"
+                context_window = 128000
+                auto_compact_threshold_percent = 80
+                temperature = 0.2
+                top_p = 0.9
+                max_completion_tokens = 4096
+
+                [model.omgb-localtest.extra_headers]
+                X-Test = "safe-value"
+            "#,
+        )
+        .unwrap();
+        let provider = provider_from_grok_table("localtest", value.as_table().unwrap())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(provider.id, "localtest");
+        assert_eq!(provider.model, "runtime-test-model");
+        assert_eq!(provider.base_url, "http://127.0.0.1:55478/v1");
+        assert_eq!(
+            provider.env_key,
+            Some(vec!["OMGB_LOCALTEST_API_KEY".into()])
+        );
+        assert_eq!(provider.context_window, Some(128_000));
+        assert_eq!(provider.auto_compact_threshold_percent, Some(80));
+        assert_eq!(provider.temperature, Some(0.2));
+        assert_eq!(provider.top_p, Some(0.9));
+        assert_eq!(provider.max_completion_tokens, Some(4096));
+        assert_eq!(
+            provider
+                .extra_headers
+                .as_ref()
+                .and_then(|headers| headers.get("X-Test"))
+                .map(String::as_str),
+            Some("safe-value")
+        );
+    }
+
+    #[test]
+    fn effective_provider_list_merges_grok_models_and_prefers_omg_config() {
+        let grok: toml::Value = toml::from_str(
+            r#"
+                [model.omgb-shared]
+                name = "Grok copy"
+                model = "stale-model"
+                base_url = "https://stale.example/v1"
+
+                [model.omgb-zebra]
+                name = "Zebra"
+                model = "zebra-model"
+                base_url = "https://zebra.example/v1"
+            "#,
+        )
+        .unwrap();
+        let explicit = ProviderConfig {
+            id: "shared".into(),
+            name: "Explicit copy".into(),
+            model: "current-model".into(),
+            base_url: "https://current.example/v1".into(),
+            api_backend: None,
+            env_key: None,
+            extra_headers: None,
+            context_window: None,
+            auto_compact_threshold_percent: None,
+            temperature: None,
+            top_p: None,
+            max_completion_tokens: None,
+        };
+        let cfg = OmgConfig {
+            providers: HashMap::from([("shared".into(), explicit)]),
+            ..OmgConfig::default()
+        };
+
+        let providers = effective_providers_from_tables(&cfg, grok.as_table().unwrap()).unwrap();
+
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared", "zebra"]
+        );
+        assert_eq!(providers[0].model, "current-model");
+        assert_eq!(providers[1].model, "zebra-model");
+    }
+
+    #[test]
+    fn effective_provider_list_rejects_invalid_grok_provider_id() {
+        let grok: toml::Value = toml::from_str(
+            r#"
+                [model."omgb-Bad Id"]
+                model = "test"
+                base_url = "https://example.com/v1"
+            "#,
+        )
+        .unwrap();
+
+        assert!(
+            effective_providers_from_tables(&OmgConfig::default(), grok.as_table().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn effective_provider_rejects_unsafe_env_key() {
+        let value: toml::Value = toml::from_str(
+            r#"
+                [model.omgb-bad]
+                model = "test"
+                base_url = "http://127.0.0.1:1/v1"
+                env_key = "PATH"
+            "#,
+        )
+        .unwrap();
+
+        assert!(provider_from_grok_table("bad", value.as_table().unwrap()).is_err());
     }
 
     #[test]
@@ -1478,6 +2245,182 @@ mod tests {
     }
 
     #[test]
+    fn openai_provider_rejects_frontend_oauth_token_as_api_key() {
+        let provider = ProviderConfig {
+            id: "codex".into(),
+            name: "OpenAI Codex".into(),
+            model: "codex-mini-latest".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_backend: Some("responses".into()),
+            env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            extra_headers: None,
+            context_window: None,
+            auto_compact_threshold_percent: None,
+            temperature: None,
+            top_p: None,
+            max_completion_tokens: None,
+        };
+        let env = HashMap::from([("OPENAI_API_KEY".into(), "fe_oa_not_a_platform_key".into())]);
+
+        assert_eq!(
+            resolve_api_key_with_maps(&provider, &env, &HashMap::new()),
+            None
+        );
+        assert!(api_key_value_is_usable(&provider, "sk-proj-valid-shape"));
+    }
+
+    #[test]
+    fn concurrent_api_key_writes_preserve_every_entry() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let tmp =
+            std::env::temp_dir().join(format!("omgb-provider-env-test-{}", uuid::Uuid::new_v4()));
+        set_omg_home_for_tests(Some(tmp.clone()));
+
+        let writers: Vec<_> = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    write_api_key(
+                        &format!("provider-{index}"),
+                        None,
+                        &format!("secret-{index}"),
+                    )
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+
+        let entries = load_env_file().unwrap();
+        for index in 0..8 {
+            assert_eq!(
+                entries.get(&format!("OMGB_PROVIDER_{index}_API_KEY")),
+                Some(&format!("secret-{index}"))
+            );
+        }
+
+        set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    fn test_provider(id: &str) -> ProviderConfig {
+        ProviderConfig {
+            id: id.into(),
+            name: id.into(),
+            model: "test-model".into(),
+            base_url: "https://example.com/v1".into(),
+            api_backend: None,
+            env_key: None,
+            extra_headers: None,
+            context_window: Some(128_000),
+            auto_compact_threshold_percent: Some(80),
+            temperature: None,
+            top_p: None,
+            max_completion_tokens: None,
+        }
+    }
+
+    #[test]
+    fn ensure_provider_repairs_a_missing_grok_entry() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "omgb-provider-reconcile-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let omg = root.join("omg");
+        let grok = root.join("grok");
+        set_omg_home_for_tests(Some(omg));
+        set_grok_home_for_tests(Some(grok));
+        let provider = test_provider("repair");
+        save_omg_config(&OmgConfig {
+            default_model: Some("omgb-repair".into()),
+            providers: HashMap::from([("repair".into(), provider)]),
+            relay: None,
+        })
+        .unwrap();
+
+        ensure_provider_configured("repair").unwrap();
+        assert!(provider_from_grok_config("repair").unwrap().is_some());
+
+        set_grok_home_for_tests(None);
+        set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn set_default_provider_replaces_the_existing_grok_default() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "omgb-provider-default-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        set_omg_home_for_tests(Some(root.join("omg")));
+        set_grok_home_for_tests(Some(root.join("grok")));
+        save_omg_config(&OmgConfig {
+            default_model: None,
+            providers: HashMap::from([("next".into(), test_provider("next"))]),
+            relay: None,
+        })
+        .unwrap();
+        let mut grok = toml::map::Map::new();
+        let mut models = toml::map::Map::new();
+        models.insert("default".into(), toml::Value::String("old-model".into()));
+        grok.insert("models".into(), toml::Value::Table(models));
+        save_grok_config_table_unlocked(&grok).unwrap();
+
+        set_default_provider("next").unwrap();
+        assert_eq!(
+            configured_default_model().unwrap().as_deref(),
+            Some("omgb-next")
+        );
+        assert!(provider_from_grok_config("next").unwrap().is_some());
+
+        set_grok_home_for_tests(None);
+        set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_execution_fingerprint_changes_with_runtime_configuration() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "omgb-provider-fingerprint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        set_omg_home_for_tests(Some(root.join("omg")));
+        set_grok_home_for_tests(Some(root.join("grok")));
+        let mut provider = test_provider("fingerprint");
+        save_omg_config(&OmgConfig {
+            default_model: None,
+            providers: HashMap::from([("fingerprint".into(), provider.clone())]),
+            relay: None,
+        })
+        .unwrap();
+        let before = provider_execution_fingerprint("omgb-fingerprint")
+            .unwrap()
+            .unwrap();
+        provider.base_url = "https://changed.example/v1".into();
+        save_omg_config(&OmgConfig {
+            default_model: None,
+            providers: HashMap::from([("fingerprint".into(), provider)]),
+            relay: None,
+        })
+        .unwrap();
+        let after = provider_execution_fingerprint("omgb-fingerprint")
+            .unwrap()
+            .unwrap();
+        assert_ne!(before, after);
+        assert!(
+            prepare_provider_execution("omgb-fingerprint", Some(&before)).is_err(),
+            "a planned turn must reject a provider changed before execution"
+        );
+
+        set_grok_home_for_tests(None);
+        set_omg_home_for_tests(None);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn test_ensure_provider_configured_rejects_empty_model() {
         let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let tmp =
@@ -1512,5 +2455,33 @@ mod tests {
         assert!(err.to_string().contains("no configured model"));
         crate::providers::set_omg_home_for_tests(None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_directory_keeps_existing_and_new_children_accessible() {
+        let root = std::env::temp_dir().join(format!(
+            "omgb-private-directory-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing.lock");
+        std::fs::write(&existing, b"before").unwrap();
+
+        restrict_omg_directory_permissions(&root).unwrap();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&existing)
+            .unwrap();
+        let new_child = root.join("new.lock");
+        std::fs::write(&new_child, b"after").unwrap();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&new_child)
+            .unwrap();
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

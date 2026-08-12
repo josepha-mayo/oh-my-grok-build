@@ -3,6 +3,49 @@
 //! [`acp::Agent`] trait implementation for [`MvpAgent`].
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
+
+struct ReconnectGatewayGuard {
+    enabled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl ReconnectGatewayGuard {
+    fn disable(enabled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        if let Some(flag) = &enabled {
+            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self { enabled }
+    }
+
+    fn reenable(&mut self) {
+        if let Some(flag) = self.enabled.take() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for ReconnectGatewayGuard {
+    fn drop(&mut self) {
+        self.reenable();
+    }
+}
+
+#[cfg(test)]
+mod reconnect_gateway_guard_tests {
+    use super::ReconnectGatewayGuard;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn reconnect_error_paths_reenable_the_existing_gateway() {
+        let enabled = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = ReconnectGatewayGuard::disable(Some(enabled.clone()));
+            assert!(!enabled.load(Ordering::Relaxed));
+        }
+        assert!(enabled.load(Ordering::Relaxed));
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for MvpAgent {
     /// In the meta, we provide
@@ -912,6 +955,25 @@ impl acp::Agent for MvpAgent {
             id: session_id.clone(),
             cwd: cwd.as_str().to_owned(),
         };
+        if self.sessions.borrow().contains_key(&session_id) {
+            return Err(acp::Error::invalid_params().data(format!(
+                "session ID {} is already active",
+                session_id.0
+            )));
+        }
+        let session_reservation = if !is_chat_kind {
+            Some(crate::session::persistence::reserve_new_session_dir(&session_info).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    acp::Error::invalid_params()
+                        .data(format!("session ID {} already exists", session_id.0))
+                } else {
+                    acp::Error::internal_error()
+                        .data(format!("failed to reserve session ID {}: {error}", session_id.0))
+                }
+            })?)
+        } else {
+            None
+        };
         let mut model_agent_type: Option<String> = None;
         let mut session_sampling_override: Option<SamplingConfig> = None;
         let mut disallowed_custom: Option<String> = None;
@@ -1026,6 +1088,13 @@ impl acp::Agent for MvpAgent {
                 .await
                 .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?
         };
+        let writer_lease = if let Some(reservation) = session_reservation {
+            Some(reservation
+                .commit()
+                .map_err(|error| crate::session::persistence::io_error_to_acp(&error))?)
+        } else {
+            None
+        };
         self.session_turn_numbers.borrow_mut().insert(session_id.clone(), 0u64);
         let chat_history = vec![];
         let client_code_nav_enabled = arguments
@@ -1080,7 +1149,7 @@ impl acp::Agent for MvpAgent {
                         prompt_display_cwd: None,
                     }
             };
-            self.spawn_and_register_session(init, spawn_opts).await
+            self.spawn_and_register_session(init, spawn_opts, writer_lease).await
         };
         spawn_res?;
         tracing::debug!(session_id = % session_id.0, "new_session: spawn_session_actor");
@@ -1209,9 +1278,15 @@ impl acp::Agent for MvpAgent {
         &self,
         arguments: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
-        let _load_guard = self.begin_session_load(&arguments.session_id);
+        let _load_guard = self.begin_session_load(&arguments.session_id).await;
         self.sweep_dead_sessions();
-        self.drain_old_session_thread(&arguments.session_id).await;
+        if !self.sessions.borrow().contains_key(&arguments.session_id)
+            && !self.drain_old_session_thread(&arguments.session_id).await
+        {
+            return Err(acp::Error::internal_error().data(
+                "the previous session actor is still shutting down; retry session/load",
+            ));
+        }
         tracing::debug!("Received load session request {arguments:?}");
         let init = self
             .initialize_request
@@ -1266,6 +1341,14 @@ impl acp::Agent for MvpAgent {
             id: session_id.clone(),
             cwd: cwd.as_str().to_owned(),
         };
+        let writer_lease = if self.sessions.borrow().contains_key(&session_id) {
+            None
+        } else {
+            Some(
+                crate::session::persistence::acquire_session_writer_lease(&session_info)
+                    .map_err(|error| crate::session::persistence::io_error_to_acp(&error))?,
+            )
+        };
         let current_session_dir = crate::session::persistence::session_dir(
             &session_info,
         );
@@ -1275,24 +1358,25 @@ impl acp::Agent for MvpAgent {
             );
         });
         let session_exists = self.sessions.borrow().contains_key(&session_id);
+        let reconnect_gateway = self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .map(|handle| handle.gateway_enabled.clone());
+        let mut reconnect_gateway = ReconnectGatewayGuard::disable(reconnect_gateway);
         if session_exists {
             tracing::info!(
                 session_id = % session_id.0,
                 "Reconnect detected: flushing persistence buffer before replay"
             );
-            if let Some(handle) = self.sessions.borrow().get(&session_id) {
-                handle
-                    .gateway_enabled
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
             let mut flush_timer = crate::instrumentation_timer!(
                 "session.reconnect_flush"
             );
             flush_timer.with_field("session_id", session_id.0.as_ref());
             if let Err(reason) = self.flush_session(&session_id).await {
-                tracing::warn!(
-                    session_id = % session_id.0, reason, "Reconnect flush failed"
-                );
+                return Err(acp::Error::internal_error().data(format!(
+                    "could not durably flush the active session before replay ({reason}); retry session/load"
+                )));
             }
             drop(flush_timer);
         }
@@ -1518,8 +1602,15 @@ impl acp::Agent for MvpAgent {
                 .await?;
             let cursor_mark_replay = cursor.is_none();
             let _timer = crate::instrumentation_timer!("session.delta_flush_replay");
-            let completions = match self.flush_session(&session_id).await {
-                Ok(()) => {
+            let completions = self
+                .flush_session(&session_id)
+                .await
+                .map_err(|reason| {
+                    acp::Error::internal_error().data(format!(
+                        "could not durably flush the session after replay ({reason}); retry session/load"
+                    ))
+                })
+                .map(|()| {
                     self.replay_session_updates_from_offset_enqueue(
                         &session_id,
                         &updates_file_path,
@@ -1528,20 +1619,13 @@ impl acp::Agent for MvpAgent {
                         target_client_id.as_ref(),
                         cursor_mark_replay,
                     )
-                }
-                Err(reason) => {
-                    tracing::warn!(
-                        session_id = % session_id.0, reason,
-                        "Post-replay flush failed, skipping delta replay"
-                    );
-                    Vec::new()
-                }
-            };
+                })?;
             (tokens, completions, unfinished_subagents)
         };
         if let Some(handle) = self.sessions.borrow().get(&session_id) {
             handle.gateway_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        reconnect_gateway.reenable();
         for rx in delta_completions {
             let _ = rx.await;
         }
@@ -1619,6 +1703,7 @@ impl acp::Agent for MvpAgent {
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd,
                     },
+                    writer_lease,
                 )
                 .await?;
             drop(spawn_timer);

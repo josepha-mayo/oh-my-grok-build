@@ -305,7 +305,7 @@ Additional requirements / notices:
   Upstream license expression: MIT OR Apache-2.0. For this distribution, obligations are satisfied under: MIT.
 
 --------------------------------------------------------------------------------
-anyhow 1.0.100
+anyhow 1.0.103
 --------------------------------------------------------------------------------
 Source:  https://github.com/dtolnay/anyhow
 License: MIT  (upstream declares: MIT OR Apache-2.0)
@@ -3943,7 +3943,7 @@ Additional requirements / notices:
   Upstream license expression: Apache-2.0 OR MIT. For this distribution, obligations are satisfied under: MIT.
 
 --------------------------------------------------------------------------------
-event-listener 5.4.1
+event-listener 5.4.2
 --------------------------------------------------------------------------------
 Source:  https://github.com/smol-rs/event-listener
 License: MIT  (upstream declares: Apache-2.0 OR MIT)
@@ -4939,7 +4939,7 @@ Additional requirements / notices:
   Upstream license expression: MIT OR Apache-2.0. For this distribution, obligations are satisfied under: MIT.
 
 --------------------------------------------------------------------------------
-git2 0.20.2
+git2 0.21.0
 --------------------------------------------------------------------------------
 Source:  https://github.com/rust-lang/git2-rs
 License: MIT  (upstream declares: MIT OR Apache-2.0)
@@ -7142,7 +7142,7 @@ Additional requirements / notices:
   Upstream license expression: MIT OR Apache-2.0. For this distribution, obligations are satisfied under: MIT.
 
 --------------------------------------------------------------------------------
-libgit2-sys 0.18.2+1.9.1
+libgit2-sys 0.18.7+1.9.6
 --------------------------------------------------------------------------------
 Source:  https://github.com/rust-lang/git2-rs
 License: MIT  (upstream declares: MIT OR Apache-2.0)
@@ -9111,7 +9111,7 @@ Additional requirements / notices:
   Upstream license expression: MIT OR Apache-2.0. For this distribution, obligations are satisfied under: MIT.
 
 --------------------------------------------------------------------------------
-pdf_oxide 0.3.46
+pdf_oxide 0.3.74
 --------------------------------------------------------------------------------
 Source:  https://github.com/yfedoseev/pdf_oxide
 License: MIT  (upstream declares: MIT OR Apache-2.0)
@@ -16678,7 +16678,7 @@ PART II — LICENSE TEXTS
 
 Original license texts referenced by Part I. Primary source for SPDX licenses:
 https://github.com/spdx/license-list-data (text/ directory).
-libgit2 COPYING: https://github.com/libgit2/libgit2/blob/v1.9.1/COPYING
+libgit2 COPYING: https://github.com/libgit2/libgit2/blob/v1.9.6/COPYING
 
 
 ################################################################################
@@ -17478,7 +17478,7 @@ signature of Ty Coon, 1 April 1989 Ty Coon, President of Vice
 
 ################################################################################
 # libgit2 COPYING (GPL-2.0 WITH linking exception) — vendored C library
-# Source: https://raw.githubusercontent.com/libgit2/libgit2/v1.9.1/COPYING
+# Source: https://raw.githubusercontent.com/libgit2/libgit2/v1.9.6/COPYING
 ################################################################################
 
 libgit2 is Copyright (C) the libgit2 contributors,

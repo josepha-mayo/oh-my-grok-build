@@ -4,11 +4,12 @@
 //! JSON-RPC stdio lifecycles.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -17,6 +18,9 @@ use url::Url;
 use crate::args::{DapCommand, LspCommand, LspStartArgs};
 
 const MAX_JSONRPC_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+const LSP_TRANSACTION_DIR: &str = ".omgb-lsp-transaction";
+const MAX_TRANSACTION_ENTRIES: usize = 1024;
+const MAX_TRANSACTION_FILE_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Server {
@@ -295,21 +299,28 @@ impl JsonRpcClient {
     }
 }
 
-fn workspace_edit_has_uri(edit: &serde_json::Value, uri: &str) -> bool {
-    if let Some(changes) = edit.get("changes").and_then(|c| c.as_object())
-        && changes.contains_key(uri)
-    {
-        return true;
+fn rename_workspace_edit(response: &serde_json::Value) -> Result<&serde_json::Value> {
+    if let Some(error) = response.get("error") {
+        let code = error.get("code").and_then(|value| value.as_i64());
+        let message = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("language server rejected the rename");
+        bail!(
+            "language server rename failed{}: {message}",
+            code.map_or_else(String::new, |code| format!(" ({code})"))
+        );
     }
-    if let Some(docs) = edit.get("documentChanges").and_then(|d| d.as_array()) {
-        return docs.iter().any(|d| {
-            d.get("textDocument")
-                .and_then(|t| t.get("uri"))
-                .and_then(|u| u.as_str())
-                == Some(uri)
-        });
+    let result = response
+        .get("result")
+        .context("language server rename response is missing result")?;
+    if result.is_null() {
+        bail!("language server produced no semantic rename edit");
     }
-    false
+    if !result.is_object() {
+        bail!("language server returned an invalid semantic rename edit");
+    }
+    Ok(result)
 }
 
 pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> Result<()> {
@@ -329,6 +340,10 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
         .to_string();
     let root = dunce::canonicalize(std::env::current_dir()?)
         .with_context(|| "failed to canonicalize workspace root")?;
+    let recovery_root = root.clone();
+    tokio::task::spawn_blocking(move || recover_workspace_transaction(&recovery_root))
+        .await
+        .context("workspace edit recovery task panicked")??;
     let root_uri = Url::from_file_path(&root)
         .map_err(|_| anyhow::anyhow!("invalid root path"))?
         .to_string();
@@ -390,26 +405,8 @@ pub async fn lsp_refactor(file_path: &Path, old_name: &str, new_name: &str) -> R
         )
         .await?;
 
-    let result = rename_resp.get("result");
-    let result_has_edits = result.is_some_and(|r| workspace_edit_has_uri(r, &uri));
-    let edit = if result_has_edits {
-        result.cloned().unwrap()
-    } else {
-        let end_char = character + utf16_len(old_name);
-        json!({
-            "changes": {
-                (uri): [{
-                    "range": {
-                        "start": {"line": line, "character": character},
-                        "end": {"line": line, "character": end_char}
-                    },
-                    "newText": new_name
-                }]
-            }
-        })
-    };
-
-    apply_workspace_edit(&edit, &root).await?;
+    let edit = rename_workspace_edit(&rename_resp)?;
+    apply_workspace_edit(edit, &root).await?;
     Ok(())
 }
 
@@ -509,7 +506,7 @@ fn resolve_program_path(program: &Path) -> Result<PathBuf> {
         .with_context(|| format!("program path is not resolvable: {}", candidate.display()))
 }
 
-fn same_executable(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_executable(a: &Path, b: &Path) -> bool {
     match (dunce::canonicalize(a), dunce::canonicalize(b)) {
         (Ok(a), Ok(b)) => {
             if cfg!(windows) {
@@ -555,8 +552,8 @@ fn is_process_owned_by_current_user(pid: u32) -> Result<bool> {
     Ok(uid == me)
 }
 
-#[cfg(unix)]
-fn process_image_path(pid: u32) -> Result<PathBuf> {
+#[cfg(target_os = "linux")]
+pub(crate) fn process_image_path(pid: u32) -> Result<PathBuf> {
     let exe = format!("/proc/{pid}/exe");
     if let Ok(path) = std::fs::read_link(&exe) {
         return Ok(path);
@@ -570,83 +567,89 @@ fn process_image_path(pid: u32) -> Result<PathBuf> {
     Ok(PathBuf::from(first))
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn process_image_path(pid: u32) -> Result<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let written =
+        unsafe { libc::proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if written <= 0 {
+        bail!("proc_pidpath({pid}) failed");
+    }
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(written as usize);
+    Ok(PathBuf::from(std::ffi::OsStr::new(
+        std::str::from_utf8(&buffer[..end]).context("process path is not UTF-8")?,
+    )))
+}
+
 #[cfg(windows)]
 fn is_process_owned_by_current_user(pid: u32) -> Result<bool> {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
     use windows::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     unsafe {
-        fn sid_ptr(buf: &[u8]) -> windows::Win32::Security::PSID {
-            let token_user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
-            token_user.User.Sid
-        }
-
-        fn sid_bytes(sid: windows::Win32::Security::PSID) -> Vec<u8> {
-            let ptr = sid.0 as *const u8;
-            let count = unsafe { *ptr.add(1) } as usize;
-            let len = 2 + 6 + count * 4;
-            unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
-        }
-
         let mut current_token = windows::Win32::Foundation::HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut current_token)
-            .map_err(|e| anyhow::anyhow!("OpenProcessToken(current): {e}"))?;
-        let mut current_len = 0u32;
-        let _ = GetTokenInformation(current_token, TokenUser, None, 0, &mut current_len);
-        let mut current_buf = vec![0u8; current_len as usize];
-        GetTokenInformation(
-            current_token,
-            TokenUser,
-            Some(current_buf.as_mut_ptr() as *mut _),
-            current_len,
-            &mut current_len,
-        )
-        .map_err(|e| anyhow::anyhow!("GetTokenInformation(current): {e}"))?;
-        let current_sid = sid_ptr(&current_buf);
-
-        let handle = OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
-            false,
-            pid,
-        )
-        .map_err(|e| anyhow::anyhow!("OpenProcess({pid}): {e}"))?;
+        let mut handle = windows::Win32::Foundation::HANDLE::default();
         let mut target_token = windows::Win32::Foundation::HANDLE::default();
-        OpenProcessToken(handle, TOKEN_QUERY, &mut target_token).map_err(|e| {
-            let _ = CloseHandle(handle);
-            anyhow::anyhow!("OpenProcessToken({pid}): {e}")
-        })?;
-        let mut target_len = 0u32;
-        let _ = GetTokenInformation(target_token, TokenUser, None, 0, &mut target_len);
-        let mut target_buf = vec![0u8; target_len as usize];
-        GetTokenInformation(
-            target_token,
-            TokenUser,
-            Some(target_buf.as_mut_ptr() as *mut _),
-            target_len,
-            &mut target_len,
-        )
-        .map_err(|e| {
-            let _ = CloseHandle(target_token);
-            let _ = CloseHandle(handle);
-            anyhow::anyhow!("GetTokenInformation({pid}): {e}")
-        })?;
-        let target_sid = sid_ptr(&target_buf);
 
-        let equal = sid_bytes(current_sid) == sid_bytes(target_sid);
+        let result = (|| {
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut current_token)
+                .map_err(|e| anyhow::anyhow!("OpenProcessToken(current): {e}"))?;
+            let mut current_len = 0u32;
+            let _ = GetTokenInformation(current_token, TokenUser, None, 0, &mut current_len);
+            let mut current_buf = vec![0u8; current_len as usize];
+            GetTokenInformation(
+                current_token,
+                TokenUser,
+                Some(current_buf.as_mut_ptr() as *mut _),
+                current_len,
+                &mut current_len,
+            )
+            .map_err(|e| anyhow::anyhow!("GetTokenInformation(current): {e}"))?;
+            let current_sid = crate::win_sid::sid_ptr(&current_buf)?;
 
-        let _ = CloseHandle(target_token);
-        let _ = CloseHandle(handle);
-        let _ = CloseHandle(current_token);
-        Ok(equal)
+            handle = OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            )
+            .map_err(|e| anyhow::anyhow!("OpenProcess({pid}): {e}"))?;
+            OpenProcessToken(handle, TOKEN_QUERY, &mut target_token)
+                .map_err(|e| anyhow::anyhow!("OpenProcessToken({pid}): {e}"))?;
+            let mut target_len = 0u32;
+            let _ = GetTokenInformation(target_token, TokenUser, None, 0, &mut target_len);
+            let mut target_buf = vec![0u8; target_len as usize];
+            GetTokenInformation(
+                target_token,
+                TokenUser,
+                Some(target_buf.as_mut_ptr() as *mut _),
+                target_len,
+                &mut target_len,
+            )
+            .map_err(|e| anyhow::anyhow!("GetTokenInformation({pid}): {e}"))?;
+            let target_sid = crate::win_sid::sid_ptr(&target_buf)?;
+
+            Ok(crate::win_sid::sid_bytes(&current_buf, current_sid)?
+                == crate::win_sid::sid_bytes(&target_buf, target_sid)?)
+        })();
+
+        for token in [target_token, handle, current_token] {
+            if !token.is_invalid() {
+                let _ = CloseHandle(token);
+            }
+        }
+        result
     }
 }
 
 #[cfg(windows)]
-fn process_image_path(pid: u32) -> Result<PathBuf> {
+pub(crate) fn process_image_path(pid: u32) -> Result<PathBuf> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -673,14 +676,153 @@ fn process_image_path(pid: u32) -> Result<PathBuf> {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn process_start_identity(pid: u32) -> Result<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|error| anyhow::anyhow!("OpenProcess({pid}): {error}"))?;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let result = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let _ = CloseHandle(handle);
+        result.map_err(|error| anyhow::anyhow!("GetProcessTimes({pid}): {error}"))?;
+        Ok(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn process_parent_pid(pid: u32) -> Result<Option<u32>> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .map_err(|error| anyhow::anyhow!("CreateToolhelp32Snapshot: {error}"))?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let result = (|| -> Result<Option<u32>> {
+            Process32FirstW(snapshot, &mut entry)
+                .map_err(|error| anyhow::anyhow!("Process32FirstW: {error}"))?;
+            loop {
+                if entry.th32ProcessID == pid {
+                    return Ok(
+                        (entry.th32ParentProcessID != 0).then_some(entry.th32ParentProcessID)
+                    );
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    return Ok(None);
+                }
+            }
+        })();
+        let _ = CloseHandle(snapshot);
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_start_identity(pid: u32) -> Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| anyhow::anyhow!("invalid /proc process stat"))?;
+    fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow::anyhow!("process start time is missing"))?
+        .parse()
+        .context("parse process start time")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_start_identity(pid: u32) -> Result<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        bail!("proc_pidinfo({pid}) failed");
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(info
+        .pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_parent_pid(pid: u32) -> Result<Option<u32>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| anyhow::anyhow!("invalid /proc process stat"))?;
+    let parent: u32 = fields
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("process parent pid is missing"))?
+        .parse()
+        .context("parse process parent pid")?;
+    Ok((parent != 0).then_some(parent))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_parent_pid(pid: u32) -> Result<Option<u32>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        bail!("proc_pidinfo({pid}) failed");
+    }
+    let parent = unsafe { info.assume_init() }.pbi_ppid;
+    Ok((parent != 0).then_some(parent))
+}
+
 #[cfg(not(any(unix, windows)))]
 fn is_process_owned_by_current_user(_pid: u32) -> Result<bool> {
     bail!("DAP attach is not supported on this platform")
 }
 
-#[cfg(not(any(unix, windows)))]
-fn process_image_path(_pid: u32) -> Result<PathBuf> {
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn process_image_path(_pid: u32) -> Result<PathBuf> {
     bail!("DAP attach is not supported on this platform")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn process_start_identity(_pid: u32) -> Result<u64> {
+    bail!("process start identity is not supported on this platform")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn process_parent_pid(_pid: u32) -> Result<Option<u32>> {
+    bail!("process ancestry is not supported on this platform")
 }
 
 pub async fn run_lsp(cmd: LspCommand) -> Result<()> {
@@ -893,12 +1035,7 @@ fn url_to_path(uri: &str, root: &Path) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
-async fn apply_text_edits_to_path(
-    uri: &str,
-    edits_value: &serde_json::Value,
-    root: &Path,
-) -> Result<()> {
-    let path = url_to_path(uri, root)?;
+fn apply_text_edits(text: &str, edits_value: &serde_json::Value) -> Result<String> {
     let mut edits = edits_value
         .as_array()
         .context("edits must be an array")?
@@ -907,42 +1044,321 @@ async fn apply_text_edits_to_path(
             let range = e.get("range").context("edit missing range")?;
             let start = parse_position(range.get("start").context("start")?)?;
             let end = parse_position(range.get("end").context("end")?)?;
+            if end < start {
+                bail!("edit range end precedes its start");
+            }
             let new_text = e
                 .get("newText")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .context("edit missing newText")?
                 .to_string();
             Ok((start, end, new_text))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut text = tokio::fs::read_to_string(&path).await?;
+    let mut text = text.to_string();
     edits.sort_by(|a, b| b.0.cmp(&a.0));
+    for pair in edits.windows(2) {
+        if pair[1].1 > pair[0].0 {
+            bail!("workspace edit contains overlapping ranges");
+        }
+    }
     for (start, end, new_text) in edits {
         let start_idx = position_to_byte(&text, start)?;
         let end_idx = position_to_byte(&text, end)?;
         text.replace_range(start_idx..end_idx, &new_text);
     }
-    tokio::task::spawn_blocking(move || {
-        crate::providers::write_file_atomic(&path, text.as_bytes(), false)
-    })
-    .await
-    .context("write file task panicked")??;
+    Ok(text)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceTransaction {
+    state: String,
+    entries: Vec<WorkspaceTransactionEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceTransactionEntry {
+    path: String,
+    backup: String,
+    original_hash: String,
+    updated_hash: String,
+}
+
+fn transaction_dir(root: &Path) -> PathBuf {
+    root.join(LSP_TRANSACTION_DIR)
+}
+
+fn reject_link(path: &Path, want_dir: bool) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect transaction path {}", path.display()))?;
+    #[cfg(windows)]
+    let reparse = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x0000_0400 != 0
+    };
+    #[cfg(not(windows))]
+    let reparse = false;
+    if metadata.file_type().is_symlink() || reparse || metadata.is_dir() != want_dir {
+        bail!("unsafe transaction path: {}", path.display());
+    }
     Ok(())
 }
 
+fn safe_transaction_dir(root: &Path, create: bool) -> Result<PathBuf> {
+    let root = dunce::canonicalize(root)?;
+    let dir = transaction_dir(&root);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => reject_link(&dir, true)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            std::fs::create_dir(&dir)
+                .with_context(|| format!("create transaction directory {}", dir.display()))?;
+            crate::providers::restrict_omg_directory_permissions(&dir)?;
+            reject_link(&dir, true)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(dir),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(dir)
+}
+
+fn transaction_file(dir: &Path) -> PathBuf {
+    dir.join("journal.json")
+}
+
+fn checked_transaction_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        bail!("invalid transaction target path");
+    }
+    let path = root.join(relative);
+    let canonical = dunce::canonicalize(&path)
+        .with_context(|| format!("transaction target is missing: {}", path.display()))?;
+    if !canonical.starts_with(root) || canonical.starts_with(transaction_dir(root)) {
+        bail!(
+            "transaction target is outside workspace: {}",
+            path.display()
+        );
+    }
+    let mut current = root.to_path_buf();
+    let count = relative.components().count();
+    for (index, component) in relative.components().enumerate() {
+        let Component::Normal(part) = component else {
+            unreachable!()
+        };
+        current.push(part);
+        reject_link(&current, index + 1 != count)?;
+    }
+    Ok(canonical)
+}
+
+fn file_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+fn read_transaction_file(path: &Path) -> Result<Vec<u8>> {
+    reject_link(path, false)?;
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() as usize > MAX_TRANSACTION_FILE_SIZE {
+        bail!("transaction file is too large: {}", path.display());
+    }
+    std::fs::read(path).with_context(|| format!("read transaction file {}", path.display()))
+}
+
+fn write_transaction(dir: &Path, transaction: &WorkspaceTransaction) -> Result<()> {
+    let raw = serde_json::to_vec(transaction)?;
+    if raw.len() > MAX_TRANSACTION_FILE_SIZE {
+        bail!("transaction journal is too large");
+    }
+    crate::providers::write_file_atomic(&transaction_file(dir), raw, true)
+}
+
+fn rollback_transaction(root: &Path, transaction: &WorkspaceTransaction) -> Result<()> {
+    let dir = safe_transaction_dir(root, false)?;
+    let mut conflicts = Vec::new();
+    for entry in transaction.entries.iter().rev() {
+        let path = checked_transaction_path(root, &entry.path)?;
+        let backup = dir.join(&entry.backup);
+        if !matches!(
+            Path::new(&entry.backup).components().next(),
+            Some(Component::Normal(_))
+        ) || Path::new(&entry.backup).components().count() != 1
+        {
+            bail!("invalid transaction backup path");
+        }
+        let original = read_transaction_file(&backup)?;
+        if file_hash(&original) != entry.original_hash {
+            bail!("transaction backup checksum mismatch: {}", backup.display());
+        }
+        let current = std::fs::read(&path)?;
+        if file_hash(&current) == entry.updated_hash {
+            crate::providers::write_file_atomic_if_unchanged(&path, &current, &original)?;
+        } else if file_hash(&current) != entry.original_hash {
+            conflicts.push(path.display().to_string());
+        }
+    }
+    if !conflicts.is_empty() {
+        bail!(
+            "incomplete workspace edit conflicts with external changes: {}",
+            conflicts.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn remove_transaction(root: &Path) -> Result<()> {
+    let dir = safe_transaction_dir(root, false)?;
+    if !dir.exists() {
+        return Ok(());
+    }
+    reject_link(&dir, true)?;
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        reject_link(&path, false)?;
+        std::fs::remove_file(path)?;
+    }
+    std::fs::remove_dir(&dir)?;
+    #[cfg(unix)]
+    std::fs::File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+fn recover_workspace_transaction(root: &Path) -> Result<()> {
+    let dir = safe_transaction_dir(root, false)?;
+    let journal = transaction_file(&dir);
+    match std::fs::symlink_metadata(&journal) {
+        Ok(_) => reject_link(&journal, false)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if dir.exists() {
+                remove_transaction(root)?;
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let raw = read_transaction_file(&journal)?;
+    let transaction: WorkspaceTransaction =
+        serde_json::from_slice(&raw).context("parse transaction journal")?;
+    if !matches!(transaction.state.as_str(), "prepared" | "applying")
+        || transaction.entries.is_empty()
+        || transaction.entries.len() > MAX_TRANSACTION_ENTRIES
+    {
+        bail!("invalid incomplete workspace edit journal");
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let mut backups = std::collections::BTreeSet::new();
+    if transaction
+        .entries
+        .iter()
+        .any(|entry| !paths.insert(&entry.path) || !backups.insert(&entry.backup))
+    {
+        bail!("invalid incomplete workspace edit journal");
+    }
+    if transaction.state == "applying" {
+        rollback_transaction(root, &transaction)?;
+    }
+    remove_transaction(root)
+}
+
+fn commit_workspace_edit(root: &Path, writes: Vec<(PathBuf, (String, String))>) -> Result<()> {
+    recover_workspace_transaction(root)?;
+    if writes.is_empty() {
+        bail!("language server produced an empty semantic rename edit");
+    }
+    if writes.len() > MAX_TRANSACTION_ENTRIES {
+        bail!("workspace edit has too many files");
+    }
+    let dir = safe_transaction_dir(root, true)?;
+    let mut entries = Vec::with_capacity(writes.len());
+    for (index, (path, (original, updated))) in writes.iter().enumerate() {
+        if original.len() > MAX_TRANSACTION_FILE_SIZE || updated.len() > MAX_TRANSACTION_FILE_SIZE {
+            bail!(
+                "workspace edit file exceeds transaction size limit: {}",
+                path.display()
+            );
+        }
+        let relative = path
+            .strip_prefix(root)
+            .context("workspace edit target is outside root")?;
+        let path = checked_transaction_path(root, &relative.to_string_lossy())?;
+        let current = std::fs::read_to_string(&path)?;
+        if current != *original {
+            remove_transaction(root)?;
+            bail!(
+                "workspace edit source changed before commit at {}",
+                path.display()
+            );
+        }
+        let backup = format!("backup-{index}.txt");
+        crate::providers::write_file_atomic(&dir.join(&backup), original.as_bytes(), true)?;
+        entries.push(WorkspaceTransactionEntry {
+            path: relative.to_string_lossy().to_string(),
+            backup,
+            original_hash: file_hash(original.as_bytes()),
+            updated_hash: file_hash(updated.as_bytes()),
+        });
+    }
+    let mut transaction = WorkspaceTransaction {
+        state: "prepared".into(),
+        entries,
+    };
+    write_transaction(&dir, &transaction)?;
+    transaction.state = "applying".into();
+    write_transaction(&dir, &transaction)?;
+    for (path, (original, updated)) in &writes {
+        let current = std::fs::read_to_string(path)
+            .with_context(|| format!("recheck {} before workspace edit", path.display()))?;
+        if current != *original {
+            let rollback = rollback_transaction(root, &transaction);
+            match rollback {
+                Ok(()) => {
+                    remove_transaction(root)?;
+                    bail!(
+                        "workspace edit source changed before commit at {}; earlier files were rolled back",
+                        path.display()
+                    );
+                }
+                Err(rollback_error) => bail!(
+                    "workspace edit source changed before commit at {}; recovery required: {rollback_error}",
+                    path.display()
+                ),
+            };
+        }
+        if let Err(error) = crate::providers::write_file_atomic_if_unchanged(
+            path,
+            original.as_bytes(),
+            updated.as_bytes(),
+        ) {
+            let rollback = rollback_transaction(root, &transaction);
+            return match rollback {
+                Ok(()) => {
+                    remove_transaction(root)?;
+                    Err(error.context("workspace edit failed; earlier files were rolled back"))
+                }
+                Err(rollback_error) => Err(error.context(format!(
+                    "workspace edit failed; recovery required: {rollback_error}"
+                ))),
+            };
+        }
+    }
+    remove_transaction(root)
+}
+
 async fn apply_workspace_edit(edit: &serde_json::Value, root: &Path) -> Result<()> {
+    let mut requested = Vec::new();
     if let Some(changes) = edit.get("changes") {
         let changes = changes
             .as_object()
             .context("workspace changes must be an object")?;
         for (uri, edits_value) in changes {
-            apply_text_edits_to_path(uri, edits_value, root).await?;
+            requested.push((uri.as_str(), edits_value));
         }
-        return Ok(());
-    }
-
-    if let Some(document_changes) = edit.get("documentChanges") {
+    } else if let Some(document_changes) = edit.get("documentChanges") {
         let document_changes = document_changes
             .as_array()
             .context("documentChanges must be an array")?;
@@ -953,21 +1369,81 @@ async fn apply_workspace_edit(edit: &serde_json::Value, root: &Path) -> Result<(
                     .and_then(|u| u.as_str())
                     .context("missing textDocument uri")?;
                 if let Some(edits) = change.get("edits") {
-                    apply_text_edits_to_path(uri, edits, root).await?;
+                    requested.push((uri, edits));
+                } else {
+                    bail!("document change is missing edits");
                 }
             } else if change.get("kind").is_some() {
                 bail!("workspace file operations are not supported in refactor");
+            } else {
+                bail!("unsupported documentChanges entry");
             }
         }
-        return Ok(());
+    } else {
+        bail!("workspace edit has neither changes nor documentChanges");
     }
 
-    bail!("workspace edit has neither changes nor documentChanges")
+    let mut prepared: std::collections::BTreeMap<std::path::PathBuf, (String, String)> =
+        std::collections::BTreeMap::new();
+    for (uri, edits) in requested {
+        let path = url_to_path(uri, root)?;
+        if let Some((_, current)) = prepared.get_mut(&path) {
+            *current = apply_text_edits(current, edits)?;
+        } else {
+            let original = tokio::fs::read_to_string(&path).await?;
+            let updated = apply_text_edits(&original, edits)?;
+            prepared.insert(path, (original, updated));
+        }
+    }
+
+    let prepared: Vec<_> = prepared.into_iter().collect();
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || commit_workspace_edit(&root, prepared))
+        .await
+        .context("workspace edit transaction task panicked")??;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_rename_rejects_language_server_errors_and_null_results() {
+        let error = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32602, "message": "symbol cannot be renamed"}
+        });
+        assert!(
+            rename_workspace_edit(&error)
+                .unwrap_err()
+                .to_string()
+                .contains("symbol cannot be renamed")
+        );
+        let no_edit = json!({"jsonrpc": "2.0", "id": 1, "result": null});
+        assert!(
+            rename_workspace_edit(&no_edit)
+                .unwrap_err()
+                .to_string()
+                .contains("no semantic rename edit")
+        );
+    }
+
+    #[test]
+    fn semantic_rename_accepts_cross_file_only_workspace_edit() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "changes": {
+                    "file:///workspace/other.rs": []
+                }
+            }
+        });
+        let edit = rename_workspace_edit(&response).unwrap();
+        assert!(edit["changes"].get("file:///workspace/other.rs").is_some());
+    }
 
     #[test]
     fn lsp_server_lookup() {
@@ -981,6 +1457,161 @@ mod tests {
         let m = adapter_map();
         assert!(m.contains_key("debugpy"));
         assert!(m.contains_key("gdb"));
+    }
+
+    #[tokio::test]
+    async fn invalid_later_workspace_edit_leaves_every_file_unchanged() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = temp.path().join("first.rs");
+        let second = temp.path().join("second.rs");
+        std::fs::write(&first, "first\n").unwrap();
+        std::fs::write(&second, "second\n").unwrap();
+        let first_uri = Url::from_file_path(&first).unwrap().to_string();
+        let second_uri = Url::from_file_path(&second).unwrap().to_string();
+        let edit = serde_json::json!({
+            "documentChanges": [
+                {
+                    "textDocument": {"uri": first_uri},
+                    "edits": [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 5}
+                        },
+                        "newText": "changed"
+                    }]
+                },
+                {
+                    "textDocument": {"uri": second_uri},
+                    "edits": [{
+                        "range": {
+                            "start": {"line": 0, "character": 4},
+                            "end": {"line": 0, "character": 1}
+                        },
+                        "newText": "invalid"
+                    }]
+                }
+            ]
+        });
+
+        assert!(apply_workspace_edit(&edit, temp.path()).await.is_err());
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "first\n");
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "second\n");
+    }
+
+    #[tokio::test]
+    async fn unknown_document_change_shape_is_rejected() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let edit = serde_json::json!({
+            "documentChanges": [{"unexpected": true}]
+        });
+        let error = apply_workspace_edit(&edit, temp.path()).await.unwrap_err();
+        assert!(error.to_string().contains("unsupported documentChanges"));
+    }
+
+    #[tokio::test]
+    async fn empty_workspace_edit_is_rejected_without_leaving_a_journal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let error = apply_workspace_edit(&json!({"changes": {}}), temp.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("empty semantic rename edit"));
+        assert!(!transaction_dir(temp.path()).exists());
+    }
+
+    fn incomplete_transaction(root: &Path, path: &Path, original: &str, updated: &str) {
+        let root = dunce::canonicalize(root).unwrap();
+        let dir = safe_transaction_dir(&root, true).unwrap();
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        crate::providers::write_file_atomic(dir.join("backup-0.txt").as_path(), original, true)
+            .unwrap();
+        write_transaction(
+            &dir,
+            &WorkspaceTransaction {
+                state: "applying".into(),
+                entries: vec![WorkspaceTransactionEntry {
+                    path: relative,
+                    backup: "backup-0.txt".into(),
+                    original_hash: file_hash(original.as_bytes()),
+                    updated_hash: file_hash(updated.as_bytes()),
+                }],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn incomplete_workspace_edit_is_recovered_before_next_refactor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("main.rs");
+        std::fs::write(&file, "new\n").unwrap();
+        incomplete_transaction(temp.path(), &file, "old\n", "new\n");
+
+        recover_workspace_transaction(temp.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+        assert!(!transaction_dir(temp.path()).exists());
+    }
+
+    #[test]
+    fn prepared_workspace_edit_is_discarded_without_touching_sources() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("main.rs");
+        std::fs::write(&file, "old\n").unwrap();
+        incomplete_transaction(temp.path(), &file, "old\n", "new\n");
+        let dir = transaction_dir(temp.path());
+        let mut transaction: WorkspaceTransaction =
+            serde_json::from_slice(&read_transaction_file(&transaction_file(&dir)).unwrap())
+                .unwrap();
+        transaction.state = "prepared".into();
+        write_transaction(&dir, &transaction).unwrap();
+
+        recover_workspace_transaction(temp.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn incomplete_workspace_edit_conflict_fails_closed_and_keeps_journal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("main.rs");
+        std::fs::write(&file, "external\n").unwrap();
+        incomplete_transaction(temp.path(), &file, "old\n", "new\n");
+
+        let error = recover_workspace_transaction(temp.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with external changes")
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "external\n");
+        assert!(transaction_file(&transaction_dir(temp.path())).exists());
+    }
+
+    #[test]
+    fn incomplete_workspace_edit_rejects_symlinked_backup() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let temp = tempfile::TempDir::new().unwrap();
+            let file = temp.path().join("main.rs");
+            let outside = temp.path().join("outside.txt");
+            std::fs::write(&file, "new\n").unwrap();
+            std::fs::write(&outside, "old\n").unwrap();
+            incomplete_transaction(temp.path(), &file, "old\n", "new\n");
+            let backup = transaction_dir(temp.path()).join("backup-0.txt");
+            std::fs::remove_file(&backup).unwrap();
+            symlink(&outside, &backup).unwrap();
+
+            assert!(recover_workspace_transaction(temp.path()).is_err());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        }
     }
 
     #[test]

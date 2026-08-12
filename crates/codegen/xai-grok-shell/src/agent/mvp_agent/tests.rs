@@ -1705,7 +1705,7 @@ async fn wait_for_in_flight_load_blocks_until_load_completes() {
         .run_until(async {
             let agent = std::rc::Rc::new(build_minimal_agent_for_tests());
             let sid = acp::SessionId::new("sess-loading");
-            let guard = agent.begin_session_load(&sid);
+            let guard = agent.begin_session_load(&sid).await;
             let waiter_agent = agent.clone();
             let waiter_sid = sid.clone();
             let waiter = tokio::task::spawn_local(async move {
@@ -1730,6 +1730,47 @@ async fn wait_for_in_flight_load_blocks_until_load_completes() {
         })
         .await;
 }
+
+/// Reconnecting an already-active session still replays configuration and
+/// persistence state. Session-scoped requests must wait for that refresh even
+/// though the old handle remains present in the map.
+#[tokio::test]
+async fn active_session_handle_waits_for_reconnect_load_to_finish() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let agent = std::rc::Rc::new(build_minimal_agent_for_tests());
+            let sid = acp::SessionId::new("sess-active-reload");
+            agent
+                .sessions
+                .borrow_mut()
+                .insert(sid.clone(), make_test_handle("old-model", false, None));
+            let guard = agent.begin_session_load(&sid).await;
+            let waiter_agent = agent.clone();
+            let waiter_sid = sid.clone();
+            let waiter = tokio::task::spawn_local(async move {
+                waiter_agent
+                    .session_handle_waiting_for_load(&waiter_sid)
+                    .await
+            });
+
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                !waiter.is_finished(),
+                "an active handle must not bypass an in-flight reconnect load"
+            );
+            drop(guard);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+                    .await
+                    .expect("waiter must wake after reconnect load")
+                    .expect("waiter task must not panic")
+                    .is_some(),
+                "the active handle should be returned after the load guard drops"
+            );
+        })
+        .await;
+}
 /// A failed load (guard dropped WITHOUT registering the session) also
 /// wakes waiters — they re-check, find nothing, and the caller surfaces
 /// the regular "unknown session id" error rather than hanging.
@@ -1740,7 +1781,7 @@ async fn wait_for_in_flight_load_wakes_on_failed_load() {
         .run_until(async {
             let agent = std::rc::Rc::new(build_minimal_agent_for_tests());
             let sid = acp::SessionId::new("sess-load-fails");
-            let guard = agent.begin_session_load(&sid);
+            let guard = agent.begin_session_load(&sid).await;
             let waiter_agent = agent.clone();
             let waiter_sid = sid.clone();
             let waiter = tokio::task::spawn_local(async move {
@@ -1764,20 +1805,32 @@ async fn wait_for_in_flight_load_wakes_on_failed_load() {
 /// newer in-flight load).
 #[tokio::test]
 async fn concurrent_load_guards_do_not_clobber_each_other() {
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("sess-concurrent");
-    let guard_one = agent.begin_session_load(&sid);
-    let guard_two = agent.begin_session_load(&sid);
-    drop(guard_one);
-    assert!(
-        agent.loading_sessions.borrow().contains_key(&sid),
-        "second load's marker must survive the first guard's drop"
-    );
-    drop(guard_two);
-    assert!(
-        agent.loading_sessions.borrow().is_empty(),
-        "all markers removed once every load finished"
-    );
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let agent = std::rc::Rc::new(build_minimal_agent_for_tests());
+            let sid = acp::SessionId::new("sess-concurrent");
+            let guard_one = agent.begin_session_load(&sid).await;
+            let second_agent = agent.clone();
+            let second_sid = sid.clone();
+            let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let second = tokio::task::spawn_local(async move {
+                let _guard = second_agent.begin_session_load(&second_sid).await;
+                let _ = acquired_tx.send(());
+                let _ = release_rx.await;
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(!second.is_finished(), "same-ID load must wait for its predecessor");
+            assert!(acquired_rx.try_recv().is_err());
+            drop(guard_one);
+            acquired_rx.await.unwrap();
+            assert!(agent.loading_sessions.borrow().contains_key(&sid));
+            let _ = release_tx.send(());
+            second.await.unwrap();
+            assert!(agent.loading_sessions.borrow().is_empty());
+        })
+        .await;
 }
 /// `resident_activity` returns `NeedsInput` whenever the session's
 /// pending-interaction map is non-empty — and that wins even over a

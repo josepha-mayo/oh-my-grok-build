@@ -719,14 +719,45 @@ async fn handle_commands_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
 // session/fork
 
 async fn handle_session_fork(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
-    use crate::session::fork::{ForkSessionRequest, fork_session};
+    use crate::session::fork::{ForkSessionRequest, fork_session_from_snapshot};
 
     let request: ForkSessionRequest = parse_params(args)?;
+    let source_id = acp::SessionId::new(request.source_session_id.clone());
+    let source_snapshot = if let Some(handle) = agent.get_session_handle(&source_id) {
+        if handle.info.cwd != request.source_cwd {
+            return Err(acp::Error::invalid_params().data(format!(
+                "source cwd does not match active session {}",
+                request.source_session_id
+            )));
+        }
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        handle
+            .cmd_tx
+            .send(SessionCommand::CopyFile { respond_to })
+            .map_err(|_| {
+                acp::Error::internal_error().data("active source session is unavailable")
+            })?;
+        Some(
+            response
+                .await
+                .map_err(|_| {
+                    acp::Error::internal_error().data("active source snapshot was cancelled")
+                })?
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     let agent_id = agent_id();
-    let response = fork_session(request, &agent_id, Some(agent.auth_manager.clone()))
-        .await
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    let response = fork_session_from_snapshot(
+        request,
+        &agent_id,
+        Some(agent.auth_manager.clone()),
+        source_snapshot,
+    )
+    .await
+    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
     to_raw_response(&response)
 }

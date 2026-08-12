@@ -577,8 +577,6 @@ pub fn add_connector(
     if let Some(ref cmd) = command {
         validate_connector_command(cmd)?;
     }
-    let mut registry = load_registry()?;
-
     let child_key = secret_env_key
         .clone()
         .or_else(|| default_secret_env_key(&type_str).map(|s| s.to_string()));
@@ -591,6 +589,12 @@ pub fn add_connector(
     }
 
     let storage = crate::providers::env_var_name(&name);
+    let secret = std::env::var("OMGB_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let _lock = crate::providers::provider_mutation_lock()?;
+    let mut registry = load_registry()?;
+    let previous = registry.clone();
     registry.connectors.insert(
         name.clone(),
         ConnectorConfig {
@@ -608,8 +612,16 @@ pub fn add_connector(
 
     // API keys are only accepted via OMGB_API_KEY; persist the secret only after
     // the connector registry has been saved successfully.
-    if let Some(key) = std::env::var("OMGB_API_KEY").ok().filter(|s| !s.is_empty()) {
-        crate::providers::write_api_key(&name, Some(std::slice::from_ref(&storage)), &key)?;
+    if let Some(key) = secret
+        && let Err(error) = crate::providers::write_api_key_unlocked(
+            &name,
+            Some(std::slice::from_ref(&storage)),
+            &key,
+        )
+    {
+        save_registry(&previous)
+            .context("roll back connector registry after secret write failed")?;
+        return Err(error);
     }
 
     Ok(())
@@ -620,12 +632,22 @@ pub fn list_connectors() -> Result<Vec<ConnectorConfig>> {
 }
 
 pub fn remove_connector(name: &str) -> Result<()> {
+    let _lock = crate::providers::provider_mutation_lock()?;
     let mut registry = load_registry()?;
+    let previous = registry.clone();
     let cfg = registry.connectors.remove(name);
     save_registry(&registry)?;
     if cfg.is_some() {
         let storage = crate::providers::env_var_name(name);
-        crate::providers::remove_api_key(name, true, Some(std::slice::from_ref(&storage)))?;
+        if let Err(error) = crate::providers::remove_api_key_unlocked(
+            name,
+            true,
+            Some(std::slice::from_ref(&storage)),
+        ) {
+            save_registry(&previous)
+                .context("roll back connector registry after secret removal failed")?;
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -815,6 +837,87 @@ mod tests {
         crate::providers::set_omg_home_for_tests(None);
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(r.is_err(), "non-ASCII connector name should be rejected");
+    }
+
+    #[test]
+    fn concurrent_connector_mutations_preserve_unrelated_entries() {
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let tmp = temp_dir_for_test();
+        crate::providers::set_omg_home_for_tests(Some(tmp.clone()));
+        let add = |name: &str| {
+            add_connector(
+                name.into(),
+                HarnessType::Codex,
+                Some("codex exec --json {prompt}".into()),
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+        };
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let writers: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    add_connector(
+                        name.into(),
+                        HarnessType::Codex,
+                        Some("codex exec --json {prompt}".into()),
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let registry = load_registry().unwrap();
+        assert!(registry.connectors.contains_key("alpha"));
+        assert!(registry.connectors.contains_key("beta"));
+
+        add("remove-me").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let add_barrier = barrier.clone();
+        let add_thread = std::thread::spawn(move || {
+            add_barrier.wait();
+            add_connector(
+                "gamma".into(),
+                HarnessType::Codex,
+                Some("codex exec --json {prompt}".into()),
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+        });
+        let remove_barrier = barrier.clone();
+        let remove_thread = std::thread::spawn(move || {
+            remove_barrier.wait();
+            remove_connector("remove-me")
+        });
+        barrier.wait();
+        add_thread.join().unwrap().unwrap();
+        remove_thread.join().unwrap().unwrap();
+
+        let registry = load_registry().unwrap();
+        assert!(registry.connectors.contains_key("alpha"));
+        assert!(registry.connectors.contains_key("beta"));
+        assert!(registry.connectors.contains_key("gamma"));
+        assert!(!registry.connectors.contains_key("remove-me"));
+
+        crate::providers::set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

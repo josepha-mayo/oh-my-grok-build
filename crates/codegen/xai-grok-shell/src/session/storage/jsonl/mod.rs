@@ -811,14 +811,31 @@ impl JsonlStorageAdapter {
         target_info: &Info,
         options: super::CopySessionOptions,
     ) -> io::Result<super::CopySessionResult> {
+        let source_dir = self.session_dir(source_info);
+        self.copy_session_data_from_dir_sync(source_info, &source_dir, target_info, options)
+    }
+
+    /// Copy a session from an immutable directory snapshot into the normal
+    /// target store. The source `Info` is retained for cwd/session transforms,
+    /// but every source byte is read from `source_dir`.
+    pub fn copy_session_data_from_dir_sync(
+        &self,
+        source_info: &Info,
+        source_dir: &std::path::Path,
+        target_info: &Info,
+        options: super::CopySessionOptions,
+    ) -> io::Result<super::CopySessionResult> {
         let target_dir = self.session_dir(target_info);
-        std::fs::create_dir_all(&target_dir)?;
-        let source_summary = self.read_summary_sync(source_info)?;
+        let target_reservation =
+            crate::session::persistence::reserve_new_session_path(&target_dir)?;
+        let source_summary: crate::session::persistence::Summary =
+            serde_json::from_slice(&std::fs::read(source_dir.join("summary.json"))?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let chat_format_version = source_summary.chat_format_version;
-        let mut chat_to_copy: Vec<ConversationItem> =
-            self.read_chat_history_sync(self.chat_file(source_info), chat_format_version)?;
+        let mut chat_to_copy: Vec<ConversationItem> = self
+            .read_chat_history_sync(source_dir.join("chat_history.jsonl"), chat_format_version)?;
         let mut updates_to_copy: Vec<super::SessionUpdate> =
-            self.read_updates_jsonl(self.updates_file(source_info))?;
+            self.read_updates_jsonl(source_dir.join("updates.jsonl"))?;
         if let Some(target_idx) = options.target_prompt_index {
             updates_to_copy = super::filter_rewind_updates(updates_to_copy);
             updates_to_copy.truncate(updates_truncate_for_prompt(&updates_to_copy, target_idx));
@@ -908,7 +925,7 @@ impl JsonlStorageAdapter {
         }
         std::fs::write(self.updates_file(target_info), updates_content)?;
         let plan_copied = if options.copy_plan_state {
-            let plan_path = self.plan_file(source_info);
+            let plan_path = source_dir.join("plan.json");
             if plan_path.exists() {
                 std::fs::write(self.plan_file(target_info), std::fs::read(&plan_path)?)?;
                 true
@@ -919,7 +936,7 @@ impl JsonlStorageAdapter {
             false
         };
         let signals_copied = if options.copy_signals {
-            let signals_path = self.signals_file(source_info);
+            let signals_path = source_dir.join("signals.json");
             if signals_path.exists() {
                 std::fs::write(
                     self.signals_file(target_info),
@@ -933,7 +950,7 @@ impl JsonlStorageAdapter {
             false
         };
         let plan_mode_state_copied = if options.copy_plan_mode_state {
-            let plan_mode_path = self.plan_mode_state_file(source_info);
+            let plan_mode_path = source_dir.join("plan_mode.json");
             if plan_mode_path.exists() {
                 std::fs::write(
                     self.plan_mode_state_file(target_info),
@@ -947,7 +964,7 @@ impl JsonlStorageAdapter {
             false
         };
         let tool_state_copied = if options.copy_tool_state {
-            let tool_state_path = self.session_dir(source_info).join("tool_state.json");
+            let tool_state_path = source_dir.join("tool_state.json");
             if tool_state_path.is_file() {
                 std::fs::write(
                     self.session_dir(target_info).join("tool_state.json"),
@@ -967,7 +984,7 @@ impl JsonlStorageAdapter {
             false
         };
         let announcement_state_copied = if options.copy_announcement_state {
-            let ann_path = self.announcement_state_file(source_info);
+            let ann_path = source_dir.join("announcement_state.json");
             if ann_path.exists() {
                 std::fs::write(
                     self.announcement_state_file(target_info),
@@ -981,9 +998,7 @@ impl JsonlStorageAdapter {
             false
         };
         let compaction_segments_copied = if options.copy_compaction_segments {
-            let src_dir = self
-                .session_dir(source_info)
-                .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+            let src_dir = source_dir.join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
             let mut copied = 0usize;
             if src_dir.is_dir() {
                 let dst_dir = self
@@ -1002,7 +1017,7 @@ impl JsonlStorageAdapter {
         } else {
             0
         };
-        Ok(super::CopySessionResult {
+        let result = super::CopySessionResult {
             chat_messages_copied: num_chat_messages,
             updates_copied: num_messages,
             plan_state_copied: plan_copied,
@@ -1011,7 +1026,9 @@ impl JsonlStorageAdapter {
             tool_state_copied,
             announcement_state_copied,
             compaction_segments_copied,
-        })
+        };
+        drop(target_reservation.commit()?);
+        Ok(result)
     }
 }
 /// Next `segment_NNN` index in `compaction_dir`: one past the highest existing

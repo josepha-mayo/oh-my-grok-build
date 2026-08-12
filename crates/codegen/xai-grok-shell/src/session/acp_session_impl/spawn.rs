@@ -1671,6 +1671,7 @@ pub(crate) async fn spawn_session_actor(
 /// (which derives `Clone`) because `JoinHandle` is not `Clone`.
 pub struct SessionThread {
     join_handle: std::thread::JoinHandle<()>,
+    pub(crate) _writer_lease: Option<crate::session::persistence::SessionWriterLease>,
 }
 impl SessionThread {
     /// Check if the session thread has exited (panicked or finished).
@@ -1682,6 +1683,7 @@ impl SessionThread {
     pub fn from_handle(handle: std::thread::JoinHandle<()>) -> Self {
         Self {
             join_handle: handle,
+            _writer_lease: None,
         }
     }
 }
@@ -1992,7 +1994,10 @@ pub(crate) async fn spawn_session_on_thread(
         init.handle,
         init.permission_events_rx,
         init.system_prompt,
-        SessionThread { join_handle },
+        SessionThread {
+            join_handle,
+            _writer_lease: None,
+        },
     ))
 }
 /// Production [`crate::session::mcp_restart::RestartActions`] impl.

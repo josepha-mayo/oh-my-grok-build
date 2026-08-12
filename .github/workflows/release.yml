@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag matching the crate version (for example v0.1.0)
+        required: true
+        type: string
 
 jobs:
   build:
@@ -13,7 +18,6 @@ jobs:
       id-token: write
       attestations: write
       contents: read
-      actions: write
     strategy:
       fail-fast: false
       matrix:
@@ -22,26 +26,43 @@ jobs:
             target: x86_64-unknown-linux-gnu
             ext: ""
             archive: omgb-x86_64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            ext: ""
+            archive: omgb-aarch64-unknown-linux-gnu.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             ext: ""
             archive: omgb-aarch64-apple-darwin.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            ext: ""
+            archive: omgb-x86_64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: ".exe"
             archive: omgb-x86_64-pc-windows-msvc.tar.gz
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: arduino/setup-protoc@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: "1.92.0"
           targets: ${{ matrix.target }}
-      - uses: swatinem/rust-cache@v2
+      - name: Verify release tag matches crate version
+        shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "oh-my-grok-build") | .version')
+          tag=$GITHUB_REF_NAME
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]; then tag=$DISPATCH_TAG; fi
+          test "$tag" = "v$version"
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build release binary
         run: cargo build -p oh-my-grok-build --profile release-dist --target ${{ matrix.target }}
@@ -58,16 +79,60 @@ jobs:
           cd dist
           tar czf "${{ matrix.archive }}" "omgb-${{ matrix.target }}${{ matrix.ext }}" "safe-shell-guard-${{ matrix.target }}${{ matrix.ext }}" "plugin-${{ matrix.target }}"
 
+      - name: Generate Debian package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "oh-my-grok-build") | .version')
+          bash scripts/generate-deb-package.sh dist "${{ matrix.target }}" "$version"
+
+      - name: Install RPM packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - name: Generate RPM package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "oh-my-grok-build") | .version')
+          bash scripts/generate-rpm-package.sh dist "${{ matrix.target }}" "$version"
+
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/${{ matrix.archive }}
 
+      - name: Attest Debian package provenance
+        if: runner.os == 'Linux'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*.deb
+
+      - name: Attest RPM package provenance
+        if: runner.os == 'Linux'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*.rpm
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: dist/${{ matrix.archive }}
+          format: spdx-json
+          output-file: dist/sbom-${{ matrix.target }}.spdx.json
+          upload-artifact: true
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: omgb-${{ matrix.target }}
-          path: dist/${{ matrix.archive }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/*.deb
+            dist/*.rpm
+            dist/sbom-${{ matrix.target }}.spdx.json
 
   release:
     needs: build
@@ -75,26 +140,73 @@ jobs:
     permissions:
       contents: write
       actions: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           pattern: omgb-*
           merge-multiple: true
 
+      - name: Generate Windows MSI
+        shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y msitools
+          tag=$GITHUB_REF_NAME
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]; then tag=$DISPATCH_TAG; fi
+          version=${tag#v}
+          bash scripts/generate-msi-package.sh "dist/omgb-x86_64-pc-windows-msvc.tar.gz" "$version" dist
+
+      - name: Attest MSI provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*.msi
+
+      - name: Generate WinGet manifests for stable releases
+        shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          tag=$GITHUB_REF_NAME
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]; then tag=$DISPATCH_TAG; fi
+          version=${tag#v}
+          if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            bash scripts/generate-winget-manifests.sh \
+              "dist/omgb-$version-x86_64.msi" "$version" "$tag" JosephAyanda.OMGB dist/winget
+          else
+            echo "Skipping WinGet manifests for prerelease version $version"
+          fi
+
       - name: Generate checksums
         shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
+          tag=$GITHUB_REF_NAME
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]; then tag=$DISPATCH_TAG; fi
+          cp scripts/install.sh dist/install.sh
+          cp scripts/install.ps1 dist/install.ps1
+          bash scripts/generate-homebrew-formula.sh dist "$tag"
           cd dist
-          sha256sum -b omgb-*.tar.gz > checksums-sha256.txt
-          sha512sum -b omgb-*.tar.gz > checksums-sha512.txt
+          sha256sum -b omgb-*.tar.gz omgb_*.deb omgb-*.rpm omgb-*.msi install.sh install.ps1 omgb.rb > checksums-sha256.txt
+          sha512sum -b omgb-*.tar.gz omgb_*.deb omgb-*.rpm omgb-*.msi install.sh install.ps1 omgb.rb > checksums-sha512.txt
+
+      - name: Upload assembled release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: omgb-release-bundle
+          path: dist/**/*
 
       - name: Create GitHub Release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/**/*
           draft: true

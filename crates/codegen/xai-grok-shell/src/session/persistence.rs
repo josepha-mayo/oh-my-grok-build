@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -395,6 +396,206 @@ pub enum PersistenceMsg {
 }
 
 pub use xai_grok_shared::session::session_dir;
+
+const SESSION_CREATION_MARKER: &str = ".omgb-creating";
+
+pub struct NewSessionReservation {
+    path: PathBuf,
+    lock: Option<std::fs::File>,
+    committed: bool,
+}
+
+pub struct SessionWriterLease {
+    _lock: std::fs::File,
+}
+
+impl NewSessionReservation {
+    pub fn commit(mut self) -> std::io::Result<SessionWriterLease> {
+        let marker = self.path.join(SESSION_CREATION_MARKER);
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.committed = true;
+        let lock = self
+            .lock
+            .take()
+            .ok_or_else(|| std::io::Error::other("session reservation lost its writer lease"))?;
+        Ok(SessionWriterLease { _lock: lock })
+    }
+}
+
+impl Drop for NewSessionReservation {
+    fn drop(&mut self) {
+        if !self.committed && self.path.join(SESSION_CREATION_MARKER).is_file() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+        if let Some(lock) = self.lock.take() {
+            let _ = lock.unlock();
+        }
+    }
+}
+
+/// Atomically reserve a brand-new persisted session directory. A sidecar lease
+/// distinguishes an active creator from an abandoned pre-summary tombstone.
+pub fn reserve_new_session_dir(
+    info: &crate::session::info::Info,
+) -> std::io::Result<NewSessionReservation> {
+    reserve_new_session_dir_at(&session_dir(info))
+}
+
+pub(crate) fn reserve_new_session_path(path: &Path) -> std::io::Result<NewSessionReservation> {
+    reserve_new_session_dir_at(path)
+}
+
+pub fn acquire_session_writer_lease(
+    info: &crate::session::info::Info,
+) -> std::io::Result<SessionWriterLease> {
+    let path = session_dir(info);
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("session directory has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("session directory has no valid name"))?;
+    let lock_path = parent.join(format!(".{file_name}.creating.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(SessionWriterLease { _lock: lock }),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "session is already open for writing in another process",
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn acquire_session_writer_lease_for(
+    session_id: &str,
+    cwd: &str,
+) -> std::io::Result<SessionWriterLease> {
+    acquire_session_writer_lease(&crate::session::info::Info {
+        id: acp::SessionId::new(session_id.to_string()),
+        cwd: cwd.to_string(),
+    })
+}
+
+fn reserve_new_session_dir_at(path: &Path) -> std::io::Result<NewSessionReservation> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("session directory has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("session directory has no valid name"))?;
+    let lock_path = parent.join(format!(".{file_name}.creating.lock"));
+    // Keep this sidecar for the lifetime of the session. Unlinking a lock file
+    // after unlock lets contenders lock different inodes for the same ID.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    if let Err(error) = lock.try_lock_exclusive() {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "session ID is currently being created",
+            ));
+        }
+        return Err(error);
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && path.join(SESSION_CREATION_MARKER).is_file() =>
+        {
+            std::fs::remove_dir_all(path)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "session ID already exists",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::create_dir(path)?;
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path.join(SESSION_CREATION_MARKER))?;
+    Ok(NewSessionReservation {
+        path: path.to_path_buf(),
+        lock: Some(lock),
+        committed: false,
+    })
+}
+
+#[cfg(test)]
+mod session_reservation_tests {
+    use super::reserve_new_session_dir_at;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_session_reservations_have_exactly_one_winner() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = Arc::new(temp.path().join("cwd").join("session-id"));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let target = target.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                reserve_new_session_dir_at(&target)
+            }));
+        }
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn abandoned_pre_summary_reservation_is_reclaimed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("cwd").join("session-id");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(super::SESSION_CREATION_MARKER), b"").unwrap();
+
+        let reservation = reserve_new_session_dir_at(&target).unwrap();
+        assert!(target.join(super::SESSION_CREATION_MARKER).is_file());
+        reservation.commit().unwrap();
+        assert!(!target.join(super::SESSION_CREATION_MARKER).exists());
+    }
+}
 
 /// Check if a session exists locally under the given cwd.
 ///
@@ -1904,7 +2105,7 @@ impl SessionPersistence {
                 return Ok(SessionStateCopy { files });
             }
 
-            collect_session_files_recursive(&session_dir, &session_dir, &mut files);
+            collect_session_files_recursive(&session_dir, &session_dir, &mut files)?;
             collect_mcp_stderr_logs(&mut files);
 
             Ok(SessionStateCopy { files })
@@ -1938,41 +2139,45 @@ fn collect_mcp_stderr_logs(files: &mut Vec<CopiedSessionFile>) {
 /// Recursively collect all files from `dir` into `files`, using paths relative to `base`.
 /// This captures subdirectories like `prompts/` which contain large-prompt files
 /// referenced by truncated chat history entries.
-fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<CopiedSessionFile>) {
+fn collect_session_files_recursive(
+    base: &Path,
+    dir: &Path,
+    files: &mut Vec<CopiedSessionFile>,
+) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(?dir, ?e, "Failed to read directory during session copy");
-            return;
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            let rel_path = match path.strip_prefix(base) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let Some(name) = rel_path.to_str() else {
-                continue;
-            };
-            let data = match std::fs::read(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(?e, "Failed to read session file during copy");
-                    continue;
-                }
-            };
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session snapshot contains a symlink: {}", path.display()),
+            ));
+        }
+        if file_type.is_file() {
+            let rel_path = path.strip_prefix(base).map_err(std::io::Error::other)?;
+            let name = rel_path.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "session snapshot contains a non-UTF-8 path",
+                )
+            })?;
+            let data = std::fs::read(&path)?;
             files.push(CopiedSessionFile {
                 name: name.to_string(),
                 data,
             });
-        } else if path.is_dir() {
-            collect_session_files_recursive(base, &path, files);
+        } else if file_type.is_dir() {
+            collect_session_files_recursive(base, &path, files)?;
         }
     }
+    Ok(())
 }
 
 fn init_remote_sync(
@@ -2940,7 +3145,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("summary.json"), b"{}").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 2);
@@ -2960,7 +3165,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("summary.json"), b"{}").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 3);
@@ -2979,7 +3184,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("top.txt"), b"top").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(files.len(), 2);
@@ -2993,7 +3198,7 @@ mod collect_session_files_tests {
         let missing = dir.path().join("does_not_exist");
 
         let mut files = Vec::new();
-        collect_session_files_recursive(&missing, &missing, &mut files);
+        collect_session_files_recursive(&missing, &missing, &mut files).unwrap();
 
         assert!(files.is_empty());
     }
@@ -3003,7 +3208,7 @@ mod collect_session_files_tests {
         let dir = TempDir::new().unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         assert!(files.is_empty());
     }
@@ -3015,7 +3220,7 @@ mod collect_session_files_tests {
         fs::write(dir.path().join("file.txt"), b"data").unwrap();
 
         let mut files = Vec::new();
-        collect_session_files_recursive(dir.path(), dir.path(), &mut files);
+        collect_session_files_recursive(dir.path(), dir.path(), &mut files).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "file.txt");

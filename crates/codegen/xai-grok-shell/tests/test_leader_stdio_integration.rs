@@ -3276,8 +3276,8 @@ async fn test_sever_mid_rpc_orphans_response_and_replay_recovers() {
 /// DESIRED behavior (the cancel reaches the agent after recovery) and stays
 /// ignored until a cancel-ack/resend protocol ships.
 #[tokio::test]
-#[ignore = "leader-acceptance: cancel severed in reconnect swap window is not resent; un-ignore with cancel-ack"]
-async fn test_cancel_severed_in_swap_window_reaches_agent_after_recovery() {
+#[ignore = "characterizes bare LeaderClient behavior; reconnect durability belongs to LeaderBridge"]
+async fn bare_leader_client_cannot_replay_cancel_after_disconnect() {
     let temp = TempDir::new().unwrap();
     let (sock_path, cancel, mut acp_rx, response_tx) = setup_persistent_test_server(&temp).await;
 

@@ -38,14 +38,35 @@ enum ForwardOutcome {
     Cancelled,
 }
 
+/// Only a syntactically valid `session/cancel` *notification* is safe to
+/// retry after a leader-channel swap. Requests can carry stateful work and
+/// arbitrary notifications may not be idempotent, but cancelling a turn is a
+/// durable intent and the agent treats repeated cancellation as harmless.
+fn is_cancel_intent(line: &str) -> bool {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    json.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
+        && json.get("method").and_then(|v| v.as_str()) == Some("session/cancel")
+        && json.get("id").is_none()
+        && json
+            .get("params")
+            .and_then(|params| params.get("sessionId"))
+            .and_then(|id| id.as_str())
+            .is_some()
+}
+
 /// Send one outbound line to the (swappable) leader tx.
 ///
 /// A failed send means the connection is dead; the line is held — blocking
 /// the lines queued behind it — until the reader task installs a fresh tx,
-/// then dropped. Replaying it would be worse: a stale `session/load`
-/// re-delivered on the new connection triggers a second full replay into the
-/// same reload window (duplicated transcript); the reconnect re-init
-/// re-establishes state explicitly instead.
+/// then dropped, except for a valid `session/cancel` notification. Cancelling
+/// is the sole durable outbound intent: it is resent on the replacement
+/// channel so a leader crash cannot leave a turn running. Replaying any other
+/// line would be worse: a stale `session/load` re-delivered on the new
+/// connection triggers a second full replay into the same reload window
+/// (duplicated transcript); the reconnect re-init re-establishes state
+/// explicitly instead.
 ///
 /// Scoping is by FIRST OBSERVED send failure, a best-effort heuristic: a
 /// pre-disconnect line whose first send happens after the swap never fails
@@ -63,7 +84,14 @@ async fn forward_outbound_line(
             if let Some(ref dead) = failed_on
                 && !tx.same_channel(dead)
             {
-                return ForwardOutcome::DroppedStale;
+                if is_cancel_intent(&pending) {
+                    // A cancel is intentionally replayed after every observed
+                    // replacement until one leader accepts it. All other
+                    // outbound ACP lines remain connection-scoped.
+                    failed_on = None;
+                } else {
+                    return ForwardOutcome::DroppedStale;
+                }
             }
             pending = match tx.send(pending) {
                 Ok(()) => return ForwardOutcome::Sent,
@@ -206,11 +234,9 @@ pub(crate) fn bridge_channels(
                                             ForwardOutcome::DroppedStale => {
                                                 // Unified-log marker: this drop is deliberate
                                                 // (replaying a stale `session/load` would
-                                                // double-replay the transcript), but it can eat
-                                                // one-shot notifications like `session/cancel`, a
-                                                // known stuck-cancel failure mode. Record WHAT was
-                                                // dropped so the next
-                                                // investigation sees it in the unified log.
+                                                // double-replay the transcript). Cancels are
+                                                // excluded in `forward_outbound_line` and are
+                                                // resent after the swap.
                                                 let method = serde_json::from_str::<serde_json::Value>(pending)
                                                     .ok()
                                                     .and_then(|j| {
@@ -332,6 +358,54 @@ mod tests {
             new_rx.try_recv().is_err(),
             "the stale line must not be re-delivered onto the new connection"
         );
+    }
+
+    /// Acceptance: a cancel composed while the old leader channel is severed
+    /// reaches the agent after the reconnect swap. This covers the bridge
+    /// layer that owns the swappable connection; a bare `LeaderClient` has no
+    /// reconnect state to replay through.
+    #[tokio::test]
+    async fn test_cancel_severed_in_swap_window_reaches_agent_after_recovery() {
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<String>();
+        drop(dead_rx);
+        let shared = Arc::new(TokioMutex::new(dead_tx));
+        let cancel = CancellationToken::new();
+
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel::<String>();
+        let swapper_shared = shared.clone();
+        let swapper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            *swapper_shared.lock().await = new_tx;
+        });
+
+        let intent =
+            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"sess-swap"}}"#;
+        assert_eq!(
+            forward_outbound_line(&shared, &cancel, intent.into()).await,
+            ForwardOutcome::Sent
+        );
+        swapper.await.unwrap();
+        assert_eq!(new_rx.recv().await.as_deref(), Some(intent));
+        assert!(
+            new_rx.try_recv().is_err(),
+            "cancel intent must be resent once"
+        );
+    }
+
+    #[test]
+    fn only_cancel_notifications_are_retryable() {
+        assert!(is_cancel_intent(
+            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"sess"}}"#
+        ));
+        assert!(!is_cancel_intent(
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/cancel","params":{"sessionId":"sess"}}"#
+        ));
+        assert!(!is_cancel_intent(
+            r#"{"jsonrpc":"2.0","method":"session/prompt","params":{"sessionId":"sess"}}"#
+        ));
+        assert!(!is_cancel_intent(
+            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{}}"#
+        ));
     }
 
     #[tokio::test]

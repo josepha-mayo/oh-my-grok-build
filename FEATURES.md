@@ -18,14 +18,14 @@ This file is the single source of truth for what `oh-my-grok-build` is and what 
 |------|---------|
 | `crates/codegen/xai-grok-*` | Upstream Grok Build Rust source. Edits kept minimal and clearly marked (`omgb:` comments or new extension crates). |
 | `crates/oh-my-grok-build` | New composition-root binary `oh-my-grok-build` / `omgb`. It imports the upstream `xai-grok-*` crates and contains all new subcommands (provider, model, exec, team, workflow, research, serve, dap, lsp, etc.). |
-| `crates/omgb-providers` | BYOK providers, local model discovery, model-switching, provider connectivity tests. |
-| `crates/omgb-scheduler` | Cron/scheduled prompt execution, background daemon, safe lifecycle. |
-| `crates/omgb-subagents` | `team`, `swarm`, `subagent spawn/list/kill/logs/trace`, worktree isolation. |
-| `crates/omgb-taste` | Personal taste/style learning from accepts/rejects/edits. |
-| `crates/omgb-timeline` | Cross-session event logging and `timeline` command. |
-| `crates/omgb-research` | ArXiv/web research and patch proposal. |
-| `crates/omgb-harness` | Cross-harness connectors for OpenCode, Codex, Claude, Hermes, Pi, OMP, etc. |
-| `crates/omgb-mobile-relay` | ACP/WebSocket server for the mobile app, QR pairing, rate limiting, origin/secret checks. |
+| `crates/oh-my-grok-build/src/providers.rs`, `moe.rs` | BYOK providers, local model discovery, model switching, and cost routing. |
+| `crates/oh-my-grok-build/src/scheduler.rs` | Cron/scheduled prompt execution, background daemon, and lifecycle handling. |
+| `crates/oh-my-grok-build/src/subagents.rs`, `team.rs`, `swarm.rs` | Subagent commands, task splitting, and worktree isolation. |
+| `crates/oh-my-grok-build/src/taste.rs` | Personal taste/style learning from accepts, rejects, and edits. |
+| `crates/oh-my-grok-build/src/timeline.rs` | Cross-session event logging and the `timeline` command. |
+| `crates/oh-my-grok-build/src/research.rs` | ArXiv/web research and patch proposal. |
+| `crates/oh-my-grok-build/src/harness.rs` | Cross-harness connectors for OpenCode, Codex, Claude, Hermes, Pi, OMP, and others. |
+| `crates/oh-my-grok-build/src/server.rs`, `group.rs` | ACP/WebSocket mobile relay plus group APIs, pairing, rate limiting, and origin/secret checks. |
 | `plugin/` | Grok Build plugin skills and slash commands (`/use`, `/browser`, `/schedule`, `/loop`, `/btw`, `/taste`, `/autonomous`, `/research`, `/workflow`, `/live`, etc.). |
 | `grok-build-app/` (separate repo) | React Native + Expo mobile app. |
 | `AGENTS.md` | Agent rules and conventions. |
@@ -52,6 +52,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | --- | --- |
 | `oh-my-grok-build` / `omgb` binary boots and calls into upstream `xai-grok-pager` | ✅ |
 | `omgb provider` — add BYOK providers (OpenAI, Anthropic, xAI, OpenRouter, Ollama, LM Studio, vLLM, llama.cpp, Tabby) | ✅ |
+| `omgb auth` — optional Grok subscription status/device login/logout, separate from BYOK | ✅ |
 | `omgb provider discover` — local model discovery (Ollama/LM Studio) | ✅ |
 | `omgb model` — switch default model, list custom models | ✅ |
 | `omgb exec` — single-turn headless prompt | ✅ |
@@ -60,6 +61,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | `omgb team` — team mode with isolated git worktrees | ✅ |
 | `omgb swarm` — parallel subagents with task splitting and majority-vote fallback | ✅ |
 | `omgb subagent spawn/list/kill/logs/trace` | ✅ |
+| `omgb thread` — persistent cross-session messaging with bounded inbox delivery | ✅ |
 | `omgb workflow` — exec/fan_out/shell workflow runner | ✅ |
 | `omgb research` — arXiv/web research and patch proposal | ✅ |
 | `omgb timeline` — recent session/job events | ✅ |
@@ -78,11 +80,11 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | Desktop-control safety (`OMGB_ALLOW_DESKTOP_CONTROL` gating) | ✅ |
 | `omgb commit` / `omgb review` / `omgb undo` helpers | ✅ |
 | Tests for every new crate (`cargo test -p oh-my-grok-build`) | ✅ |
-| `cargo fmt`, `cargo clippy`, `cargo test` green on CI | ✅ |
+| `cargo fmt`, `cargo clippy`, `cargo test` green on CI | 🚧 |
 
 > Phase 1 features are implemented as modules inside `crates/oh-my-grok-build`; the separate `omgb-*` crates listed in the repo layout may be extracted once the harness stabilizes.
 >
-> Build/CI update (2026-07-21): GitHub Actions is green on `ubuntu-latest`, `macos-latest`, and `windows-latest` for `cargo fmt --check`, `cargo clippy --workspace --all-targets` (Unix) / `cargo clippy -p oh-my-grok-build --all-targets` (Windows), `cargo test -p oh-my-grok-build`, and `cargo build -p oh-my-grok-build --bin safe-shell-guard` with the binary copied to `plugin/bin/safe-shell-guard` for hook verification. Full `cargo clippy --workspace` and `cargo test --workspace` are intentionally not run on Windows because upstream codegen crates contain Unix-only code.
+> CI status (verified 2026-08-09): the workflows contain cross-platform formatting, Clippy, test, and hook-binary checks, but the latest public runs are failing. Local Windows validation is being rerun against the current working tree. Full `cargo clippy --workspace` and `cargo test --workspace` are intentionally not run on Windows because upstream codegen crates contain Unix-only code.
 
 ### Phase 2 — Advanced harness gaps
 
@@ -100,7 +102,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | Multi-model cost routing / benchmark-optimized scaffolding | ✅ |
 | Local-first inference fallback (Ollama / LM Studio / vLLM) wired end-to-end | ✅ |
 | Doctor TUI remediation | ✅ |
-| Auto-mode classifier with recorded approvals/timeouts | ✅ |
+| Auto-mode classifier with explicit per-call approval (no inferred allow-rule persistence) | ✅ |
 | Taste learning automatic from accepts/rejects/edits | ✅ |
 | Anti-loop guard (16 repeated tool calls) | ✅ |
 
@@ -108,13 +110,18 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 
 | Feature | Status |
 | --- | --- |
-| Installation packages (Homebrew, cargo-binstall, MSI, DEB/RPM, signed tarball) | ⏳ |
-| GitHub Releases with signed binaries and SBOM | ⏳ |
-| CI (GitHub Actions) runs `cargo test`, `cargo clippy`, `cargo fmt --check`, cross-platform builds | ✅ |
+| Signed release archives and verified Unix/Windows first-install scripts | 🚧 |
+| Generated Homebrew formula with per-platform checksums | 🚧 |
+| Native Debian packages for AMD64 and ARM64 | 🚧 |
+| Native RPM packages for x86_64 and ARM64 | 🚧 |
+| Native Windows x64 MSI | 🚧 |
+| Generated WinGet manifests tied to the stable MSI checksum | 🚧 |
+| GitHub Releases with signed binaries and SBOM | 🚧 |
+| CI (GitHub Actions) runs `cargo test`, `cargo clippy`, `cargo fmt --check`, cross-platform builds | 🚧 |
 | App-store-ready native mobile app in separate repo | 🚧 |
-| User-facing docs (`README.md`, `docs/`) and man pages / `--help` | 🚧 |
-| Security hardening guide, telemetry policy, privacy policy | ⏳ |
-| Update mechanism (`omgb update`) with release channel support | ⏳ |
+| User-facing docs (`README.md`, `docs/`) and man pages / `--help` | ✅ |
+| Security hardening guide, telemetry policy, privacy policy | ✅ |
+| Update mechanism (`omgb update`) with release channel support | ✅ |
 
 ## 4. Mobile app
 
@@ -132,7 +139,7 @@ cargo clippy -p oh-my-grok-build --all-targets
 cargo test -p oh-my-grok-build
 
 # Distribution build
-cargo build --bin oh-my-grok-build --profile release-dist
+cargo build --bin omgb --profile release-dist
 ```
 
 ## 6. Notes

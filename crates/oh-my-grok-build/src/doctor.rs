@@ -93,7 +93,20 @@ pub async fn run_doctor(fix: bool, json: bool) -> Result<()> {
     }
     let checks = run_checks(fix).await;
     print_report(&checks, fix, json);
-    Ok(())
+    ensure_no_failed_checks(&checks)
+}
+
+fn ensure_no_failed_checks(checks: &[Check]) -> Result<()> {
+    let failures = checks
+        .iter()
+        .filter(|check| matches!(check.status, Status::Fail))
+        .map(|check| check.name.as_str())
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("doctor checks failed: {}", failures.join(", "))
+    }
 }
 
 fn is_fixable(name: &str) -> bool {
@@ -130,7 +143,16 @@ async fn run_doctor_tui() -> Result<()> {
     }
 
     print_report(&final_checks, true, false);
-    Ok(())
+    ensure_no_failed_checks(&final_checks)
+}
+
+struct TuiRestoreGuard;
+
+impl Drop for TuiRestoreGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen);
+    }
 }
 
 fn tui_select_fixes(checks: &[Check]) -> Result<Vec<String>> {
@@ -144,6 +166,7 @@ fn tui_select_fixes(checks: &[Check]) -> Result<Vec<String>> {
     }
 
     enable_raw_mode()?;
+    let _restore = TuiRestoreGuard;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -242,9 +265,6 @@ fn tui_select_fixes(checks: &[Check]) -> Result<Vec<String>> {
         }
     };
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
     if apply { Ok(result) } else { Ok(Vec::new()) }
 }
 
@@ -298,13 +318,14 @@ fn status_str(status: &Status) -> &'static str {
 }
 
 fn check_providers() -> Result<Check> {
-    let cfg = crate::providers::load_omg_config()?;
-    let providers: Vec<_> = cfg.providers.values().cloned().collect();
+    let providers = crate::providers::list_providers()?;
     if providers.is_empty() {
         return Ok(warn("provider config", "no providers configured"));
     }
 
+    let default_model = crate::providers::configured_default_model()?;
     let mut issues = Vec::new();
+    let mut credential_warnings = Vec::new();
     for p in &providers {
         if p.id.trim().is_empty() {
             issues.push("provider with empty id".to_string());
@@ -330,22 +351,24 @@ fn check_providers() -> Result<Check> {
             }
         }
 
-        if !crate::providers::is_local_provider_id(&p.id) {
+        if !crate::providers::is_local_provider_id(&p.id)
+            && !crate::net::is_url_host_loopback(&p.base_url)
+        {
             match crate::providers::resolve_api_key(p) {
                 Ok(None) | Err(_) => {
-                    issues.push(format!("provider {}: API key not resolvable", p.id));
+                    let message = format!("provider {}: API key not resolvable", p.id);
+                    if default_model.as_deref() == Some(format!("omgb-{}", p.id).as_str()) {
+                        issues.push(format!("default {message}"));
+                    } else {
+                        credential_warnings.push(message);
+                    }
                 }
                 Ok(Some(_)) => {}
             }
         }
     }
 
-    if issues.is_empty() {
-        Ok(ok(
-            "provider config",
-            format!("{} provider(s) valid", providers.len()),
-        ))
-    } else {
+    if !issues.is_empty() {
         Ok(fail(
             "provider config",
             format!(
@@ -354,6 +377,20 @@ fn check_providers() -> Result<Check> {
                 issues.len(),
                 issues.join("; ")
             ),
+        ))
+    } else if !credential_warnings.is_empty() {
+        Ok(warn(
+            "provider config",
+            format!(
+                "{} provider(s) valid; optional credentials unavailable: {}",
+                providers.len(),
+                credential_warnings.join("; ")
+            ),
+        ))
+    } else {
+        Ok(ok(
+            "provider config",
+            format!("{} provider(s) valid", providers.len()),
         ))
     }
 }
@@ -422,8 +459,8 @@ fn env_permissions_not_restricted(_path: &Path) -> Option<String> {
 }
 
 async fn check_safe_shell_guard(fix: bool) -> Result<Check> {
-    let root = find_workspace_root().context("cannot locate workspace root")?;
-    let plugin_bin = root.join("plugin").join("bin");
+    let plugin_root = locate_plugin_root()?;
+    let plugin_bin = plugin_root.join("bin");
     let binary = plugin_bin.join(safe_shell_guard_name());
 
     if binary.is_file() {
@@ -439,6 +476,16 @@ async fn check_safe_shell_guard(fix: bool) -> Result<Check> {
             format!("missing {}", binary.display()),
         ));
     }
+
+    let Some(root) = find_workspace_root() else {
+        return Ok(fail(
+            "safe-shell-guard",
+            format!(
+                "missing {}; reinstall the release archive because this binary installation has no source tree to rebuild it",
+                binary.display()
+            ),
+        ));
+    };
 
     build_and_copy_safe_shell_guard(&root, &binary)
         .await
@@ -479,6 +526,39 @@ fn find_workspace_root() -> Option<PathBuf> {
         dir = dir.parent()?;
     }
     None
+}
+
+fn locate_plugin_root() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot locate current executable")?;
+    Ok(locate_plugin_root_from(
+        &exe,
+        find_workspace_root().as_deref(),
+    ))
+}
+
+fn locate_plugin_root_from(exe: &Path, workspace_root: Option<&Path>) -> PathBuf {
+    let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let mut dir = Some(exe_dir);
+    for _ in 0..6 {
+        let Some(candidate_parent) = dir else {
+            break;
+        };
+        let candidate = candidate_parent.join("plugin");
+        if candidate.is_dir() {
+            return candidate;
+        }
+        dir = candidate_parent.parent();
+    }
+
+    if let Some(root) = workspace_root {
+        return root.join("plugin");
+    }
+    if exe_dir.file_name().is_some_and(|name| name == "bin")
+        && let Some(install_root) = exe_dir.parent()
+    {
+        return install_root.join("plugin");
+    }
+    exe_dir.join("plugin")
 }
 
 fn verify_safe_shell_guard_source(root: &Path) -> Result<()> {
@@ -576,8 +656,8 @@ fn build_profile() -> &'static str {
 }
 
 fn check_plugin_hooks() -> Result<Check> {
-    let root = find_workspace_root().context("cannot locate workspace root")?;
-    let hooks_json = root.join("plugin").join("hooks").join("hooks.json");
+    let plugin_root = locate_plugin_root()?;
+    let hooks_json = plugin_root.join("hooks").join("hooks.json");
     if !hooks_json.is_file() {
         return Ok(fail(
             "plugin hooks",
@@ -607,28 +687,50 @@ struct SubagentRecord {
     #[allow(dead_code)]
     id: String,
     pid: u32,
+    #[serde(default)]
+    executable: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SchedulerPidRecord {
+    pid: u32,
+    executable: String,
+}
+
+fn process_matches_executable(pid: u32, executable: &str) -> bool {
+    crate::process_alive(pid)
+        && crate::lsp::process_image_path(pid)
+            .is_ok_and(|actual| crate::lsp::same_executable(Path::new(executable), &actual))
 }
 
 fn check_stale_daemons(fix: bool) -> Result<Check> {
     let omg = crate::providers::omg_dir()?;
     let mut messages = Vec::new();
+    let mut requires_attention = false;
 
     // Scheduler PID file.
     let scheduler_pid = omg.join("scheduler.pid");
     if scheduler_pid.is_file() {
         let raw = std::fs::read_to_string(&scheduler_pid).unwrap_or_default();
-        let pid = raw.trim().parse::<u32>();
-        match pid {
-            Ok(pid) if crate::process_alive(pid) => {
-                messages.push(format!("scheduler running (pid {pid})"));
+        match serde_json::from_str::<SchedulerPidRecord>(&raw) {
+            Ok(record) if process_matches_executable(record.pid, &record.executable) => {
+                messages.push(format!("scheduler running (pid {})", record.pid));
             }
-            _ => {
+            Ok(_) => {
                 if fix {
                     let _ = std::fs::remove_file(&scheduler_pid);
                     messages.push("removed stale scheduler.pid".to_string());
                 } else {
                     messages.push(format!("stale scheduler.pid: {}", raw.trim()));
+                    requires_attention = true;
                 }
+            }
+            Err(_) => {
+                messages.push(
+                    "unverified scheduler.pid; restart the scheduler before attempting to stop it"
+                        .to_string(),
+                );
+                requires_attention = true;
             }
         }
     }
@@ -637,22 +739,35 @@ fn check_stale_daemons(fix: bool) -> Result<Check> {
     let subagents_path = omg.join("subagents.jsonl");
     if subagents_path.is_file() {
         let raw = std::fs::read_to_string(&subagents_path).unwrap_or_default();
-        let mut alive = Vec::new();
+        let mut retained = Vec::new();
+        let mut running = 0;
         let mut stale = 0;
+        let mut unverified = 0;
         for line in raw.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             match serde_json::from_str::<SubagentRecord>(trimmed) {
-                Ok(rec) if crate::process_alive(rec.pid) => alive.push(line.to_string()),
-                _ => stale += 1,
+                Ok(rec)
+                    if rec.executable.as_deref().is_some_and(|executable| {
+                        process_matches_executable(rec.pid, executable)
+                    }) =>
+                {
+                    retained.push(line.to_string());
+                    running += 1;
+                }
+                Ok(rec) if rec.executable.is_some() => stale += 1,
+                Ok(_) | Err(_) => {
+                    retained.push(line.to_string());
+                    unverified += 1;
+                }
             }
         }
 
         if stale > 0 {
             if fix {
-                let content = alive.join("\n");
+                let content = retained.join("\n");
                 if content.is_empty() {
                     let _ = std::fs::remove_file(&subagents_path);
                     messages.push("removed subagents.jsonl (all stale)".to_string());
@@ -663,21 +778,26 @@ fn check_stale_daemons(fix: bool) -> Result<Check> {
                 }
             } else {
                 messages.push(format!("{stale} stale subagent record(s)"));
+                requires_attention = true;
             }
-        } else {
-            messages.push(format!("{} subagent record(s) alive", alive.len()));
+        }
+        if unverified > 0 {
+            messages.push(format!(
+                "{unverified} unverified subagent record(s) from an older or malformed registry"
+            ));
+            requires_attention = true;
+        }
+        if stale == 0 && unverified == 0 {
+            messages.push(format!("{running} subagent record(s) running"));
         }
     }
 
     if messages.is_empty() {
         Ok(ok("stale daemons", "no scheduler/subagent state found"))
+    } else if requires_attention {
+        Ok(warn("stale daemons", messages.join("; ")))
     } else {
-        let has_stale = messages.iter().any(|m| m.contains("stale"));
-        if has_stale && !fix {
-            Ok(warn("stale daemons", messages.join("; ")))
-        } else {
-            Ok(ok("stale daemons", messages.join("; ")))
-        }
+        Ok(ok("stale daemons", messages.join("; ")))
     }
 }
 
@@ -689,5 +809,52 @@ async fn check_git() -> Result<Check> {
             Ok(ok("git", text.trim().to_string()))
         }
         _ => Ok(fail("git", "git is not installed or not on PATH")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_checks_make_doctor_fail() {
+        assert!(ensure_no_failed_checks(&[fail("broken", "nope")]).is_err());
+        assert!(ensure_no_failed_checks(&[ok("good", "ok")]).is_ok());
+    }
+
+    #[test]
+    fn plugin_root_supports_release_bin_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("omgb");
+        let plugin = install.join("plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+
+        assert_eq!(
+            locate_plugin_root_from(&install.join("bin").join("omgb"), None),
+            plugin
+        );
+    }
+
+    #[test]
+    fn plugin_root_supports_flat_release_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+
+        assert_eq!(
+            locate_plugin_root_from(&temp.path().join("omgb"), None),
+            plugin
+        );
+    }
+
+    #[test]
+    fn missing_release_plugin_reports_expected_sibling_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("omgb");
+
+        assert_eq!(
+            locate_plugin_root_from(&install.join("bin").join("omgb"), None),
+            install.join("plugin")
+        );
     }
 }

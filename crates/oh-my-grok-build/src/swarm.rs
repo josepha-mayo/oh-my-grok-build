@@ -3,17 +3,28 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
+const MAX_SWARM_MEMBERS: usize = 16;
+const MAX_SUBTASK_BYTES: usize = 16 * 1024;
+const MAX_SPLITTER_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_SWARM_RESULT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_COMBINED_RESULT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SUBTASK_CONCURRENCY: usize = 4;
+const SPLITTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub async fn run_swarm_task_splitting(
     prompt: &str,
     model: Option<String>,
     yolo: bool,
     count: usize,
 ) -> Result<String> {
+    if count == 0 || count > MAX_SWARM_MEMBERS {
+        bail!("swarm count must be between 1 and {MAX_SWARM_MEMBERS}");
+    }
     if count <= 1 {
         return exec_plain(prompt, model, yolo, None).await;
     }
 
-    let subtasks = match fetch_subtasks(prompt, model.clone(), yolo, count).await {
+    let subtasks = match fetch_subtasks(prompt, model.clone(), count).await {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => {
             eprintln!("warning: task splitting returned no subtasks; falling back to ensemble");
@@ -36,6 +47,9 @@ pub(crate) async fn run_swarm_ensemble(
     yolo: bool,
     count: usize,
 ) -> Result<String> {
+    if count == 0 || count > MAX_SWARM_MEMBERS {
+        bail!("swarm count must be between 1 and {MAX_SWARM_MEMBERS}");
+    }
     let mut handles = Vec::new();
     for i in 0..count {
         let member_prompt = format!(
@@ -108,17 +122,17 @@ pub(crate) async fn exec_plain(
         bail!("exec failed");
     }
 
+    let metadata = tokio::fs::metadata(&output_file).await?;
+    if metadata.len() > MAX_SWARM_RESULT_BYTES {
+        let _ = tokio::fs::remove_file(&output_file).await;
+        bail!("swarm output exceeds the {MAX_SWARM_RESULT_BYTES} byte limit");
+    }
     let text = tokio::fs::read_to_string(&output_file).await?;
     let _ = tokio::fs::remove_file(&output_file).await;
     Ok(text)
 }
 
-async fn fetch_subtasks(
-    prompt: &str,
-    model: Option<String>,
-    yolo: bool,
-    count: usize,
-) -> Result<Vec<String>> {
+async fn fetch_subtasks(prompt: &str, model: Option<String>, count: usize) -> Result<Vec<String>> {
     let split_prompt = build_split_prompt(count, prompt);
     let prompt_file = crate::write_prompt_temp(&split_prompt).await?;
     let _prompt_guard = crate::PromptFileGuard(prompt_file.clone());
@@ -129,22 +143,47 @@ async fn fetch_subtasks(
         .arg("--prompt-file")
         .arg(&prompt_file)
         .arg("--json")
+        .arg("--disallowed-tools")
+        .arg(crate::all_tool_ids_csv().as_str())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     if let Some(m) = &model {
         cmd.arg("--model").arg(m);
     }
-    if yolo {
-        cmd.arg("--yolo");
-    }
-
-    let out = cmd.output().await?;
-    if !out.status.success() {
+    let (mut child, group) = crate::spawn_with_process_group(cmd)?;
+    let mut stdout = child.stdout.take().context("splitter stdout not piped")?;
+    let capture = tokio::spawn(async move {
+        let mut capture = crate::BoundedCapture::new(MAX_SPLITTER_OUTPUT_BYTES + 1);
+        tokio::io::copy(&mut stdout, &mut capture).await?;
+        Ok::<_, std::io::Error>(capture.into_string())
+    });
+    let status = match tokio::time::timeout(SPLITTER_TIMEOUT, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            crate::kill_child_and_reap(&mut child, group.as_ref()).await;
+            capture.abort();
+            bail!(
+                "task splitting timed out after {}s",
+                SPLITTER_TIMEOUT.as_secs()
+            );
+        }
+    };
+    crate::kill_process_group(group.as_ref());
+    let text = capture.await.context("splitter output task failed")??;
+    if !status.success() {
         bail!("task splitting failed");
     }
-
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_subtasks(&text).context("failed to parse subtasks")
+    if text.len() > MAX_SPLITTER_OUTPUT_BYTES {
+        bail!("task splitter output exceeds the {MAX_SPLITTER_OUTPUT_BYTES} byte limit");
+    }
+    let subtasks = parse_subtasks(&text).context("failed to parse subtasks")?;
+    if subtasks.len() != count {
+        bail!(
+            "task splitter returned {} subtasks; expected exactly {count}",
+            subtasks.len()
+        );
+    }
+    Ok(subtasks)
 }
 
 async fn run_subtasks(
@@ -152,20 +191,30 @@ async fn run_subtasks(
     model: Option<String>,
     yolo: bool,
 ) -> Result<Vec<String>> {
-    let mut handles = Vec::new();
-    for subtask in subtasks {
-        let subtask = subtask.clone();
-        let model = model.clone();
-        handles.push(tokio::spawn(async move {
-            exec_plain(&subtask, model, yolo, None).await
-        }));
-    }
-
     let mut results = Vec::new();
-    for h in handles {
-        match h.await? {
-            Ok(text) => results.push(text),
-            Err(e) => eprintln!("warning: subtask failed: {e}"),
+    let mut result_bytes = 0_usize;
+    for batch in subtasks.chunks(MAX_SUBTASK_CONCURRENCY) {
+        let handles: Vec<_> = batch
+            .iter()
+            .map(|subtask| {
+                let model = model.clone();
+                let subtask = subtask.clone();
+                tokio::spawn(async move { exec_plain(&subtask, model, yolo, None).await })
+            })
+            .collect();
+        for handle in handles {
+            match handle.await? {
+                Ok(text) => {
+                    result_bytes = result_bytes.saturating_add(text.len());
+                    if result_bytes > MAX_COMBINED_RESULT_BYTES {
+                        bail!(
+                            "combined swarm results exceed the {MAX_COMBINED_RESULT_BYTES} byte limit"
+                        );
+                    }
+                    results.push(text);
+                }
+                Err(e) => eprintln!("warning: subtask failed: {e}"),
+            }
         }
     }
 
@@ -198,9 +247,13 @@ pub fn parse_subtasks(raw: &str) -> Option<Vec<String>> {
     let trimmed = raw.trim();
 
     fn try_array(s: &str) -> Option<Vec<String>> {
-        serde_json::from_str::<Vec<String>>(s)
-            .ok()
-            .filter(|a| !a.is_empty())
+        serde_json::from_str::<Vec<String>>(s).ok().filter(|items| {
+            !items.is_empty()
+                && items.len() <= MAX_SWARM_MEMBERS
+                && items
+                    .iter()
+                    .all(|item| !item.trim().is_empty() && item.len() <= MAX_SUBTASK_BYTES)
+        })
     }
 
     if let Some(arr) = try_array(trimmed) {
@@ -261,7 +314,10 @@ pub fn parse_subtasks(raw: &str) -> Option<Vec<String>> {
             }
         })
         .collect();
-    if !numbered.is_empty() && numbered.len() <= 20 {
+    if !numbered.is_empty()
+        && numbered.len() <= MAX_SWARM_MEMBERS
+        && numbered.iter().all(|item| item.len() <= MAX_SUBTASK_BYTES)
+    {
         return Some(numbered);
     }
 
@@ -333,6 +389,19 @@ mod tests {
         assert!(parse_subtasks("[]").is_none());
         assert!(parse_subtasks("not json").is_none());
         assert!(parse_subtasks("{\"foo\": [\"a\"]}").is_none());
+    }
+
+    #[test]
+    fn parse_subtasks_rejects_oversized_plans_and_items() {
+        let too_many = serde_json::to_string(
+            &(0..=MAX_SWARM_MEMBERS)
+                .map(|index| format!("task-{index}"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(parse_subtasks(&too_many).is_none());
+        let oversized = serde_json::to_string(&vec!["x".repeat(MAX_SUBTASK_BYTES + 1)]).unwrap();
+        assert!(parse_subtasks(&oversized).is_none());
     }
 
     #[test]

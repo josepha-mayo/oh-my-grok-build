@@ -24,6 +24,24 @@ Distribution builds use the hardened profile:
 cargo build -p oh-my-grok-build --profile release-dist
 ```
 
+Published releases also include verified first-install scripts. Download the
+script from the same release you intend to install, inspect it, then run it:
+
+```bash
+# Linux or macOS
+sh install.sh vMAJOR.MINOR.PATCH
+```
+
+```powershell
+# Windows PowerShell
+.\install.ps1 -Version vMAJOR.MINOR.PATCH
+```
+
+The installers verify the release archive's SHA-256 checksum and GitHub build
+provenance by default, install the adjacent plugin tree, and run `omgb doctor`.
+They require the GitHub CLI (`gh`) unless their explicit insecure override is
+used.
+
 ## Quick start
 
 Run a headless prompt:
@@ -40,6 +58,20 @@ OMGB_API_KEY="$OPENAI_API_KEY" omgb provider add openai --default
 omgb exec "write a rust fibonacci" --model omgb-openai
 ```
 
+Or discover a local provider without any account sign-in:
+
+```bash
+omgb provider discover --add
+```
+
+Grok subscription sign-in is optional and separate from BYOK/local setup:
+
+```bash
+omgb auth status
+omgb auth login            # device code
+omgb auth login --browser  # local browser callback
+```
+
 Run deep arXiv research (with optional model patch):
 
 ```bash
@@ -49,9 +81,15 @@ omgb research "quantum error correction" --count 5 --model omgb-openai --yolo
 Start the WebSocket relay server:
 
 ```bash
-omgb serve --bind 0.0.0.0:9999 --insecure-allow-lan
+omgb serve --bind 0.0.0.0:9999 --insecure-allow-lan --allowed-origins '*'
 omgb connect ws://127.0.0.1:9999 --secret <pairing-secret>
 ```
+
+LAN mode is explicitly opt-in. Prefer `wss://` behind a TLS-terminating proxy
+when it is available, and replace `*` with exact browser origins when serving
+browser clients. The same `--allowed-origins` policy controls WebSocket origin
+checks and CORS for the authenticated HTTP group API. An HTTPS-hosted web
+companion requires `wss://`; use the native app for a local `ws://` relay.
 
 ## Configuration
 
@@ -70,6 +108,7 @@ omgb connect ws://127.0.0.1:9999 --secret <pairing-secret>
 | `omgb loop "<prompt>"` | Iterate until the git working tree is clean (anti-loop guard). |
 | `omgb autonomous "<prompt>"` | High-autonomy mode with guard checks and auto-approval. |
 | `omgb provider list|catalog|add|remove|discover|test` | Manage BYOK/local provider templates and keys. |
+| `omgb auth status|login|logout` | Manage optional Grok subscription sign-in without changing BYOK keys. |
 | `omgb model list` / `omgb model switch <model>` | List models or set the default model (provider id or `omgb-<id>`). |
 | `omgb cron "<expr>" "<prompt>"` | Schedule a repeating job (cron or interval expression). |
 | `omgb schedule list|add|run|delete|start|stop|set-expiry|cleanup-expired` | Manage scheduled jobs. |
@@ -96,6 +135,7 @@ omgb connect ws://127.0.0.1:9999 --secret <pairing-secret>
 | `omgb use` / `omgb browser` | Computer / browser use (gated by `--yolo` or `OMGB_ALLOW_DESKTOP_CONTROL=1`). |
 | `omgb mcp` | Manage MCP servers. |
 | `omgb doctor` | Environment diagnostics and remediation. |
+| `omgb update --check` / `omgb update --apply` | Check for or install an attestation-verified GitHub Release update. |
 | `omgb taste` | Remember a coding-style preference. |
 | `omgb skill` | Manage auto-generated skills. |
 | `omgb commit` | Commit the current working tree. |
@@ -105,10 +145,13 @@ omgb connect ws://127.0.0.1:9999 --secret <pairing-secret>
 
 ## Mobile app
 
-A separate React Native + Expo mobile app lives in the `grok-build-app` repository.
+A separate React Native + Expo mobile app lives in the `grok-build-app` repository. The `omgb serve` QR includes the harness's absolute working directory so the app can create a valid ACP session on both Windows and Unix without guessing a path.
 It pairs with `omgb serve` over ACP/WebSocket using a QR code or manual URL/secret,
 and supports chat, tool approval, model switching, slash commands, `/help` for command
-discovery, message history paging, and a `/live` voice/text screen.
+discovery, message history paging, and a `/live` hold-to-talk dictation screen. Live
+audio uses the same pairing secret on the relay's `/voice` endpoint; the harness keeps
+the xAI bearer local and returns STT transcripts to the phone, which submits each final
+transcript through its active ACP session.
 
 ```bash
 cd grok-build-app
@@ -131,4 +174,6 @@ cargo clippy -p oh-my-grok-build
 cargo test -p oh-my-grok-build
 ```
 
-A release workflow in `.github/workflows/release.yml` builds `omgb` for Linux, macOS, and Windows on pushed `v*` tags.
+A release workflow in `.github/workflows/release.yml` builds `omgb` for Linux x86_64/ARM64, macOS Intel/Apple Silicon, and Windows x86_64 on pushed `v*` tags. Each release artifact is accompanied by a checksum, SBOM, and GitHub build-provenance attestation; the release also includes AMD64/ARM64 Debian and RPM packages, an x64 MSI, plus Unix and Windows first-install scripts.
+
+Maintainers should follow the [release playbook](docs/releasing.md) to verify the generated draft before making it available to self-updating clients.

@@ -7,10 +7,12 @@ use crate::remote::BackendClient;
 const FORK_LOG: &str = "xai_fork";
 use crate::session::export::ExportedMetadata;
 use crate::session::info::Info;
+use crate::session::persistence::{SessionStateCopy, acquire_session_writer_lease};
 use crate::session::storage::{CopySessionOptions, JsonlStorageAdapter};
 use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
-use std::io;
+use std::io::{self, Write as _};
+use std::path::{Component, Path};
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,13 +63,35 @@ fn generate_fork_session_id(_source_id: &str) -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+fn validate_fork_session_id(value: &str, field: &str) -> io::Result<()> {
+    uuid::Uuid::try_parse(value).map(|_| ()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{field} must be a UUID: {error}"),
+        )
+    })
+}
+
 /// Fork a saved session to a new working directory.
 pub async fn fork_session(
     request: ForkSessionRequest,
     agent_id: &str,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
 ) -> io::Result<ForkSessionResponse> {
+    fork_session_from_snapshot(request, agent_id, auth_manager, None).await
+}
+
+/// Fork a session from an actor-produced, flush-consistent snapshot. Callers
+/// should use this for an active session; the normal path instead acquires the
+/// persisted session's exclusive writer lease for the entire copy.
+pub async fn fork_session_from_snapshot(
+    request: ForkSessionRequest,
+    agent_id: &str,
+    auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
+    source_snapshot: Option<SessionStateCopy>,
+) -> io::Result<ForkSessionResponse> {
     let t0 = std::time::Instant::now();
+    validate_fork_session_id(&request.source_session_id, "source_session_id")?;
 
     let root_dir = grok_home();
     let storage = JsonlStorageAdapter::with_root(root_dir.clone());
@@ -83,6 +107,7 @@ pub async fn fork_session(
         .new_session_id
         .clone()
         .unwrap_or_else(|| generate_fork_session_id(&request.source_session_id));
+    validate_fork_session_id(&new_session_id, "new_session_id")?;
 
     let target_info = Info {
         id: acp::SessionId::new(new_session_id.clone()),
@@ -106,8 +131,24 @@ pub async fn fork_session(
         ..Default::default()
     };
 
+    let source_lease = if source_snapshot.is_none() {
+        Some(acquire_session_writer_lease(&source_info)?)
+    } else {
+        None
+    };
     let result = tokio::task::spawn_blocking(move || {
-        storage.copy_session_data_sync(&source_info, &target_info, options)
+        let _source_lease = source_lease;
+        if let Some(snapshot) = source_snapshot {
+            let snapshot_dir = materialize_session_snapshot(snapshot)?;
+            storage.copy_session_data_from_dir_sync(
+                &source_info,
+                snapshot_dir.path(),
+                &target_info,
+                options,
+            )
+        } else {
+            storage.copy_session_data_sync(&source_info, &target_info, options)
+        }
     })
     .await
     .map_err(|e| io::Error::other(format!("spawn_blocking panicked: {e}")))??;
@@ -161,6 +202,37 @@ pub async fn fork_session(
         parent_session_id: request.source_session_id,
         new_model_id: request.new_model_id,
     })
+}
+
+fn materialize_session_snapshot(snapshot: SessionStateCopy) -> io::Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new()
+        .prefix("grok-fork-snapshot-")
+        .tempdir()?;
+    for file in snapshot.files {
+        let relative = Path::new(&file.name);
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("session snapshot contains unsafe path: {}", file.name),
+            ));
+        }
+        let destination = dir.path().join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(destination)?;
+        output.write_all(&file.data)?;
+        output.sync_all()?;
+    }
+    Ok(dir)
 }
 
 /// Sync a forked session to the backend (for writeback mode).
@@ -245,6 +317,39 @@ mod tests {
         assert_eq!(id1.len(), 36);
         assert_eq!(id2.len(), 36);
         assert_eq!(id3.len(), 36);
+    }
+
+    #[test]
+    fn fork_session_ids_reject_path_components() {
+        assert!(validate_fork_session_id("..", "source_session_id").is_err());
+        assert!(validate_fork_session_id("../escaped", "new_session_id").is_err());
+        assert!(validate_fork_session_id("C:\\escaped", "new_session_id").is_err());
+        assert!(validate_fork_session_id(&uuid::Uuid::now_v7().to_string(), "id").is_ok());
+    }
+
+    #[test]
+    fn snapshot_materialization_rejects_unsafe_or_duplicate_paths() {
+        let traversal = SessionStateCopy {
+            files: vec![crate::session::persistence::CopiedSessionFile {
+                name: "../summary.json".to_string(),
+                data: b"{}".to_vec(),
+            }],
+        };
+        assert!(materialize_session_snapshot(traversal).is_err());
+
+        let duplicate = SessionStateCopy {
+            files: vec![
+                crate::session::persistence::CopiedSessionFile {
+                    name: "summary.json".to_string(),
+                    data: b"{}".to_vec(),
+                },
+                crate::session::persistence::CopiedSessionFile {
+                    name: "summary.json".to_string(),
+                    data: b"{}".to_vec(),
+                },
+            ],
+        };
+        assert!(materialize_session_snapshot(duplicate).is_err());
     }
 
     #[test]

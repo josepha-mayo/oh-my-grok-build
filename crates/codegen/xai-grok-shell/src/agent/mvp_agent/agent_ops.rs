@@ -1696,11 +1696,11 @@ impl MvpAgent {
     ///
     /// Uses async polling (never blocks the `LocalSet` runtime) with a 5s deadline
     /// to handle slow shutdowns (e.g., embedding API timeouts).
-    pub(super) async fn drain_old_session_thread(&self, session_id: &acp::SessionId) {
+    pub(super) async fn drain_old_session_thread(&self, session_id: &acp::SessionId) -> bool {
         let thread = self.session_threads.borrow_mut().remove(session_id);
-        let Some(thread) = thread else { return };
+        let Some(thread) = thread else { return true };
         if thread.is_finished() {
-            return;
+            return true;
         }
         tracing::info!(
             session_id = % session_id.0,
@@ -1712,7 +1712,7 @@ impl MvpAgent {
                 tracing::debug!(
                     session_id = % session_id.0, "Old session thread finished cleanly"
                 );
-                return;
+                return true;
             }
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!(
@@ -1720,7 +1720,10 @@ impl MvpAgent {
                     "Old session thread still running after 5s — proceeding with replay. \
                      Session data may be incomplete if the old actor is still writing."
                 );
-                return;
+                self.session_threads
+                    .borrow_mut()
+                    .insert(session_id.clone(), thread);
+                return false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1732,17 +1735,26 @@ impl MvpAgent {
     /// requests for the same session. Dropping the guard (every exit path of
     /// `load_session`, success or error) removes the marker and wakes all
     /// waiters via watch-channel closure.
-    pub(super) fn begin_session_load(
+    pub(super) async fn begin_session_load(
         &self,
         session_id: &acp::SessionId,
     ) -> SessionLoadGuard<'_> {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        self.loading_sessions.borrow_mut().insert(session_id.clone(), rx.clone());
-        SessionLoadGuard {
-            agent: self,
-            session_id: session_id.clone(),
-            rx,
-            _tx: tx,
+        loop {
+            let existing = self.loading_sessions.borrow().get(session_id).cloned();
+            if let Some(mut existing) = existing {
+                let _ = existing.changed().await;
+                continue;
+            }
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            self.loading_sessions
+                .borrow_mut()
+                .insert(session_id.clone(), rx.clone());
+            return SessionLoadGuard {
+                agent: self,
+                session_id: session_id.clone(),
+                rx,
+                _tx: tx,
+            };
         }
     }
     /// Session lookup that tolerates an in-flight `session/load`.
@@ -1761,11 +1773,14 @@ impl MvpAgent {
         &self,
         session_id: &acp::SessionId,
     ) -> Option<crate::session::SessionHandle> {
-        let existing = self.sessions.borrow().get(session_id).cloned();
-        if existing.is_some() {
-            return existing;
-        }
         self.wait_for_in_flight_session_load(session_id).await;
+        if self.loading_sessions.borrow().contains_key(session_id) {
+            tracing::warn!(
+                session_id = %session_id.0,
+                "refusing a session-scoped request while session/load remains in flight"
+            );
+            return None;
+        }
         self.sessions.borrow().get(session_id).cloned()
     }
     /// If a `session/load` for `session_id` is in flight, wait (bounded) for
@@ -1786,9 +1801,6 @@ impl MvpAgent {
         );
         let deadline = tokio::time::Instant::now() + LOAD_WAIT_TIMEOUT;
         loop {
-            if self.sessions.borrow().contains_key(session_id) {
-                return;
-            }
             let rx = self.loading_sessions.borrow().get(session_id).cloned();
             let Some(mut rx) = rx else { return };
             let now = tokio::time::Instant::now();
@@ -2883,6 +2895,7 @@ impl MvpAgent {
         &self,
         init: &acp::InitializeRequest,
         spec: SessionSpawnOptions<'_>,
+        writer_lease: Option<crate::session::persistence::SessionWriterLease>,
     ) -> Result<(), acp::Error> {
         let SessionSpawnOptions {
             session_info,
@@ -3437,7 +3450,7 @@ impl MvpAgent {
                 );
             }
         }
-        let (mut handle, permission_events_rx, agent_system_prompt, session_thread) = {
+        let (mut handle, permission_events_rx, agent_system_prompt, mut session_thread) = {
             let _timer = crate::instrumentation_timer!("session.spawn_actor_call");
             let session_key = self.auth_manager.current_or_expired().map(|a| a.key);
             let credentials = xai_chat_state::Credentials {
@@ -3652,6 +3665,7 @@ impl MvpAgent {
                 )
                 .await?
         };
+        session_thread._writer_lease = writer_lease;
         self.session_threads
             .borrow_mut()
             .insert(session_info.id.clone(), session_thread);

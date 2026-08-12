@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::DateTime;
 use serde::Deserialize;
 
@@ -26,48 +26,57 @@ struct SessionSummary {
 
 fn sessions_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
+    Ok(sessions_root_from(&xai_grok_config::grok_home(), &cwd))
+}
+
+fn sessions_root_from(grok_home: &Path, cwd: &Path) -> PathBuf {
     let encoded = xai_grok_config::encode_cwd_dirname(&cwd.to_string_lossy());
-    Ok(xai_grok_config::grok_home().join("sessions").join(encoded))
+    grok_home.join("sessions").join(encoded)
 }
 
-fn is_safe_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id != "."
-        && id != ".."
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-fn validate_session_id(id: &str) -> Result<()> {
-    if !is_safe_session_id(id) {
-        bail!("invalid session id '{id}'");
-    }
-    Ok(())
+fn normalize_session_id(id: &str) -> Result<String> {
+    uuid::Uuid::try_parse(id)
+        .map(|id| id.to_string())
+        .map_err(|_| anyhow::anyhow!("session id must be a valid UUID (got '{id}')"))
 }
 
 fn session_dir(id: &str) -> Result<PathBuf> {
-    validate_session_id(id)?;
-    Ok(sessions_root()?.join(id))
+    session_dir_from(&sessions_root()?, id)
 }
 
-fn list_session_dirs(root: &Path) -> Vec<PathBuf> {
+fn session_dir_from(root: &Path, id: &str) -> Result<PathBuf> {
+    Ok(root.join(normalize_session_id(id)?))
+}
+
+fn list_session_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                dirs.push(p);
-            }
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let p = entry.path();
+        let metadata = std::fs::symlink_metadata(&p)?;
+        if metadata.file_type().is_symlink() {
+            bail!("session directory entry is a symlink: {}", p.display());
+        }
+        if metadata.is_dir() {
+            dirs.push(p);
         }
     }
-    dirs
+    Ok(dirs)
 }
 
-fn read_summary(path: &Path) -> Option<SessionSummary> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<SessionSummary>(&s).ok())
+fn read_summary(path: &Path) -> Result<SessionSummary> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("session summary is not a regular file: {}", path.display());
+    }
+    Ok(serde_json::from_str::<SessionSummary>(
+        &std::fs::read_to_string(path)?,
+    )?)
 }
 
 fn fmt_time(ts: Option<i64>) -> String {
@@ -87,19 +96,30 @@ pub async fn run_session(cmd: SessionCommand) -> Result<()> {
 
 fn list_sessions() -> Result<()> {
     let root = sessions_root()?;
-    let dirs = list_session_dirs(&root);
+    let dirs = list_session_dirs(&root)?;
     if dirs.is_empty() {
         println!("No sessions found for this workspace.");
         return Ok(());
     }
 
-    let mut sessions: Vec<(PathBuf, SessionSummary)> = dirs
-        .into_iter()
-        .filter_map(|d| {
-            let summary = read_summary(&d.join("summary.json"))?;
-            Some((d, summary))
-        })
-        .collect();
+    let mut sessions: Vec<(PathBuf, SessionSummary)> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let summary_path = dir.join("summary.json");
+        let summary = match read_summary(&summary_path) {
+            Ok(summary) => summary,
+            Err(error) => {
+                eprintln!(
+                    "warning: session {} has an unreadable summary: {error}",
+                    dir.file_name().unwrap_or_default().to_string_lossy()
+                );
+                SessionSummary {
+                    summary: "[summary unavailable]".into(),
+                    ..Default::default()
+                }
+            }
+        };
+        sessions.push((dir, summary));
+    }
 
     sessions.sort_by(|a, b| b.1.last_message_time.cmp(&a.1.last_message_time));
 
@@ -118,13 +138,22 @@ fn list_sessions() -> Result<()> {
 }
 
 async fn run_session_new(args: SessionNewArgs) -> Result<()> {
-    if let Some(ref sid) = args.session_id
-        && session_dir(sid)?.exists()
+    let session_id = args
+        .session_id
+        .as_deref()
+        .map(normalize_session_id)
+        .transpose()?;
+    let explicit_dir = session_id.as_deref().map(session_dir).transpose()?;
+    if let Some(ref dir) = explicit_dir
+        && dir.exists()
     {
-        bail!("session already exists: {sid}");
+        bail!(
+            "session already exists: {}",
+            args.session_id.as_deref().unwrap_or_default()
+        );
     }
     let session = SessionParams {
-        session_id: args.session_id,
+        session_id,
         ..Default::default()
     };
     run_single_turn_with(
@@ -144,15 +173,35 @@ async fn run_session_new(args: SessionNewArgs) -> Result<()> {
 }
 
 async fn run_session_resume(args: SessionResumeArgs) -> Result<()> {
-    if let Some(ref sid) = args.source_session_id {
-        validate_session_id(sid)?;
+    if args.source_session_id.is_some() && args.continue_last {
+        bail!("pass a source session id or --continue, not both");
     }
-    if let Some(ref sid) = args.target_session_id {
-        validate_session_id(sid)?;
+    if args.target_session_id.is_some() && !args.fork_session {
+        bail!("--session-id requires --fork-session when resuming");
+    }
+    let source_session_id = args
+        .source_session_id
+        .as_deref()
+        .map(normalize_session_id)
+        .transpose()?;
+    let target_session_id = args
+        .target_session_id
+        .as_deref()
+        .map(normalize_session_id)
+        .transpose()?;
+    if let Some(ref sid) = source_session_id
+        && !session_dir(sid)?.is_dir()
+    {
+        bail!("source session '{sid}' does not exist in this workspace");
+    }
+    if let Some(ref sid) = target_session_id
+        && session_dir(sid)?.exists()
+    {
+        bail!("target session '{sid}' already exists");
     }
     let session = SessionParams {
-        resume: args.source_session_id.clone(),
-        session_id: args.target_session_id,
+        resume: source_session_id,
+        session_id: target_session_id,
         fork_session: args.fork_session,
         continue_last: args.continue_last,
     };
@@ -174,32 +223,24 @@ async fn run_session_resume(args: SessionResumeArgs) -> Result<()> {
 }
 
 async fn run_session_fork(args: SessionForkArgs) -> Result<()> {
-    let parent = args.parent_session_id;
-    validate_session_id(&parent)?;
+    let parent = normalize_session_id(&args.parent_session_id)?;
     let parent_dir = session_dir(&parent)?;
-    if !parent_dir.exists() {
+    if !parent_dir.is_dir() {
         bail!("parent session '{}' does not exist", parent);
+    }
+    let parent_meta = std::fs::symlink_metadata(&parent_dir)?;
+    if parent_meta.is_symlink() {
+        bail!("parent session '{}' is a symbolic link", parent);
     }
 
     let new_id = match args.new_session_id {
-        Some(id) => {
-            validate_session_id(&id)?;
-            id
-        }
-        None => {
-            let id = format!("{parent}-fork-{}", uuid::Uuid::new_v4());
-            validate_session_id(&id)?;
-            id
-        }
+        Some(id) => normalize_session_id(&id)?,
+        None => uuid::Uuid::new_v4().to_string(),
     };
     let new_dir = session_dir(&new_id)?;
     if new_dir.exists() {
         bail!("session '{new_id}' already exists");
     }
-    std::fs::create_dir_all(&new_dir)?;
-    copy_compaction_checkpoints(&parent_dir, &new_dir)
-        .with_context(|| "failed to copy compaction checkpoints")?;
-
     let session = SessionParams {
         resume: Some(parent),
         session_id: Some(new_id),
@@ -223,56 +264,30 @@ async fn run_session_fork(args: SessionForkArgs) -> Result<()> {
     .await
 }
 
-fn copy_compaction_checkpoints(src: &Path, dst: &Path) -> Result<()> {
-    let src_ckpt = src.join("compaction_checkpoints");
-    if !src_ckpt.exists() {
-        return Ok(());
-    }
-    let meta = std::fs::symlink_metadata(&src_ckpt)
-        .with_context(|| format!("metadata for {}", src_ckpt.display()))?;
-    if !meta.is_dir() {
-        bail!("{} is not a directory", src_ckpt.display());
-    }
-    let dst_ckpt = dst.join("compaction_checkpoints");
-    std::fs::create_dir_all(&dst_ckpt)?;
-    for entry in std::fs::read_dir(&src_ckpt)? {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("metadata for {}", path.display()))?;
-        if meta.is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            copy_compaction_checkpoints(&path, &dst_ckpt.join(entry.file_name()))?;
-        } else if meta.is_file() {
-            std::fs::copy(&path, dst_ckpt.join(entry.file_name()))
-                .with_context(|| format!("copy {} to {}", path.display(), dst_ckpt.display()))?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_session_paths_under_grok_home() {
-        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("omgb-session-test-{}-", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("GROK_HOME", &tmp) };
+        let cwd = tmp.join("workspace");
 
-        let root = sessions_root().unwrap();
+        let root = sessions_root_from(&tmp, &cwd);
         assert!(root.starts_with(&tmp));
         assert!(root.to_string_lossy().contains("sessions"));
 
-        let dir = session_dir("sess-1").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = session_dir_from(&root, &id).unwrap();
         assert!(dir.starts_with(&tmp));
-        assert_eq!(dir.file_name().unwrap_or_default(), "sess-1");
+        assert_eq!(dir.file_name().unwrap_or_default(), id.as_str());
+    }
 
-        unsafe { std::env::remove_var("GROK_HOME") };
-        let _ = std::fs::remove_dir_all(&tmp);
+    #[test]
+    fn session_ids_match_the_upstream_uuid_contract() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(normalize_session_id(&id).unwrap(), id);
+        assert!(normalize_session_id("named-session").is_err());
+        assert!(normalize_session_id("../escape").is_err());
     }
 }

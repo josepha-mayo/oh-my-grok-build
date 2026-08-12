@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -18,8 +18,8 @@ use xai_grok_pager::app::{PagerArgs, run as pager_run};
 use xai_grok_pager::headless::{HeadlessOptions, HeadlessPrompt, OutputFormat, run_single_turn};
 use xai_grok_shell::agent::config::Config as AgentConfig;
 
-mod approvals;
 mod args;
+mod auth;
 mod doctor;
 mod group;
 mod harness;
@@ -47,6 +47,9 @@ mod threads;
 mod timeline;
 mod tool_overrides;
 mod tools;
+mod update;
+#[cfg(windows)]
+mod win_sid;
 mod workflow;
 
 use args::*;
@@ -251,6 +254,7 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Loop(args) => run_loop(args).await,
         OmgbCommand::Autonomous(args) => run_autonomous(args).await,
         OmgbCommand::Provider(args) => run_provider(args).await,
+        OmgbCommand::Auth(args) => auth::run_auth(args).await,
         OmgbCommand::Model(args) => run_model(args).await,
         OmgbCommand::Cron(args) => run_cron(args).await,
         OmgbCommand::Schedule(args) => run_schedule(args).await,
@@ -287,6 +291,7 @@ async fn async_main(cli: OmgbArgs) -> Result<()> {
         OmgbCommand::Review => run_review().await,
         OmgbCommand::Undo(args) => run_undo(args).await,
         OmgbCommand::Feedback(args) => run_feedback(args).await,
+        OmgbCommand::Update(args) => update::run(&args).await,
     }
 }
 
@@ -350,15 +355,6 @@ pub(crate) async fn run_tui(args: TuiArgs) -> Result<()> {
         pager_args.session_id.as_deref(),
     )?;
     crate::tool_overrides::apply_tool_overrides_to_pager_args(&overrides, &mut pager_args)?;
-
-    if !pager_args.yolo {
-        match crate::approvals::load_approvals(chrono::Utc::now()) {
-            Ok(approvals) => pager_args
-                .allow_rules
-                .extend(crate::approvals::to_allow_rules(&approvals)),
-            Err(e) => eprintln!("warning: failed to load approvals: {e}"),
-        }
-    }
 
     let mut rules_parts = Vec::new();
     if let Some(r) = pager_args.rules.take() {
@@ -554,67 +550,35 @@ fn read_prompt_file(path: &std::path::Path) -> Result<String> {
 /// Write output to `path` without following a final symlink by writing to a
 /// temporary file in the same directory and atomically renaming it into place.
 fn write_output_file(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("output path has no file name: {}", path.display()))?
-        .to_string_lossy();
-    let tmp = path.with_file_name(format!(".{}.tmp.{}", name, uuid::Uuid::new_v4()));
-    if let Err(e) = std::fs::write(&tmp, contents.as_ref()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    #[cfg(windows)]
-    {
-        // On Windows, std::fs::rename will not replace an existing file.
-        // Remove an existing target first (symlinks/directories are rejected by
-        // resolve_path, but leave directories untouched as a defensive measure).
-        if let Ok(meta) = std::fs::symlink_metadata(path)
-            && !meta.is_dir()
-            && let Err(e) = std::fs::remove_file(path)
-        {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
-        }
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(())
+    crate::providers::write_file_atomic(path, contents, false)
 }
 
 pub(crate) async fn write_prompt_temp(prompt: &str) -> Result<PathBuf> {
     let dir = scratch_dir()?;
     let file_name = format!("omgb-prompt-{}.txt", uuid::Uuid::new_v4());
     let path = dir.join(&file_name);
-    tokio::fs::create_dir_all(&dir).await?;
-    tokio::fs::write(&path, prompt.as_bytes()).await?;
     let path2 = path.clone();
-    tokio::task::spawn_blocking(move || restrict_temp_permissions(&path2)).await??;
+    let prompt = prompt.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || {
+        crate::providers::restrict_omg_directory_permissions(&dir)?;
+        crate::providers::write_file_atomic(&path2, prompt, true)
+    })
+    .await??;
     Ok(path)
 }
 
-#[cfg(unix)]
-fn restrict_temp_permissions(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn restrict_temp_permissions(_path: &std::path::Path) -> Result<()> {
-    // Windows TEMP is already per-user; no Unix-style mode setting.
-    Ok(())
-}
-
 pub(crate) struct PromptFileGuard(PathBuf);
+impl PromptFileGuard {
+    pub(crate) fn disarm(mut self) {
+        self.0.clear();
+    }
+}
 impl Drop for PromptFileGuard {
     fn drop(&mut self) {
         let path = std::mem::take(&mut self.0);
-        let _ = std::fs::remove_file(&path);
+        if !path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -647,15 +611,23 @@ pub(crate) fn spawn_detached(
 pub(crate) fn spawn_with_process_group(
     cmd: tokio::process::Command,
 ) -> Result<(tokio::process::Child, Option<xai_tty_utils::ProcessGroup>)> {
-    let child = spawn_detached(cmd)?;
-    let group = match xai_tty_utils::ProcessGroup::new() {
-        Ok(mut g) => match g.attach(&child) {
-            Ok(()) => Some(g),
-            Err(_) => None,
-        },
-        Err(_) => None,
+    let mut child = spawn_detached(cmd)?;
+    let mut group = match xai_tty_utils::ProcessGroup::new() {
+        Ok(group) => group,
+        Err(error) => {
+            let _ = child.start_kill();
+            return Err(anyhow::anyhow!(
+                "cannot safely contain child process tree: {error}"
+            ));
+        }
     };
-    Ok((child, group))
+    if let Err(error) = group.attach(&child) {
+        let _ = child.start_kill();
+        return Err(anyhow::anyhow!(
+            "cannot safely attach child to its process group: {error}"
+        ));
+    }
+    Ok((child, Some(group)))
 }
 
 pub(crate) fn kill_process_group(group: Option<&xai_tty_utils::ProcessGroup>) {
@@ -1025,14 +997,18 @@ async fn run_browser(args: BrowserArgs) -> Result<()> {
     .await
 }
 
-async fn resolve_model_candidates(prompt: &str, explicit: Option<String>) -> Result<Vec<String>> {
+pub(crate) async fn resolve_model_candidates(
+    prompt: &str,
+    explicit: Option<String>,
+) -> Result<Vec<String>> {
     if let Some(m) = explicit {
         return Ok(vec![m]);
     }
 
     let mut candidates = Vec::new();
-    if let Ok(id) = moe::select_provider_or_fallback(prompt).await {
-        providers::ensure_provider_configured(&id)?;
+    if let Ok(id) = moe::select_provider_or_fallback(prompt).await
+        && providers::ensure_provider_configured(&id).is_ok()
+    {
         candidates.push(format!("omgb-{id}"));
     }
 
@@ -1055,10 +1031,39 @@ async fn resolve_model_candidates(prompt: &str, explicit: Option<String>) -> Res
         }
     }
 
+    if let Ok(config) = build_agent_config(None)
+        && let Some(default) = config.models.default
+        && !candidates.contains(&default)
+        && (!default.starts_with("omgb-")
+            || providers::ensure_provider_configured(
+                default.strip_prefix("omgb-").unwrap_or(&default),
+            )
+            .is_ok())
+    {
+        candidates.push(default);
+    }
+
     if candidates.is_empty() {
-        bail!("no providers available (set *_API_KEY or use a loopback local server)");
+        bail!(
+            "no models available (configure BYOK/local first, or sign in and select a Grok model)"
+        );
     }
     Ok(candidates)
+}
+
+fn session_id_for_model_attempt(
+    auto_new_session: bool,
+    explicit_session_id: Option<&str>,
+) -> Option<String> {
+    if auto_new_session {
+        Some(uuid::Uuid::new_v4().to_string())
+    } else {
+        explicit_session_id.map(str::to_owned)
+    }
+}
+
+fn may_retry_model_attempt(auto_new_session: bool, session_evidence_exists: bool) -> bool {
+    auto_new_session && !session_evidence_exists
 }
 
 pub(crate) async fn run_single_turn_with(
@@ -1074,14 +1079,52 @@ pub(crate) async fn run_single_turn_with(
     session: &SessionParams,
     memory: bool,
 ) -> Result<()> {
+    run_single_turn_with_provider_fingerprint(
+        prompt,
+        model,
+        yolo,
+        output_format,
+        max_turns,
+        cli_tools,
+        cli_disallowed_tools,
+        agent,
+        cwd,
+        session,
+        memory,
+        None,
+    )
+    .await
+}
+
+async fn run_single_turn_with_provider_fingerprint(
+    prompt: &str,
+    model: Option<String>,
+    yolo: bool,
+    output_format: OutputFormat,
+    max_turns: Option<u32>,
+    cli_tools: Option<String>,
+    cli_disallowed_tools: Option<String>,
+    agent: Option<String>,
+    cwd: Option<PathBuf>,
+    session: &SessionParams,
+    memory: bool,
+    expected_provider_fingerprint: Option<String>,
+) -> Result<()> {
     let candidates = resolve_model_candidates(prompt, model).await?;
 
     let mut rules_parts = Vec::new();
-    if memory
-        && let Ok(r) = crate::memory::recall_for_prompt_with_one_shot(prompt, 5, true)
-        && !r.trim().is_empty()
-    {
-        rules_parts.push(r);
+    let mut one_shot_lease = None;
+    if memory {
+        let notes = crate::memory::recall(prompt, 5)?;
+        one_shot_lease = crate::memory::lease_one_shot(prompt, 5)?;
+        let shots = one_shot_lease
+            .as_ref()
+            .map(|lease| lease.notes())
+            .unwrap_or_default();
+        let recalled = crate::memory::format_prompt_memory(notes, shots);
+        if !recalled.trim().is_empty() {
+            rules_parts.push(recalled);
+        }
     }
     let skill_rules = crate::skill::skill_preamble();
     if !skill_rules.is_empty() {
@@ -1098,12 +1141,9 @@ pub(crate) async fn run_single_turn_with(
     };
 
     let resume = session.resume.as_ref().filter(|s| !s.is_empty()).cloned();
-    let effective_session_id =
-        if resume.is_none() && !session.continue_last && session.session_id.is_none() {
-            Some(uuid::Uuid::new_v4().to_string())
-        } else {
-            session.session_id.clone()
-        };
+    let auto_new_session =
+        resume.is_none() && !session.continue_last && session.session_id.is_none();
+    let effective_session_id = session.session_id.clone();
 
     let mut options = HeadlessOptions {
         session_id: effective_session_id.clone(),
@@ -1151,33 +1191,39 @@ pub(crate) async fn run_single_turn_with(
     )?;
     crate::tool_overrides::apply_tool_overrides_to_headless_options(&overrides, &mut options)?;
 
-    if options.permission_mode_flag.as_deref() == Some("auto") {
-        match crate::approvals::load_approvals(chrono::Utc::now()) {
-            Ok(approvals) => options
-                .allow_rules
-                .extend(crate::approvals::to_allow_rules(&approvals)),
-            Err(e) => eprintln!("warning: failed to load approvals: {e}"),
-        }
-    }
-
     let mut last_result: Result<()> = Err(anyhow::anyhow!("no usable model candidates"));
     let mut errors: Vec<String> = Vec::new();
+    let mut last_attempt_session_id = effective_session_id.clone();
     for m in &candidates {
-        let provider_id = m.strip_prefix("omgb-").unwrap_or(m);
-        if let Err(e) = providers::ensure_provider_configured(provider_id) {
-            eprintln!("warning: provider '{provider_id}' is not configured: {e}");
-            continue;
-        }
+        let _provider_execution_guard = match providers::prepare_provider_execution(
+            m,
+            expected_provider_fingerprint.as_deref(),
+        ) {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("warning: model '{m}' cannot be executed: {e}");
+                continue;
+            }
+        };
         let mut opts = options.clone();
         opts.model = Some(m.clone());
+        let attempt_session_id =
+            session_id_for_model_attempt(auto_new_session, effective_session_id.as_deref());
+        opts.session_id = attempt_session_id.clone();
+        last_attempt_session_id = attempt_session_id.clone();
+        if let Some(lease) = one_shot_lease.as_mut() {
+            lease.bind_attempt(attempt_session_id.as_deref(), m, yolo)?;
+        }
         match run_single_turn(HeadlessPrompt::Text(prompt.to_string()), false, opts).await {
             Ok(()) => {
-                let tool_calls = if let Some(ref sid) = effective_session_id {
+                let tool_calls = if let Some(ref sid) = attempt_session_id {
                     let cwd = cwd
                         .clone()
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     if has_repeated_tool_call(sid, &cwd, 16) {
-                        bail!("anti-loop: same tool call repeated 16 times in a row");
+                        return Err(anyhow::anyhow!(
+                            "anti-loop: same tool call repeated 16 times in a row"
+                        ));
                     }
                     count_chat_tool_calls(sid, &cwd)
                 } else {
@@ -1197,28 +1243,34 @@ pub(crate) async fn run_single_turn_with(
                     Some(data),
                 );
                 maybe_auto_create_skill(tool_calls).await;
-                if let Some(ref sid) = effective_session_id {
-                    let cwd = cwd
-                        .clone()
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    record_session_approvals(sid, &cwd, yolo);
-                }
                 record_taste_from_success(prompt).await;
+                if let Some(lease) = one_shot_lease.take() {
+                    let _ = lease.consume();
+                }
                 return Ok(());
             }
             Err(e) => {
                 eprintln!("warning: model '{m}' failed: {e}");
                 errors.push(e.to_string());
+                let session_evidence_exists = attempt_session_id.as_deref().is_some_and(|sid| {
+                    xai_grok_shell::session::persistence::find_session_dir_by_id(sid).is_some()
+                });
                 last_result = Err(e);
+                if !may_retry_model_attempt(auto_new_session, session_evidence_exists) {
+                    break;
+                }
             }
         }
     }
 
-    if let Some(ref sid) = effective_session_id {
+    {
+        let sid = last_attempt_session_id.as_deref();
         let cwd = cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let tool_calls = count_chat_tool_calls(sid, &cwd);
+        let tool_calls = sid
+            .map(|session_id| count_chat_tool_calls(session_id, &cwd))
+            .unwrap_or(0);
         let mut data = serde_json::json!({"tool_calls": tool_calls, "success": false});
         if !errors.is_empty() {
             data["errors"] = serde_json::json!(errors);
@@ -1244,6 +1296,8 @@ pub(crate) async fn run_single_turn_with(
 /// output (e.g. JSON planning or group-chat routing). It creates a throwaway
 /// session, caps the turn at one model response, and reads the assistant message
 /// back from the session's chat history.
+const MAX_CAPTURE_CHAT_HISTORY_BYTES: u64 = 64 * 1024 * 1024;
+
 pub(crate) async fn run_single_turn_capture(
     prompt: &str,
     model: Option<String>,
@@ -1251,11 +1305,70 @@ pub(crate) async fn run_single_turn_capture(
     max_turns: Option<u32>,
     tools: Option<String>,
 ) -> Result<String> {
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let session = SessionParams {
-        session_id: Some(session_id.clone()),
-        ..Default::default()
-    };
+    run_single_turn_capture_with_limit(
+        prompt,
+        model,
+        yolo,
+        max_turns,
+        tools,
+        MAX_CAPTURE_CHAT_HISTORY_BYTES,
+    )
+    .await
+}
+
+pub(crate) async fn run_single_turn_capture_with_limit(
+    prompt: &str,
+    model: Option<String>,
+    yolo: bool,
+    max_turns: Option<u32>,
+    tools: Option<String>,
+    max_chat_history_bytes: u64,
+) -> Result<String> {
+    run_single_turn_capture_with_limit_and_provider_fingerprint(
+        prompt,
+        model,
+        yolo,
+        max_turns,
+        tools,
+        max_chat_history_bytes,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_single_turn_capture_with_provider_fingerprint(
+    prompt: &str,
+    model: Option<String>,
+    yolo: bool,
+    max_turns: Option<u32>,
+    tools: Option<String>,
+    expected_provider_fingerprint: Option<String>,
+) -> Result<String> {
+    run_single_turn_capture_with_limit_and_provider_fingerprint(
+        prompt,
+        model,
+        yolo,
+        max_turns,
+        tools,
+        MAX_CAPTURE_CHAT_HISTORY_BYTES,
+        expected_provider_fingerprint,
+    )
+    .await
+}
+
+async fn run_single_turn_capture_with_limit_and_provider_fingerprint(
+    prompt: &str,
+    model: Option<String>,
+    yolo: bool,
+    max_turns: Option<u32>,
+    tools: Option<String>,
+    max_chat_history_bytes: u64,
+    expected_provider_fingerprint: Option<String>,
+) -> Result<String> {
+    if max_chat_history_bytes == 0 || max_chat_history_bytes > MAX_CAPTURE_CHAT_HISTORY_BYTES {
+        bail!("capture history limit must be between 1 and {MAX_CAPTURE_CHAT_HISTORY_BYTES} bytes");
+    }
+    let candidates = resolve_model_candidates(prompt, model).await?;
     // run_single_turn_capture is used for one-shot text/json capture. If the
     // caller did not supply a tool allowlist, disallow every registered tool so
     // the model returns final text instead of making a tool call in the single
@@ -1264,49 +1377,120 @@ pub(crate) async fn run_single_turn_capture(
         Some(s) if !s.is_empty() => (tools.clone(), None),
         _ => (None, Some(all_tool_ids_csv().clone())),
     };
-    run_single_turn_with(
-        prompt,
-        model,
-        yolo,
-        OutputFormat::Plain,
-        max_turns,
-        cli_tools,
-        cli_disallowed_tools,
-        None,
-        None,
-        &session,
-        false,
-    )
-    .await?;
-    last_assistant_text_for_session(&session_id)
+    let mut last_error = anyhow::anyhow!("no usable model candidates for capture");
+    for candidate in candidates {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let session = SessionParams {
+            session_id: Some(session_id.clone()),
+            ..Default::default()
+        };
+        match run_single_turn_with_provider_fingerprint(
+            prompt,
+            Some(candidate),
+            yolo,
+            OutputFormat::Plain,
+            max_turns,
+            cli_tools.clone(),
+            cli_disallowed_tools.clone(),
+            None,
+            None,
+            &session,
+            false,
+            expected_provider_fingerprint.clone(),
+        )
         .await
-        .with_context(|| "failed to capture assistant text")
+        {
+            Ok(()) => {
+                return last_assistant_text_for_session(&session_id, max_chat_history_bytes)
+                    .await
+                    .with_context(|| "failed to capture assistant text");
+            }
+            Err(run_error) => {
+                if xai_grok_shell::session::persistence::find_session_dir_by_id(&session_id)
+                    .is_some()
+                {
+                    return Err(run_error.context(format!(
+                        "capture attempt may have produced side effects; session {session_id} was preserved and model fallback was stopped"
+                    )));
+                }
+                last_error = run_error;
+            }
+        }
+    }
+    Err(last_error.context("all capture model candidates failed"))
 }
 
-async fn last_assistant_text_for_session(session_id: &str) -> Result<String> {
+async fn last_assistant_text_for_session(
+    session_id: &str,
+    max_chat_history_bytes: u64,
+) -> Result<String> {
     let session_dir = xai_grok_shell::session::persistence::find_session_dir_by_id(session_id)
         .ok_or_else(|| anyhow::anyhow!("session '{session_id}' not found"))?;
+    let metadata = tokio::fs::symlink_metadata(&session_dir).await?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "throwaway session path is not a regular directory: {}",
+            session_dir.display()
+        );
+    }
+    let text = read_last_assistant_text(&session_dir, session_id, max_chat_history_bytes)
+        .await
+        .with_context(|| {
+            format!(
+                "capture failed; session {session_id} was preserved for inspection and recovery"
+            )
+        })?;
+    tokio::fs::remove_dir_all(&session_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "remove throwaway session directory {}",
+                session_dir.display()
+            )
+        })?;
+    Ok(text)
+}
+
+async fn read_last_assistant_text(
+    session_dir: &Path,
+    session_id: &str,
+    max_chat_history_bytes: u64,
+) -> Result<String> {
     let path = session_dir.join("chat_history.jsonl");
-    if !path.is_file() {
-        let _ = tokio::fs::remove_dir_all(&session_dir).await;
+    let metadata = tokio::fs::symlink_metadata(&path)
+        .await
+        .with_context(|| format!("inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("session '{session_id}' has no chat history");
+    }
+    if metadata.len() > max_chat_history_bytes {
+        bail!("capture chat history exceeds the {max_chat_history_bytes} byte safety limit");
     }
     let raw = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
+    parse_last_assistant_text(&raw, &path, session_id)
+}
+
+fn parse_last_assistant_text(raw: &str, path: &Path, session_id: &str) -> Result<String> {
     let mut text = String::new();
-    for line in raw
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l: &&str| !l.is_empty())
-    {
-        if let Ok(xai_grok_shell::sampling::ConversationItem::Assistant(a)) =
-            serde_json::from_str::<xai_grok_shell::sampling::ConversationItem>(line)
-        {
+    for (index, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let item = serde_json::from_str::<xai_grok_shell::sampling::ConversationItem>(line)
+            .with_context(|| {
+                format!(
+                    "invalid JSON record in capture history {} at line {}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+        if let xai_grok_shell::sampling::ConversationItem::Assistant(a) = item {
             text = a.content.as_ref().to_string();
         }
     }
-    let _ = tokio::fs::remove_dir_all(&session_dir).await;
     if text.is_empty() {
         bail!("no assistant response in session '{session_id}'");
     }
@@ -1317,7 +1501,7 @@ const TURN_SENTINEL_NAME: &str = "__omgb_turn__";
 
 static ALL_TOOL_IDS: OnceLock<String> = OnceLock::new();
 
-fn all_tool_ids_csv() -> &'static String {
+pub(crate) fn all_tool_ids_csv() -> &'static String {
     ALL_TOOL_IDS.get_or_init(|| {
         let ids: Vec<String> = xai_grok_tools::bridge::ToolBridge::get_builder()
             .known_tool_ids()
@@ -1377,22 +1561,6 @@ fn count_chat_tool_calls(session_id: &str, cwd: &std::path::Path) -> usize {
     load_chat_tool_calls(session_id, cwd)
         .map(|v| v.iter().filter(|c| !is_turn_sentinel(c)).count())
         .unwrap_or(0)
-}
-
-fn record_session_approvals(session_id: &str, cwd: &std::path::Path, yolo: bool) {
-    if yolo {
-        return;
-    }
-    if let Some(calls) = load_chat_tool_calls(session_id, cwd) {
-        let tuples: Vec<_> = calls
-            .into_iter()
-            .filter(|c| !is_turn_sentinel(c))
-            .map(|c| (c.name, c.arguments.to_string()))
-            .collect();
-        if let Err(e) = crate::approvals::record_tool_calls(&tuples) {
-            eprintln!("warning: failed to record approvals: {e}");
-        }
-    }
 }
 
 async fn record_taste_from_success(prompt: &str) {
@@ -1501,8 +1669,9 @@ async fn maybe_auto_create_skill(tool_calls: usize) {
     }
 }
 
-async fn git_worktree_status() -> Result<(bool, String)> {
+async fn git_worktree_status_in(dir: &std::path::Path) -> Result<(bool, String)> {
     let out = git_cmd()
+        .current_dir(dir)
         .args(["status", "--short"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1513,6 +1682,10 @@ async fn git_worktree_status() -> Result<(bool, String)> {
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     Ok((text.trim().is_empty(), text))
+}
+
+async fn git_worktree_status() -> Result<(bool, String)> {
+    git_worktree_status_in(&std::env::current_dir()?).await
 }
 
 async fn git_diff_text() -> Result<String> {
@@ -1528,8 +1701,9 @@ async fn git_diff_text() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-async fn git_config(key: &str) -> Result<Option<String>> {
+async fn git_config_in(dir: &std::path::Path, key: &str) -> Result<Option<String>> {
     let out = git_cmd()
+        .current_dir(dir)
         .args(["config", "--get", key])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1542,7 +1716,7 @@ async fn git_config(key: &str) -> Result<Option<String>> {
     Ok(if text.is_empty() { None } else { Some(text) })
 }
 
-async fn git_author() -> Result<(String, String)> {
+async fn git_author_in(dir: &std::path::Path) -> Result<(String, String)> {
     if let (Ok(name), Ok(email)) = (
         std::env::var("OMGB_GIT_AUTHOR_NAME"),
         std::env::var("OMGB_GIT_AUTHOR_EMAIL"),
@@ -1551,13 +1725,17 @@ async fn git_author() -> Result<(String, String)> {
     {
         return Ok((name, email));
     }
-    let name = git_config("user.name").await?.ok_or_else(|| {
+    let name = git_config_in(dir, "user.name").await?.ok_or_else(|| {
         anyhow::anyhow!("git author name not configured; set user.name or OMGB_GIT_AUTHOR_NAME")
     })?;
-    let email = git_config("user.email").await?.ok_or_else(|| {
+    let email = git_config_in(dir, "user.email").await?.ok_or_else(|| {
         anyhow::anyhow!("git author email not configured; set user.email or OMGB_GIT_AUTHOR_EMAIL")
     })?;
     Ok((name, email))
+}
+
+async fn git_author() -> Result<(String, String)> {
+    git_author_in(&std::env::current_dir()?).await
 }
 
 pub(crate) async fn git_commit_all(
@@ -1848,9 +2026,9 @@ async fn run_provider(args: ProviderArgs) -> Result<()> {
     use providers::*;
     match args.command {
         ProviderCommand::List => {
+            let default_model = configured_default_model()?;
             for p in list_providers()? {
-                let default = if Some(format!("omgb-{}", p.id)) == load_omg_config()?.default_model
-                {
+                let default = if Some(format!("omgb-{}", p.id)) == default_model {
                     " (default)"
                 } else {
                     ""
@@ -1905,12 +2083,24 @@ async fn run_model(args: ModelArgs) -> Result<()> {
             xai_grok_pager::models::list_available_models(&cfg).await?;
         }
         Some(ModelCommand::Switch { model }) => {
-            let id = model.strip_prefix("omgb-").unwrap_or(&model).to_string();
-            providers::set_default_provider(&id)?;
-            println!("default model switched to omgb-{id}");
+            let selected = if let Some(id) = configured_provider_switch_id(&model)? {
+                providers::set_default_provider(&id)?;
+                format!("omgb-{id}")
+            } else {
+                providers::set_grok_default_model(&model)?;
+                model
+            };
+            println!("default model switched to {selected}");
         }
     }
     Ok(())
+}
+
+fn configured_provider_switch_id(model: &str) -> Result<Option<String>> {
+    if let Some(id) = model.strip_prefix("omgb-") {
+        return Ok(Some(id.to_string()));
+    }
+    Ok(providers::get_provider(model)?.map(|provider| provider.id))
 }
 
 async fn run_cron(args: CronArgs) -> Result<()> {
@@ -1940,6 +2130,7 @@ async fn run_schedule(args: ScheduleArgs) -> Result<()> {
         }
         ScheduleCommand::Delete { name } => delete_job(&name).await,
         ScheduleCommand::Run { name } => run_job(&name, false).await,
+        ScheduleCommand::ResolveRun { name, confirm } => resolve_job_run(&name, confirm).await,
         ScheduleCommand::SetExpiry { name, expires_at } => {
             omgb_schedule_set_expiry(&name, expires_at.as_deref()).await?;
             println!("set expiry for '{name}'");
@@ -1956,11 +2147,54 @@ async fn run_schedule(args: ScheduleArgs) -> Result<()> {
     }
 }
 
+const MAX_TEAM_AGENTS: usize = 16;
+const MAX_SWARM_MEMBERS: usize = 16;
+
+fn validate_parallel_count(kind: &str, count: usize, max: usize) -> Result<()> {
+    if !(1..=max).contains(&count) {
+        bail!("{kind} count must be between 1 and {max}");
+    }
+    Ok(())
+}
+
+fn ensure_team_completed(
+    total: usize,
+    failed_agents: usize,
+    failed_merges: usize,
+    cleanup_failures: usize,
+) -> Result<()> {
+    if failed_agents > 0 || failed_merges > 0 || cleanup_failures > 0 {
+        bail!(
+            "team run incomplete: {failed_agents} of {total} agent(s) failed, {failed_merges} merge(s) failed, and {cleanup_failures} cleanup operation(s) failed"
+        );
+    }
+    Ok(())
+}
+
+async fn git_current_branch(repo_root: &std::path::Path) -> Result<String> {
+    let out = git_cmd()
+        .current_dir(repo_root)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .await?;
+    if !out.status.success() {
+        bail!("team mode requires a checked-out branch (detached HEAD is not supported)");
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() {
+        bail!("team mode could not determine the current branch");
+    }
+    Ok(branch)
+}
+
 async fn run_team(args: TeamArgs) -> Result<()> {
     if !args.yolo {
         bail!("`omgb team` requires --yolo to auto-approve tool use");
     }
+    validate_parallel_count("team agent", args.agents, MAX_TEAM_AGENTS)?;
+    let repo_root = git_repo_root().await?;
     let git = git_cmd()
+        .current_dir(&repo_root)
         .args(["rev-parse", "--git-dir"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1969,18 +2203,10 @@ async fn run_team(args: TeamArgs) -> Result<()> {
     if !git.success() {
         bail!("team mode requires a git repository");
     }
-    if !git_worktree_status().await?.0 {
+    if !git_worktree_status_in(&repo_root).await?.0 {
         bail!("git working tree is not clean; commit or stash changes before running `omgb team`");
     }
-    let main_exists = git_cmd()
-        .args(["rev-parse", "--verify", "main"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await?;
-    if !main_exists.success() {
-        bail!("team mode requires a `main` branch");
-    }
+    let base_branch = git_current_branch(&repo_root).await?;
 
     let mut tasks = Vec::new();
     for i in 0..args.agents {
@@ -1993,10 +2219,12 @@ async fn run_team(args: TeamArgs) -> Result<()> {
         let model = args.model.clone();
         let yolo = args.yolo;
         let worktree = std::env::temp_dir().join(format!("omgb-team-{i}-{}", uuid::Uuid::new_v4()));
+        let repo_root = repo_root.clone();
+        let base_branch = base_branch.clone();
 
         tasks.push(async move {
-            let branch = create_worktree(&worktree).await?;
-            run_single_turn_with(
+            let branch = create_worktree(&repo_root, &worktree, &base_branch).await?;
+            let run_result = run_single_turn_with(
                 &prompt,
                 model,
                 yolo,
@@ -2009,40 +2237,62 @@ async fn run_team(args: TeamArgs) -> Result<()> {
                 &SessionParams::default(),
                 false,
             )
-            .await?;
-            Ok::<_, anyhow::Error>((worktree, branch))
+            .await;
+            Ok::<_, anyhow::Error>((worktree, branch, run_result))
         });
     }
 
     let mut worktrees = Vec::new();
+    let mut failed_agent_worktrees = Vec::new();
+    let mut failed_agents = 0_usize;
+    let mut cleanup_failures = Vec::new();
     for result in futures::future::join_all(tasks).await {
         match result {
-            Ok(w) => worktrees.push(w),
-            Err(e) => eprintln!("agent failed: {e}"),
+            Ok((worktree, branch, Ok(()))) => worktrees.push((worktree, branch)),
+            Ok((worktree, branch, Err(e))) => {
+                eprintln!("agent failed: {e}");
+                eprintln!(
+                    "warning: preserving failed agent worktree {} on branch {branch} for recovery",
+                    worktree.display()
+                );
+                failed_agents += 1;
+                failed_agent_worktrees.push((worktree, branch));
+            }
+            Err(e) => {
+                failed_agents += 1;
+                eprintln!("agent failed before its worktree could be retained: {e}");
+            }
         }
     }
     if worktrees.is_empty() {
+        for (path, branch) in &failed_agent_worktrees {
+            eprintln!(
+                "warning: retained failed agent worktree {} on branch {branch}",
+                path.display()
+            );
+        }
         bail!("all team agents failed");
     }
 
     let mut failed_merges = Vec::new();
     for (w, branch) in &worktrees {
-        if let Err(e) = merge_worktree_into_main(w, branch).await {
+        if let Err(e) = merge_worktree_into_base(&repo_root, w, branch, &base_branch).await {
             eprintln!(
                 "warning: failed to merge worktree {}: {e}; leaving it for manual resolution",
                 w.display()
             );
-            failed_merges.push(w.clone());
+            failed_merges.push((w.clone(), branch.clone()));
             continue;
         }
-        if let Err(e) = remove_worktree(w).await {
-            eprintln!("warning: failed to remove worktree {}: {e}", w.display());
+        if let Err(e) = cleanup_team_worktree(&repo_root, w, branch).await {
+            eprintln!(
+                "warning: changes were merged but cleanup failed for {} ({branch}): {e}",
+                w.display()
+            );
+            cleanup_failures.push((w.clone(), branch.clone()));
         }
     }
 
-    if failed_merges.len() == worktrees.len() {
-        bail!("failed to merge any worktree; see warnings above");
-    }
     if failed_merges.is_empty() {
         println!(
             "merged changes from all {} agent(s) into the working tree",
@@ -2055,15 +2305,45 @@ async fn run_team(args: TeamArgs) -> Result<()> {
             failed_merges.len()
         );
     }
-    Ok(())
+    for (path, branch) in &failed_merges {
+        eprintln!(
+            "warning: retained worktree {} on branch {branch}",
+            path.display()
+        );
+    }
+    for (path, branch) in &failed_agent_worktrees {
+        eprintln!(
+            "warning: failed agent work is retained at {} on branch {branch}",
+            path.display()
+        );
+    }
+    if !cleanup_failures.is_empty() {
+        for (path, branch) in &cleanup_failures {
+            eprintln!(
+                "warning: cleanup still required for {} on branch {branch}",
+                path.display()
+            );
+        }
+    }
+    ensure_team_completed(
+        args.agents,
+        failed_agents,
+        failed_merges.len(),
+        cleanup_failures.len(),
+    )
 }
 
-async fn create_worktree(path: &PathBuf) -> Result<String> {
+async fn create_worktree(
+    repo_root: &std::path::Path,
+    path: &PathBuf,
+    base_branch: &str,
+) -> Result<String> {
     let branch = format!("omgb-team-{}", uuid::Uuid::new_v4());
     let out = git_cmd()
+        .current_dir(repo_root)
         .args(["worktree", "add", "-b", &branch, "-q"])
         .arg(path)
-        .arg("main")
+        .arg(base_branch)
         .output()
         .await?;
     if !out.status.success() {
@@ -2073,30 +2353,56 @@ async fn create_worktree(path: &PathBuf) -> Result<String> {
     Ok(branch)
 }
 
-async fn remove_worktree(path: &PathBuf) -> Result<()> {
+async fn remove_worktree(repo_root: &std::path::Path, path: &PathBuf) -> Result<()> {
     let out = git_cmd()
-        .args(["worktree", "remove", "--force", "-q"])
+        .current_dir(repo_root)
+        .args(["worktree", "remove", "--force"])
         .arg(path)
         .output()
-        .await;
-    if let Err(e) = out {
-        eprintln!(
-            "warning: failed to run git worktree remove for {}: {e}",
+        .await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "git worktree remove failed for {}: {stderr}",
             path.display()
         );
     }
-    if let Err(e) = tokio::fs::remove_dir_all(path).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "warning: failed to remove worktree directory {}: {e}",
+    if path.exists() {
+        bail!(
+            "git reported successful worktree removal but {} still exists",
             path.display()
         );
     }
     Ok(())
 }
 
-async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()> {
+async fn cleanup_team_worktree(
+    repo_root: &std::path::Path,
+    path: &PathBuf,
+    branch: &str,
+) -> Result<()> {
+    if !branch.starts_with("omgb-team-") {
+        bail!("refusing to delete non-team branch '{branch}'");
+    }
+    remove_worktree(repo_root, path).await?;
+    let delete = git_cmd()
+        .current_dir(repo_root)
+        .args(["branch", "-D", "--", branch])
+        .output()
+        .await?;
+    if !delete.status.success() {
+        let stderr = String::from_utf8_lossy(&delete.stderr);
+        bail!("failed to delete team branch {branch}: {stderr}");
+    }
+    Ok(())
+}
+
+async fn merge_worktree_into_base(
+    repo_root: &std::path::Path,
+    worktree: &PathBuf,
+    branch: &str,
+    base_branch: &str,
+) -> Result<()> {
     let stage = git_cmd()
         .current_dir(worktree)
         .args(["add", "-A"])
@@ -2111,42 +2417,59 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
         .args(["diff", "--cached", "--quiet"])
         .status()
         .await?;
-    if diff.success() {
-        return Ok(());
+    let mut git_identity = None;
+    if !diff.success() {
+        let (name, email) = git_author_in(repo_root).await?;
+        let commit_msg = format!("omgb team agent {branch}");
+        let commit = git_cmd()
+            .current_dir(worktree)
+            .env("GIT_AUTHOR_NAME", &name)
+            .env("GIT_AUTHOR_EMAIL", &email)
+            .env("GIT_COMMITTER_NAME", &name)
+            .env("GIT_COMMITTER_EMAIL", &email)
+            .args(["commit", "-m", commit_msg.as_str(), "--no-gpg-sign"])
+            .status()
+            .await?;
+        if !commit.success() {
+            bail!("git commit in worktree failed");
+        }
+        git_identity = Some((name, email));
+    } else {
+        let already_merged = git_cmd()
+            .current_dir(repo_root)
+            .args(["merge-base", "--is-ancestor", branch, base_branch])
+            .status()
+            .await?;
+        if already_merged.success() {
+            return Ok(());
+        }
+        if already_merged.code() != Some(1) {
+            bail!("failed to compare team branch '{branch}' with base branch '{base_branch}'");
+        }
     }
 
-    let (name, email) = git_author().await?;
-    let commit_msg = format!("omgb team agent {branch}");
-    let commit = git_cmd()
-        .current_dir(worktree)
+    let (clean, _) = git_worktree_status_in(repo_root).await?;
+    if !clean {
+        bail!("base working tree is not clean; commit or stash changes before merging team output");
+    }
+    let current_branch = git_current_branch(repo_root).await?;
+    if current_branch != base_branch {
+        bail!(
+            "base checkout moved from branch '{base_branch}' to '{current_branch}' while team agents were running"
+        );
+    }
+
+    let merge_msg = format!("Merge omgb team agent {branch}");
+    let (name, email) = match git_identity {
+        Some(identity) => identity,
+        None => git_author_in(repo_root).await?,
+    };
+    let merge = git_cmd()
+        .current_dir(repo_root)
         .env("GIT_AUTHOR_NAME", &name)
         .env("GIT_AUTHOR_EMAIL", &email)
         .env("GIT_COMMITTER_NAME", &name)
         .env("GIT_COMMITTER_EMAIL", &email)
-        .args(["commit", "-m", commit_msg.as_str(), "--no-gpg-sign"])
-        .status()
-        .await?;
-    if !commit.success() {
-        bail!("git commit in worktree failed");
-    }
-
-    let main_dir = git_repo_root().await?;
-    let (clean, _) = git_worktree_status().await?;
-    if !clean {
-        bail!("main working tree is not clean; commit or stash changes before merging team output");
-    }
-    let checkout = git_cmd()
-        .current_dir(&main_dir)
-        .args(["checkout", "main"])
-        .status()
-        .await?;
-    if !checkout.success() {
-        bail!("failed to checkout `main` branch for team merge");
-    }
-
-    let merge_msg = format!("Merge omgb team agent {branch}");
-    let merge = git_cmd()
-        .current_dir(&main_dir)
         .args([
             "merge",
             "--no-ff",
@@ -2155,21 +2478,23 @@ async fn merge_worktree_into_main(worktree: &PathBuf, branch: &str) -> Result<()
             "--no-gpg-sign",
             branch,
         ])
-        .status()
+        .output()
         .await?;
-    if !merge.success() {
-        bail!("git merge failed");
-    }
-    let delete = git_cmd().args(["branch", "-D", branch]).status().await;
-    if let Err(e) = delete {
-        eprintln!("warning: failed to delete team branch {branch}: {e}");
-    } else if let Ok(status) = delete
-        && !status.success()
-    {
-        eprintln!(
-            "warning: failed to delete team branch {branch}: exit {}",
-            status.code().unwrap_or(-1)
-        );
+    if !merge.status.success() {
+        let stderr = String::from_utf8_lossy(&merge.stderr).trim().to_string();
+        let abort = git_cmd()
+            .current_dir(repo_root)
+            .args(["merge", "--abort"])
+            .output()
+            .await?;
+        if !abort.status.success() {
+            let abort_stderr = String::from_utf8_lossy(&abort.stderr).trim().to_string();
+            bail!(
+                "git merge failed ({stderr}) and merge abort failed ({abort_stderr}); inspect {} before continuing",
+                repo_root.display()
+            );
+        }
+        bail!("git merge failed and was aborted: {stderr}");
     }
     Ok(())
 }
@@ -2178,6 +2503,7 @@ async fn run_swarm(args: SwarmArgs) -> Result<()> {
     if !args.yolo {
         bail!("`omgb swarm` requires --yolo to auto-approve tool use");
     }
+    validate_parallel_count("swarm member", args.count, MAX_SWARM_MEMBERS)?;
     let result = if args.ensemble {
         swarm::run_swarm_ensemble(&args.prompt, args.model, args.yolo, args.count).await?
     } else {
@@ -2194,6 +2520,24 @@ async fn run_subagent(args: SubagentArgs) -> Result<()> {
         SubagentCommand::Kill { id } => subagents::kill(&id).await,
         SubagentCommand::Logs { id } => subagents::logs(&id).await,
         SubagentCommand::Trace { id } => subagents::trace(&id).await,
+        SubagentCommand::Worker {
+            prompt_file,
+            stdout_path,
+            stderr_path,
+            admission_path,
+            admission_token,
+            yolo,
+        } => {
+            subagents::run_worker(
+                &prompt_file,
+                &stdout_path,
+                &stderr_path,
+                &admission_path,
+                &admission_token,
+                yolo,
+            )
+            .await
+        }
     }
 }
 
@@ -2337,12 +2681,85 @@ mod tests {
     }
 
     #[test]
+    fn model_switch_accepts_bare_configured_provider_id() {
+        let _guard = OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home =
+            std::env::temp_dir().join(format!("omgb-model-switch-test-{}", uuid::Uuid::new_v4()));
+        providers::set_omg_home_for_tests(Some(home.clone()));
+        let provider = providers::ProviderConfig {
+            id: "codex".into(),
+            name: "OpenAI Codex".into(),
+            model: "codex-mini-latest".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_backend: Some("responses".into()),
+            env_key: Some(vec!["OPENAI_API_KEY".into()]),
+            extra_headers: None,
+            context_window: None,
+            auto_compact_threshold_percent: None,
+            temperature: None,
+            top_p: None,
+            max_completion_tokens: None,
+        };
+        providers::save_omg_config(&providers::OmgConfig {
+            providers: std::collections::HashMap::from([("codex".into(), provider)]),
+            ..providers::OmgConfig::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            configured_provider_switch_id("codex").unwrap(),
+            Some("codex".into())
+        );
+        assert_eq!(
+            configured_provider_switch_id("omgb-codex").unwrap(),
+            Some("codex".into())
+        );
+
+        providers::set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn model_fallback_uses_fresh_auto_session_ids_but_preserves_explicit_ids() {
+        let first = session_id_for_model_attempt(true, None).unwrap();
+        let second = session_id_for_model_attempt(true, None).unwrap();
+        assert_ne!(first, second);
+
+        let explicit = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            session_id_for_model_attempt(false, Some(&explicit)),
+            Some(explicit)
+        );
+        assert!(may_retry_model_attempt(true, false));
+        assert!(!may_retry_model_attempt(true, true));
+        assert!(!may_retry_model_attempt(false, false));
+    }
+
+    #[test]
     fn extract_json_object_respects_quoted_braces() {
         let text = r#"prefix {"replies":{"Alice":"ok {not closed","Bob":"hi"}} suffix"#;
         let value = extract_json_object(text).unwrap();
         let replies = value.get("replies").unwrap().as_object().unwrap();
         assert_eq!(replies["Alice"].as_str().unwrap(), "ok {not closed");
         assert_eq!(replies["Bob"].as_str().unwrap(), "hi");
+    }
+
+    #[test]
+    fn capture_history_returns_the_last_assistant_and_rejects_corruption() {
+        let path = Path::new("chat_history.jsonl");
+        let raw = concat!(
+            "{\"type\":\"assistant\",\"content\":\"first\"}\n",
+            "{\"type\":\"assistant\",\"content\":\"second\"}\n"
+        );
+        assert_eq!(
+            parse_last_assistant_text(raw, path, "session").unwrap(),
+            "second"
+        );
+        let error = parse_last_assistant_text("{SUPERSECRET}\n", path, "session")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("line 1"));
+        assert!(!error.contains("SUPERSECRET"));
     }
 
     fn tmp_test_dir() -> PathBuf {
@@ -2440,5 +2857,194 @@ mod tests {
             !crate::process_alive(u32::MAX),
             "non-existent PID should not be alive"
         );
+    }
+
+    #[test]
+    fn parallel_agent_counts_are_bounded() {
+        assert!(validate_parallel_count("team agent", 1, MAX_TEAM_AGENTS).is_ok());
+        assert!(validate_parallel_count("team agent", MAX_TEAM_AGENTS, MAX_TEAM_AGENTS).is_ok());
+        assert!(validate_parallel_count("team agent", 0, MAX_TEAM_AGENTS).is_err());
+        assert!(
+            validate_parallel_count("team agent", MAX_TEAM_AGENTS + 1, MAX_TEAM_AGENTS).is_err()
+        );
+        assert!(validate_parallel_count("swarm member", 0, MAX_SWARM_MEMBERS).is_err());
+        assert!(
+            validate_parallel_count("swarm member", MAX_SWARM_MEMBERS + 1, MAX_SWARM_MEMBERS)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_team_merge_is_not_reported_as_success() {
+        assert!(ensure_team_completed(2, 1, 0, 0).is_err());
+        assert!(ensure_team_completed(2, 0, 1, 0).is_err());
+        assert!(ensure_team_completed(2, 0, 0, 1).is_err());
+        assert!(ensure_team_completed(2, 0, 0, 0).is_ok());
+    }
+
+    async fn init_team_test_repo() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let init = git_cmd()
+            .current_dir(repo)
+            .args(["init", "-q", "-b", "trunk"])
+            .status()
+            .await
+            .unwrap();
+        assert!(init.success());
+        for (key, value) in [
+            ("user.name", "OMGB Team Test"),
+            ("user.email", "team-test@example.invalid"),
+        ] {
+            let status = git_cmd()
+                .current_dir(repo)
+                .args(["config", key, value])
+                .status()
+                .await
+                .unwrap();
+            assert!(status.success());
+        }
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        let add = git_cmd()
+            .current_dir(repo)
+            .args(["add", "shared.txt"])
+            .status()
+            .await
+            .unwrap();
+        assert!(add.success());
+        let commit = git_cmd()
+            .current_dir(repo)
+            .args(["commit", "-q", "--no-gpg-sign", "-m", "base"])
+            .status()
+            .await
+            .unwrap();
+        assert!(commit.success());
+        temp
+    }
+
+    #[tokio::test]
+    async fn team_cleanup_removes_worktree_before_branch() {
+        let temp = init_team_test_repo().await;
+        let repo = temp.path();
+        let worktree =
+            std::env::temp_dir().join(format!("omgb-team-cleanup-test-{}", uuid::Uuid::new_v4()));
+        let branch = create_worktree(repo, &worktree, "trunk").await.unwrap();
+        assert!(worktree.is_dir());
+
+        cleanup_team_worktree(repo, &worktree, &branch)
+            .await
+            .unwrap();
+
+        assert!(!worktree.exists());
+        let branches = git_cmd()
+            .current_dir(repo)
+            .args(["branch", "--list", &branch])
+            .output()
+            .await
+            .unwrap();
+        assert!(branches.status.success());
+        assert!(branches.stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn team_no_change_agent_does_not_leak_branch() {
+        let temp = init_team_test_repo().await;
+        let repo = temp.path();
+        let worktree =
+            std::env::temp_dir().join(format!("omgb-team-no-change-test-{}", uuid::Uuid::new_v4()));
+        let branch = create_worktree(repo, &worktree, "trunk").await.unwrap();
+
+        merge_worktree_into_base(repo, &worktree, &branch, "trunk")
+            .await
+            .unwrap();
+        cleanup_team_worktree(repo, &worktree, &branch)
+            .await
+            .unwrap();
+
+        let branches = git_cmd()
+            .current_dir(repo)
+            .args(["branch", "--list", &branch])
+            .output()
+            .await
+            .unwrap();
+        assert!(branches.status.success());
+        assert!(branches.stdout.is_empty());
+        assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn team_agent_commits_are_merged_even_when_the_index_is_clean() {
+        let temp = init_team_test_repo().await;
+        let repo = temp.path();
+        let worktree =
+            std::env::temp_dir().join(format!("omgb-team-commit-test-{}", uuid::Uuid::new_v4()));
+        let branch = create_worktree(repo, &worktree, "trunk").await.unwrap();
+        std::fs::write(worktree.join("agent.txt"), "committed output\n").unwrap();
+        let commit = git_cmd()
+            .current_dir(&worktree)
+            .args(["add", "agent.txt"])
+            .status()
+            .await
+            .unwrap();
+        assert!(commit.success());
+        let commit = git_cmd()
+            .current_dir(&worktree)
+            .args(["commit", "-q", "--no-gpg-sign", "-m", "agent commit"])
+            .status()
+            .await
+            .unwrap();
+        assert!(commit.success());
+
+        merge_worktree_into_base(repo, &worktree, &branch, "trunk")
+            .await
+            .unwrap();
+        cleanup_team_worktree(repo, &worktree, &branch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("agent.txt"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["committed output"]
+        );
+    }
+
+    #[tokio::test]
+    async fn team_merge_conflict_is_aborted_and_base_stays_clean() {
+        let temp = init_team_test_repo().await;
+        let repo = temp.path();
+        let worktree =
+            std::env::temp_dir().join(format!("omgb-team-conflict-test-{}", uuid::Uuid::new_v4()));
+        let branch = create_worktree(repo, &worktree, "trunk").await.unwrap();
+
+        std::fs::write(repo.join("shared.txt"), "base changed\n").unwrap();
+        let base_commit = git_cmd()
+            .current_dir(repo)
+            .args(["commit", "-qam", "base change", "--no-gpg-sign"])
+            .status()
+            .await
+            .unwrap();
+        assert!(base_commit.success());
+        std::fs::write(worktree.join("shared.txt"), "agent changed\n").unwrap();
+
+        let error = merge_worktree_into_base(repo, &worktree, &branch, "trunk")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("was aborted"));
+        assert!(git_worktree_status_in(repo).await.unwrap().0);
+        assert_eq!(git_current_branch(repo).await.unwrap(), "trunk");
+        let merge_head = git_cmd()
+            .current_dir(repo)
+            .args(["rev-parse", "--quiet", "--verify", "MERGE_HEAD"])
+            .status()
+            .await
+            .unwrap();
+        assert!(!merge_head.success());
+
+        cleanup_team_worktree(repo, &worktree, &branch)
+            .await
+            .unwrap();
     }
 }

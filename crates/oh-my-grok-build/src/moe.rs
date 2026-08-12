@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 
 use crate::providers::{
-    ProviderConfig, add_discovered_providers, discover_local_models, env_var_name,
-    is_local_provider_id, is_provider_reachable, is_valid_env_key, load_env_file, load_omg_config,
+    ProviderConfig, add_discovered_providers, api_key_value_is_usable, discover_local_models,
+    env_var_name, is_local_provider_id, is_provider_reachable, is_valid_env_key, load_env_file,
     provider_template,
 };
 
@@ -172,13 +172,12 @@ fn task_contains_word(task: &str, word: &str) -> bool {
 /// whose canonical env key is present even when they have not been explicitly
 /// configured.
 pub async fn available_providers() -> Result<Vec<String>> {
-    let cfg = load_omg_config()?;
     let dotenv = load_env_file().unwrap_or_default();
 
     let mut ids = std::collections::HashSet::new();
 
-    for provider in cfg.providers.values() {
-        if provider_is_available(provider, &dotenv, true).await {
+    for provider in crate::providers::list_providers()? {
+        if provider_is_available(&provider, &dotenv, true).await {
             ids.insert(provider.id.clone());
         }
     }
@@ -221,8 +220,12 @@ async fn provider_is_available(
         keys.push(storage.as_str());
     }
     keys.into_iter().any(|k| {
-        std::env::var(k).ok().filter(|v| !v.is_empty()).is_some()
-            || dotenv.get(k).filter(|v| !v.is_empty()).is_some()
+        std::env::var(k)
+            .ok()
+            .is_some_and(|value| api_key_value_is_usable(provider, &value))
+            || dotenv
+                .get(k)
+                .is_some_and(|value| api_key_value_is_usable(provider, value))
     })
 }
 
@@ -235,15 +238,14 @@ pub fn select_provider_from(available: &[String], task: &str) -> Result<String> 
         bail!("no providers available (set *_API_KEY or use a loopback local server)");
     }
 
-    let cfg = load_omg_config().unwrap_or_default();
     let task_lower = task.to_ascii_lowercase();
     let mut scored: Vec<(&String, f64, i32)> = available
         .iter()
         .map(|id| {
-            let base_url = cfg
-                .providers
-                .get(id)
-                .map(|p| p.base_url.clone())
+            let base_url = crate::providers::get_provider(id)
+                .ok()
+                .flatten()
+                .map(|provider| provider.base_url)
                 .or_else(|| provider_template(id).map(|t| t.base_url));
             let cost = provider_cost(id, base_url.as_deref());
             let is_local = is_local_provider_id(id)

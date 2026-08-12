@@ -17,19 +17,21 @@ use axum::{
         ConnectInfo, Json, Path, Query, State, ws::CloseFrame, ws::Message, ws::WebSocket,
         ws::WebSocketUpgrade,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame as UpstreamCloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as UpstreamCloseCode;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use url::Url;
 
@@ -37,15 +39,60 @@ use crate::args::{ConnectArgs, ServeArgs};
 
 const RATE_LIMIT_CLEANUP_INTERVAL_SECS: u64 = 60;
 const MAX_TRACKED_IPS: usize = 4096;
+const MAX_ACTIVE_PROXY_CONNECTIONS: usize = 32;
+const MAX_PAIRING_SECRET_BYTES: usize = 512;
+const MAX_REMOTE_AGENT_PROMPT_BYTES: usize = 512 * 1024;
+const MAX_HOSTED_DISPATCH_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_HOSTED_DISPATCH_CACHE_RECORDS: usize = 1024;
+const MAX_HOSTED_DISPATCH_TOMBSTONES: usize = 16 * 1024;
+const MAX_HOSTED_DISPATCH_FAILURE_BYTES: usize = 1024;
+const MAX_HOSTED_DISPATCH_GATES: usize = 4096;
+const MAX_GROUP_MESSAGE_PAGE: usize = 500;
 const UPSTREAM_PORT_ATTEMPTS: usize = 20;
+const VOICE_START_TIMEOUT: Duration = Duration::from_secs(15);
+const VOICE_SESSION_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
+const VOICE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const MIN_VOICE_SAMPLE_RATE: u32 = 8_000;
+const MAX_VOICE_SAMPLE_RATE: u32 = 48_000;
 
 fn omg_dir() -> anyhow::Result<std::path::PathBuf> {
     crate::providers::omg_dir()
 }
 
-fn generate_secret() -> String {
-    // Use the full UUIDv4 hex string (32 chars, 128 bits) for the pairing secret.
-    uuid::Uuid::new_v4().to_string().replace('-', "")
+fn generate_secret() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).context("operating-system random source failed")?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut secret = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        secret.push(HEX[(byte >> 4) as usize] as char);
+        secret.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(secret)
+}
+
+fn is_valid_pairing_secret(secret: &str) -> bool {
+    (16..=MAX_PAIRING_SECRET_BYTES).contains(&secret.len())
+        && secret.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn read_persisted_secret(path: &std::path::Path) -> Option<String> {
@@ -79,7 +126,7 @@ fn read_persisted_secret(path: &std::path::Path) -> Option<String> {
     let mut raw = String::new();
     file.read_to_string(&mut raw).ok()?;
     let s = raw.trim();
-    if s.len() >= 16 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if is_valid_pairing_secret(s) {
         Some(s.to_string())
     } else {
         None
@@ -167,8 +214,32 @@ fn pairing_url(
     }
 }
 
-fn pairing_payload(url: &str, secret: &str) -> String {
-    serde_json::json!({"url": url, "secret": secret }).to_string()
+fn pairing_payload(url: &str, secret: &str, cwd: Option<&std::path::Path>) -> String {
+    let cwd = cwd
+        .and_then(std::path::Path::to_str)
+        .filter(|path| path.len() <= 1024 && !path.chars().any(char::is_control));
+    serde_json::json!({"url": url, "secret": secret, "cwd": cwd }).to_string()
+}
+
+fn take_pairing_secret(url: &mut Url, explicit_secret: Option<String>) -> Option<String> {
+    let query_secret = url
+        .query_pairs()
+        .find(|(key, _)| key == "server-key" || key == "server_key")
+        .map(|(_, value)| value.into_owned());
+    let retained: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "server-key" && key != "server_key")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.set_query(None);
+    if !retained.is_empty() {
+        url.query_pairs_mut().extend_pairs(
+            retained
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+    }
+    explicit_secret.or(query_secret)
 }
 
 fn print_pairing_info(
@@ -183,7 +254,8 @@ fn print_pairing_info(
     // The QR encodes the URL and secret separately so the mobile client can
     // connect with an Authorization header instead of putting the secret in
     // the WebSocket URL (which would be logged by proxies and servers).
-    let payload = pairing_payload(&url, secret);
+    let cwd = std::env::current_dir().ok();
+    let payload = pairing_payload(&url, secret, cwd.as_deref());
     if let Ok(code) = qrcode::QrCode::new(payload.as_bytes()) {
         let qr = code.render().dark_color('#').light_color(' ').build();
         println!("  pairing QR:");
@@ -286,6 +358,48 @@ fn check_origin(
         return Ok(());
     }
     Err("origin not allowed")
+}
+
+fn cors_layer(allowed_origins: &Option<Vec<String>>) -> Result<Option<CorsLayer>> {
+    let Some(origins) = allowed_origins else {
+        return Ok(None);
+    };
+    if origins.is_empty() {
+        bail!("allowed origins list is empty");
+    }
+
+    let methods = [Method::GET, Method::POST, Method::OPTIONS];
+    let headers = [
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::HeaderName::from_static("x-member-token"),
+        header::HeaderName::from_static("x-pre-auth-token"),
+        header::HeaderName::from_static("x-server-token"),
+    ];
+    if origins.iter().any(|origin| origin == "*") {
+        return Ok(Some(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(methods)
+                .allow_headers(headers),
+        ));
+    }
+
+    let values = origins
+        .iter()
+        .map(|origin| {
+            let normalized = normalize_origin(origin)
+                .with_context(|| format!("invalid allowed origin {origin:?}"))?;
+            HeaderValue::from_str(&normalized)
+                .with_context(|| format!("invalid allowed origin {origin:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(
+        CorsLayer::new()
+            .allow_origin(values)
+            .allow_methods(methods)
+            .allow_headers(headers),
+    ))
 }
 
 async fn prune_rate_limiter(
@@ -406,13 +520,95 @@ async fn spawn_upstream_agent(
     bail!("failed to find free loopback port for upstream agent server")
 }
 
+fn relay_voice_config(
+    agent_config: &xai_grok_shell::agent::config::Config,
+) -> xai_grok_voice::VoiceConfig {
+    let raw = xai_grok_shell::config::load_effective_config_disk_only().ok();
+    let mut config = raw
+        .as_ref()
+        .and_then(toml::Value::as_table)
+        .map(|root| {
+            xai_grok_voice::VoiceConfig::from_config_table(
+                root,
+                Some(&agent_config.endpoints.xai_api_base_url),
+            )
+        })
+        .unwrap_or_default();
+    config.client_identifier = "oh-my-grok-build-mobile".to_string();
+    config.user_agent = format!("oh-my-grok-build/{}", env!("CARGO_PKG_VERSION"));
+    config
+}
+
 struct ProxyState {
     secret_hash: [u8; 32],
     allowed_origins: Option<Vec<String>>,
     rate_limit_per_minute: Option<u32>,
     rate_limiter: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
+    connection_limit: Arc<Semaphore>,
     upstream_url: String,
     upstream_secret: String,
+    voice_config: xai_grok_voice::VoiceConfig,
+    voice_auth: xai_grok_voice::SharedVoiceAuth,
+    hosted_dispatch_gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum VoiceClientMessage {
+    Start {
+        sample_rate: u32,
+        channels: u8,
+        encoding: String,
+    },
+    Stop,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum VoiceServerMessage<'a> {
+    Ready,
+    Partial {
+        text: &'a str,
+        is_final: bool,
+        speech_final: bool,
+    },
+    Done {
+        text: &'a str,
+    },
+    Error {
+        message: &'a str,
+    },
+}
+
+fn validate_voice_start(message: VoiceClientMessage) -> Result<u32, &'static str> {
+    let VoiceClientMessage::Start {
+        sample_rate,
+        channels,
+        encoding,
+    } = message
+    else {
+        return Err("expected voice start message");
+    };
+    if !(MIN_VOICE_SAMPLE_RATE..=MAX_VOICE_SAMPLE_RATE).contains(&sample_rate) {
+        return Err("voice sample rate is unsupported");
+    }
+    if channels != 1 {
+        return Err("voice input must be mono");
+    }
+    if encoding != "int16" {
+        return Err("voice input must be signed 16-bit PCM");
+    }
+    Ok(sample_rate)
+}
+
+async fn send_voice_event(
+    writer: &mut futures::stream::SplitSink<WebSocket, Message>,
+    event: VoiceServerMessage<'_>,
+) -> bool {
+    match serde_json::to_string(&event) {
+        Ok(body) => writer.send(Message::Text(body.into())).await.is_ok(),
+        Err(_) => false,
+    }
 }
 
 async fn ws_handler(
@@ -440,6 +636,17 @@ async fn ws_handler(
         )
             .into_response();
     };
+    let permit = match state.connection_limit.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("Connection limit reached for {}", addr);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "relay connection capacity reached; retry shortly",
+            )
+                .into_response();
+        }
+    };
 
     let from_protocol = headers.get("sec-websocket-protocol").is_some_and(|v| {
         v.to_str().ok().is_some_and(|protos| {
@@ -456,7 +663,208 @@ async fn ws_handler(
     } else {
         ws
     };
-    ws.on_upgrade(move |socket| handle_proxy(socket, state))
+    ws.max_message_size(crate::net::MAX_WEBSOCKET_MESSAGE_BYTES)
+        .max_frame_size(crate::net::MAX_WEBSOCKET_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            handle_proxy(socket, state).await;
+        })
+}
+
+async fn voice_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<xai_grok_shell::agent::server::WsQueryParams>,
+) -> Response {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        warn!("Voice rate limit exceeded for {}: {}", addr, msg);
+        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    }
+    if let Err(msg) = check_origin(&state.allowed_origins, &headers) {
+        warn!("Voice origin check failed for {}: {}", addr, msg);
+        return (StatusCode::FORBIDDEN, msg).into_response();
+    }
+
+    let Some(matched_token) = validate_auth(&headers, &query, &state).await else {
+        warn!("Unauthorized voice connection attempt from {}", addr);
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Invalid or missing authorization token",
+        )
+            .into_response();
+    };
+    let permit = match state.connection_limit.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("Voice connection limit reached for {}", addr);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "relay connection capacity reached; retry shortly",
+            )
+                .into_response();
+        }
+    };
+
+    let from_protocol = headers.get("sec-websocket-protocol").is_some_and(|v| {
+        v.to_str().ok().is_some_and(|protos| {
+            protos
+                .split(',')
+                .map(str::trim)
+                .any(|p| p == matched_token.as_str())
+        })
+    });
+    let ws = if from_protocol {
+        ws.protocols([matched_token])
+    } else {
+        ws
+    };
+    ws.max_message_size(crate::net::MAX_WEBSOCKET_MESSAGE_BYTES)
+        .max_frame_size(crate::net::MAX_WEBSOCKET_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            handle_voice(socket, state).await;
+        })
+}
+
+async fn handle_voice(client_ws: WebSocket, state: Arc<ProxyState>) {
+    use xai_grok_voice::stt::{StreamingSttEvent, StreamingSttSession};
+
+    let (mut write, mut read) = client_ws.split();
+    let start = match tokio::time::timeout(VOICE_START_TIMEOUT, read.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<VoiceClientMessage>(&text)
+            .map_err(|_| "invalid voice start message")
+            .and_then(validate_voice_start),
+        Ok(Some(Ok(_))) => Err("expected voice start message"),
+        Ok(Some(Err(_))) | Ok(None) => return,
+        Err(_) => Err("voice start timed out"),
+    };
+    let sample_rate = match start {
+        Ok(sample_rate) => sample_rate,
+        Err(message) => {
+            let _ = send_voice_event(&mut write, VoiceServerMessage::Error { message }).await;
+            return;
+        }
+    };
+
+    let Some(bearer) = state.voice_auth.bearer().await else {
+        let _ = send_voice_event(
+            &mut write,
+            VoiceServerMessage::Error {
+                message: "voice requires a signed-in xAI account or API key on the harness",
+            },
+        )
+        .await;
+        return;
+    };
+    let mut config = state.voice_config.clone();
+    config.sample_rate = sample_rate;
+    let mut stt = match StreamingSttSession::connect(&config, &bearer).await {
+        Ok(session) => session,
+        Err(error) => {
+            warn!("Voice STT connection failed: {error}");
+            let _ = send_voice_event(
+                &mut write,
+                VoiceServerMessage::Error {
+                    message: "voice transcription service is unavailable",
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    if !send_voice_event(&mut write, VoiceServerMessage::Ready).await {
+        return;
+    }
+
+    let session_deadline = tokio::time::Instant::now() + VOICE_SESSION_MAX_DURATION;
+    let never = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+    let mut accepting_audio = true;
+    let mut drain_deadline = None;
+
+    loop {
+        let finish_at = drain_deadline.unwrap_or(never);
+        tokio::select! {
+            message = read.next(), if accepting_audio => {
+                match message {
+                    Some(Ok(Message::Binary(pcm))) => {
+                        if pcm.is_empty() || pcm.len() % 2 != 0 {
+                            let _ = send_voice_event(&mut write, VoiceServerMessage::Error {
+                                message: "voice PCM frames must be non-empty signed 16-bit samples",
+                            }).await;
+                            break;
+                        }
+                        if stt.send_pcm(pcm.to_vec()).await.is_err() {
+                            let _ = send_voice_event(&mut write, VoiceServerMessage::Error {
+                                message: "voice transcription connection closed",
+                            }).await;
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<VoiceClientMessage>(&text) {
+                        Ok(VoiceClientMessage::Stop) => {
+                            stt.finish_audio();
+                            accepting_audio = false;
+                            drain_deadline = Some(tokio::time::Instant::now() + VOICE_DRAIN_TIMEOUT);
+                        }
+                        _ => {
+                            let _ = send_voice_event(&mut write, VoiceServerMessage::Error {
+                                message: "unexpected voice control message",
+                            }).await;
+                            break;
+                        }
+                    },
+                    Some(Ok(Message::Ping(payload))) => {
+                        if write.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        stt.finish_audio();
+                        accepting_audio = false;
+                        drain_deadline = Some(tokio::time::Instant::now() + VOICE_DRAIN_TIMEOUT);
+                    }
+                }
+            }
+            event = stt.recv() => match event {
+                Some(StreamingSttEvent::Partial(partial)) => {
+                    if !send_voice_event(&mut write, VoiceServerMessage::Partial {
+                        text: &partial.text,
+                        is_final: partial.is_final,
+                        speech_final: partial.speech_final,
+                    }).await {
+                        break;
+                    }
+                }
+                Some(StreamingSttEvent::Done { text }) => {
+                    let _ = send_voice_event(&mut write, VoiceServerMessage::Done { text: &text }).await;
+                    break;
+                }
+                Some(StreamingSttEvent::Error { message }) => {
+                    warn!("Voice STT session failed: {message}");
+                    let _ = send_voice_event(&mut write, VoiceServerMessage::Error {
+                        message: "voice transcription failed",
+                    }).await;
+                    break;
+                }
+                Some(StreamingSttEvent::Ready) | None => break,
+            },
+            _ = tokio::time::sleep_until(session_deadline), if accepting_audio => {
+                stt.finish_audio();
+                accepting_audio = false;
+                drain_deadline = Some(tokio::time::Instant::now() + VOICE_DRAIN_TIMEOUT);
+                if !send_voice_event(&mut write, VoiceServerMessage::Error {
+                    message: "voice session reached its five-minute limit",
+                }).await {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(finish_at), if drain_deadline.is_some() => break,
+        }
+    }
 }
 
 async fn handle_proxy(client_ws: WebSocket, state: Arc<ProxyState>) {
@@ -555,13 +963,36 @@ async fn handle_proxy(client_ws: WebSocket, state: Arc<ProxyState>) {
         }
     });
 
-    let _ = tokio::join!(client_to_up, up_to_client);
+    finish_proxy_bridge(client_to_up, up_to_client).await;
     info!("WebSocket proxy connection ended");
+}
+
+async fn finish_proxy_bridge(
+    mut client_to_up: tokio::task::JoinHandle<()>,
+    mut up_to_client: tokio::task::JoinHandle<()>,
+) {
+    tokio::select! {
+        _ = &mut client_to_up => {
+            up_to_client.abort();
+            let _ = up_to_client.await;
+        }
+        _ = &mut up_to_client => {
+            client_to_up.abort();
+            let _ = client_to_up.await;
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct GroupTokenQuery {
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GroupMessagesQuery {
+    after: Option<String>,
+    before: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -609,6 +1040,8 @@ impl From<&crate::group::JoinRequest> for PublicJoinRequest {
 struct GroupMessagePayload {
     content: String,
     kind: crate::group::MessageKind,
+    #[serde(default)]
+    client_message_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -664,12 +1097,7 @@ struct CreateWorkflowResponse {
     path: String,
 }
 
-#[derive(Deserialize)]
-struct ServerTokenQuery {
-    server_key: Option<String>,
-}
-
-fn extract_server_token(query: &ServerTokenQuery, headers: &HeaderMap) -> String {
+fn extract_server_token(headers: &HeaderMap) -> String {
     if let Some(t) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -685,15 +1113,10 @@ fn extract_server_token(query: &ServerTokenQuery, headers: &HeaderMap) -> String
     {
         return t.to_string();
     }
-    if let Some(t) = query.server_key.as_deref()
-        && !t.is_empty()
-    {
-        return t.to_string();
-    }
     String::new()
 }
 
-fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
+fn extract_group_token_from_headers(headers: &HeaderMap) -> String {
     for header in ["x-member-token", "x-group-token"] {
         if let Some(t) = headers
             .get(header)
@@ -710,6 +1133,14 @@ fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
         .filter(|v| !v.is_empty())
     {
         return t.to_string();
+    }
+    String::new()
+}
+
+fn extract_group_token(query: &GroupTokenQuery, headers: &HeaderMap) -> String {
+    let header_token = extract_group_token_from_headers(headers);
+    if !header_token.is_empty() {
+        return header_token;
     }
     if let Some(t) = query.token.as_deref()
         && !t.is_empty()
@@ -735,6 +1166,10 @@ fn is_member_token(group: &crate::group::Group, token: &str) -> bool {
     crate::group::validate_member_token(group, token).is_some()
 }
 
+fn is_host_member_token(group: &crate::group::Group, token: &str) -> bool {
+    crate::group::is_host_member_token(group, token)
+}
+
 fn server_token_valid(state: &ProxyState, token: &str) -> bool {
     constant_time_eq::constant_time_eq(
         state.secret_hash.as_ref(),
@@ -743,7 +1178,6 @@ fn server_token_valid(state: &ProxyState, token: &str) -> bool {
 }
 
 async fn admin_create_group_handler(
-    Query(query): Query<ServerTokenQuery>,
     headers: HeaderMap,
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -758,7 +1192,7 @@ async fn admin_create_group_handler(
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg.to_string()));
     }
-    let token = extract_server_token(&query, &headers);
+    let token = extract_server_token(&headers);
     if !server_token_valid(&state, &token) {
         return Err((StatusCode::UNAUTHORIZED, "invalid server token".to_string()));
     }
@@ -805,7 +1239,6 @@ async fn admin_create_group_handler(
 }
 
 async fn admin_create_workflow_handler(
-    Query(query): Query<ServerTokenQuery>,
     headers: HeaderMap,
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -820,7 +1253,7 @@ async fn admin_create_workflow_handler(
         warn!("Origin check failed for {}: {}", addr, msg);
         return Err((StatusCode::FORBIDDEN, msg.to_string()));
     }
-    let token = extract_server_token(&query, &headers);
+    let token = extract_server_token(&headers);
     if !server_token_valid(&state, &token) {
         return Err((StatusCode::UNAUTHORIZED, "invalid server token".to_string()));
     }
@@ -873,6 +1306,7 @@ async fn group_info_handler(
         return Err((StatusCode::UNAUTHORIZED, "invalid token"));
     }
     let is_member = is_member_token(&group, &token);
+    let is_host = is_host_member_token(&group, &token);
     Ok(Json(GroupInfo {
         id: group.id,
         name: group.name,
@@ -882,7 +1316,7 @@ async fn group_info_handler(
         host_name: group.host_name,
         agents: if is_member { group.agents } else { Vec::new() },
         members: if is_member { group.members } else { Vec::new() },
-        pending_joins: if is_member {
+        pending_joins: if is_host {
             group.pending_joins.iter().map(|r| r.into()).collect()
         } else {
             Vec::new()
@@ -906,7 +1340,7 @@ async fn group_info_handler(
 
 async fn group_list_messages_handler(
     Path(id): Path<String>,
-    Query(query): Query<GroupTokenQuery>,
+    Query(query): Query<GroupMessagesQuery>,
     headers: HeaderMap,
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -923,22 +1357,52 @@ async fn group_list_messages_handler(
     if crate::threads::validate_id(&id).is_err() {
         return Err((StatusCode::BAD_REQUEST, "invalid group id"));
     }
-    let token = extract_group_token(&query, &headers);
+    let limit = query.limit.unwrap_or(200);
+    if !(1..=MAX_GROUP_MESSAGE_PAGE).contains(&limit) {
+        return Err((StatusCode::BAD_REQUEST, "invalid message page size"));
+    }
+    if query
+        .after
+        .as_deref()
+        .is_some_and(|after| crate::threads::validate_id(after).is_err())
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid last message id"));
+    }
+    if query
+        .before
+        .as_deref()
+        .is_some_and(|before| crate::threads::validate_id(before).is_err())
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid first message id"));
+    }
+    if query.after.is_some() && query.before.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "after and before are mutually exclusive",
+        ));
+    }
+    let token = extract_group_token_from_headers(&headers);
     let group = crate::group::load_group_async(&id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "group not found"))?;
     if !is_member_token(&group, &token) {
         return Err((StatusCode::UNAUTHORIZED, "a valid member token is required"));
     }
-    let messages = crate::group::load_messages_async(&id)
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed to load messages"))?;
+    let messages = crate::group::load_message_page_async(
+        &id,
+        query.after.as_deref(),
+        query.before.as_deref(),
+        limit,
+    )
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed to load messages"))?;
+    let messages = messages.ok_or((StatusCode::CONFLICT, "message cursor expired"))?;
     Ok(Json(messages))
 }
 
 async fn group_post_message_handler(
     Path(id): Path<String>,
-    Query(query): Query<GroupTokenQuery>,
+    Query(_query): Query<GroupTokenQuery>,
     headers: HeaderMap,
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -956,7 +1420,7 @@ async fn group_post_message_handler(
     if let Err(e) = crate::threads::validate_id(&id) {
         return Err((StatusCode::BAD_REQUEST, e.to_string()));
     }
-    let token = extract_group_token(&query, &headers);
+    let token = extract_group_token_from_headers(&headers);
     let group = crate::group::load_group_async(&id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
@@ -990,46 +1454,244 @@ async fn group_post_message_handler(
         ));
     }
     let content = payload.content.trim().to_string();
-    if content.len() > crate::group::MAX_GROUP_MESSAGE_BYTES {
+    crate::group::validate_message_content(&content).map_err(|e| {
+        let status = if content.len() > crate::group::MAX_GROUP_MESSAGE_BYTES {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, e.to_string())
+    })?;
+    let client_message_id = payload
+        .client_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "client_message_id is required for idempotent delivery".to_string(),
+            )
+        })?;
+    if crate::threads::validate_id(&client_message_id).is_err() {
         return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "message too large".to_string(),
+            StatusCode::BAD_REQUEST,
+            "invalid client message id".to_string(),
         ));
     }
+    let message_id = client_message_id.clone();
     let message = crate::group::GroupMessage {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: message_id,
         timestamp: Utc::now(),
         sender,
         content,
         kind: payload.kind,
+        client_message_id: Some(client_message_id),
+        reply_to: None,
     };
-    crate::group::add_message_async(&id, &message)
+    crate::group::persist_and_queue_message_async(&id, &message, &message.sender)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("different payload") {
+                (
+                    StatusCode::CONFLICT,
+                    "message id is already associated with different content".to_string(),
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save and queue message".to_string(),
+                )
+            }
+        })?;
+
+    // The durable record is committed before acknowledgement. The worker may
+    // finish after the response and is recovered from the ledger on restart.
+    if let Err(error) = crate::group::schedule_group_dispatch(id.clone()) {
+        eprintln!("warning: message is durable but dispatch scheduling failed: {error}");
+    }
+
+    Ok(StatusCode::CREATED)
+}
+
+async fn group_dispatch_status_handler(
+    Path((id, trigger_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<crate::group::GroupDispatchStatus>, (StatusCode, String)> {
+    if let Err(message) =
+        check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        return Err((StatusCode::TOO_MANY_REQUESTS, message.to_string()));
+    }
+    check_origin(&state.allowed_origins, &headers)
+        .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    crate::threads::validate_id(&id)
+        .and_then(|_| crate::threads::validate_id(&trigger_id))
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let token = extract_group_token_from_headers(&headers);
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+    if !is_member_token(&group, &token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "a valid member token is required".to_string(),
+        ));
+    }
+    crate::group::dispatch_status_async(&id, &trigger_id)
+        .await
+        .map_err(|error| {
+            warn!("group dispatch status failed: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load dispatch status".to_string(),
+            )
+        })?
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "dispatch status not found or expired".to_string(),
+            )
+        })
+}
+
+#[derive(Deserialize)]
+struct GroupDispatchStatusesQuery {
+    ids: String,
+}
+
+async fn group_dispatch_statuses_handler(
+    Path(id): Path<String>,
+    Query(query): Query<GroupDispatchStatusesQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<Vec<crate::group::GroupDispatchStatus>>, (StatusCode, String)> {
+    if let Err(message) =
+        check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        return Err((StatusCode::TOO_MANY_REQUESTS, message.to_string()));
+    }
+    check_origin(&state.allowed_origins, &headers)
+        .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    crate::threads::validate_id(&id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let ids = query
+        .ids
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if ids.is_empty()
+        || ids.len() > 20
+        || ids
+            .iter()
+            .any(|trigger_id| crate::threads::validate_id(trigger_id).is_err())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ids must contain 1 to 20 valid dispatch ids".to_string(),
+        ));
+    }
+    let token = extract_group_token_from_headers(&headers);
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+    if !is_member_token(&group, &token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "a valid member token is required".to_string(),
+        ));
+    }
+    crate::group::dispatch_statuses_async(&id, ids)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            warn!("group dispatch status batch failed: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load dispatch statuses".to_string(),
+            )
+        })
+}
+
+async fn group_dispatch_retry_handler(
+    Path((id, trigger_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if let Err(message) =
+        check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        return Err((StatusCode::TOO_MANY_REQUESTS, message.to_string()));
+    }
+    check_origin(&state.allowed_origins, &headers)
+        .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    crate::threads::validate_id(&id)
+        .and_then(|_| crate::threads::validate_id(&trigger_id))
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let token = extract_group_token_from_headers(&headers);
+    let group = crate::group::load_group_async(&id)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+    let requester = crate::group::validate_member_token(&group, &token).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "a valid member token is required".to_string(),
+        )
+    })?;
+    let current = crate::group::dispatch_status_async(&id, &trigger_id)
         .await
         .map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to save message".to_string(),
+                "failed to load dispatch status".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "dispatch status not found or expired".to_string(),
             )
         })?;
-
-    // Trigger agent dispatch off the response path. dispatch_for_message is
-    // Send, so spawn it as an async task and return the HTTP response immediately.
-    let group_for_dispatch = group.clone();
-    let trigger_for_dispatch = message.clone();
-    let sender_for_dispatch = message.sender.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::group::dispatch_for_message(
-            group_for_dispatch,
-            trigger_for_dispatch,
-            sender_for_dispatch,
-        )
+    if !requester.eq_ignore_ascii_case(&current.human_name)
+        && !crate::group::is_host_member_token(&group, &token)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only the original sender or group host can retry this dispatch".to_string(),
+        ));
+    }
+    let requeued = crate::group::retry_dispatch_async(&id, &trigger_id)
         .await
-        {
-            eprintln!("warning: group dispatch failed: {e}");
-        }
-    });
-
-    Ok(StatusCode::CREATED)
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("ambiguous") {
+                (StatusCode::CONFLICT, message)
+            } else {
+                warn!("group dispatch retry failed: {error}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to retry dispatch".to_string(),
+                )
+            }
+        })?;
+    if !requeued {
+        return Err((
+            StatusCode::CONFLICT,
+            "only a failed retryable dispatch can be retried".to_string(),
+        ));
+    }
+    if let Err(error) = crate::group::schedule_group_dispatch(id.clone()) {
+        eprintln!("warning: dispatch retry is durable but scheduling failed: {error}");
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Deserialize)]
@@ -1041,7 +1703,7 @@ struct JoinPayload {
 
 async fn group_list_joins_handler(
     Path(id): Path<String>,
-    Query(query): Query<GroupTokenQuery>,
+    Query(_query): Query<GroupTokenQuery>,
     headers: HeaderMap,
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1058,14 +1720,14 @@ async fn group_list_joins_handler(
     if let Err(e) = crate::threads::validate_id(&id) {
         return Err((StatusCode::BAD_REQUEST, e.to_string()));
     }
-    let token = extract_group_token(&query, &headers);
+    let token = extract_group_token_from_headers(&headers);
     let group = crate::group::load_group_async(&id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
-    if !is_member_token(&group, &token) {
+    if !is_host_member_token(&group, &token) {
         return Err((
             StatusCode::UNAUTHORIZED,
-            "a valid member token is required".to_string(),
+            "the group host token is required".to_string(),
         ));
     }
     Ok(Json(group.pending_joins.iter().map(|r| r.into()).collect()))
@@ -1108,53 +1770,11 @@ async fn group_request_join_handler(
         return Err((StatusCode::BAD_REQUEST, e.to_string()));
     }
 
-    let result = if group.members.is_empty() {
-        let name = name.clone();
-        let github = github.clone();
-        crate::group::modify_group_async(&id, move |group| {
-            let token = crate::group::ensure_local_member(group, &name)?;
-            Ok(crate::group::JoinResult {
-                id: String::new(),
-                status: "approved".to_string(),
-                name: name.clone(),
-                github: github.clone(),
-                member_token: Some(token),
-                pre_auth_token: None,
-            })
-        })
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
-    } else if crate::group::is_member(&group, &name) {
-        crate::group::JoinResult {
-            id: String::new(),
-            status: "member".to_string(),
-            name: name.clone(),
-            github: github.clone(),
-            member_token: None,
-            pre_auth_token: None,
-        }
-    } else {
-        let name = name.clone();
-        let github = github.clone();
-        crate::group::modify_group_async(&id, move |group| {
-            let request_id = crate::group::add_join_request(group, &name, github.as_deref())?;
-            let pre_auth = group
-                .pending_joins
-                .iter()
-                .find(|r| r.id == request_id)
-                .and_then(|r| r.pre_auth_token.clone());
-            Ok(crate::group::JoinResult {
-                id: request_id,
-                status: "pending".to_string(),
-                name: name.clone(),
-                github,
-                member_token: None,
-                pre_auth_token: pre_auth,
-            })
-        })
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
-    };
+    let result = crate::group::modify_group_async(&id, move |group| {
+        crate::group::request_join(group, &name, github.as_deref())
+    })
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     Ok(Json(result))
 }
@@ -1169,7 +1789,7 @@ enum ApproveJoinError {
 impl std::fmt::Display for ApproveJoinError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidToken => f.write_str("a valid member token is required to approve"),
+            Self::InvalidToken => f.write_str("the group host token is required to approve"),
             Self::RequestNotFound => f.write_str("join request not found"),
             Self::BadRequest(msg) => f.write_str(msg),
         }
@@ -1180,7 +1800,7 @@ impl std::error::Error for ApproveJoinError {}
 
 async fn group_approve_join_handler(
     Path((id, request_id)): Path<(String, String)>,
-    Query(query): Query<GroupTokenQuery>,
+    Query(_query): Query<GroupTokenQuery>,
     headers: HeaderMap,
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1201,11 +1821,11 @@ async fn group_approve_join_handler(
         return Err((StatusCode::BAD_REQUEST, e.to_string()));
     }
 
-    let token = extract_group_token(&query, &headers);
+    let token = extract_group_token_from_headers(&headers);
 
     let modify_request_id = request_id.clone();
-    let (name, member_token) = crate::group::modify_group_async(&id, move |group| {
-        if crate::group::validate_member_token(group, &token).is_none() {
+    let (name, _) = crate::group::modify_group_async(&id, move |group| {
+        if !crate::group::is_host_member_token(group, &token) {
             return Err(ApproveJoinError::InvalidToken.into());
         }
         let pre_auth = group
@@ -1248,7 +1868,70 @@ async fn group_approve_join_handler(
         status: "approved".to_string(),
         name,
         github: None,
-        member_token: Some(member_token),
+        // The approved participant claims this token with its one-time
+        // pre-authorization secret. Do not disclose it to the approver.
+        member_token: None,
+        pre_auth_token: None,
+    }))
+}
+
+async fn group_reject_join_handler(
+    Path((id, request_id)): Path<(String, String)>,
+    Query(_query): Query<GroupTokenQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<crate::group::JoinResult>, (StatusCode, String)> {
+    if let Err(message) =
+        check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        return Err((StatusCode::TOO_MANY_REQUESTS, message.to_string()));
+    }
+    check_origin(&state.allowed_origins, &headers)
+        .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    crate::threads::validate_id(&id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    crate::threads::validate_id(&request_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let token = extract_group_token_from_headers(&headers);
+    let modify_request_id = request_id.clone();
+    let name = crate::group::modify_group_async(&id, move |group| {
+        if !crate::group::is_host_member_token(group, &token) {
+            return Err(ApproveJoinError::InvalidToken.into());
+        }
+        crate::group::reject_join_request(group, &modify_request_id).map_err(|error| {
+            let message = error.to_string();
+            if message.contains("not found") {
+                ApproveJoinError::RequestNotFound.into()
+            } else {
+                ApproveJoinError::BadRequest(message).into()
+            }
+        })
+    })
+    .await
+    .map_err(|error| {
+        if is_not_found(&error) {
+            return (StatusCode::NOT_FOUND, "group not found".to_string());
+        }
+        if let Some(rejection) = error.downcast_ref::<ApproveJoinError>() {
+            return match rejection {
+                ApproveJoinError::InvalidToken => (StatusCode::UNAUTHORIZED, rejection.to_string()),
+                ApproveJoinError::RequestNotFound => (StatusCode::NOT_FOUND, rejection.to_string()),
+                ApproveJoinError::BadRequest(message) => (StatusCode::BAD_REQUEST, message.clone()),
+            };
+        }
+        warn!("reject join request failed: {error}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to reject join request".to_string(),
+        )
+    })?;
+    Ok(Json(crate::group::JoinResult {
+        id: request_id,
+        status: "rejected".to_string(),
+        name,
+        github: None,
+        member_token: None,
         pre_auth_token: None,
     }))
 }
@@ -1301,12 +1984,9 @@ async fn group_join_status_handler(
         )
     })?;
 
-    let request_id_for_modify = request_id.clone();
-    let pre_auth_for_modify = pre_auth.clone();
-
     let group = crate::group::load_group_async(&id)
         .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "group not found".to_string()))?;
+        .map_err(map_join_status_error)?;
     for r in &group.pending_joins {
         if r.id == request_id
             && r.pre_auth_token
@@ -1324,50 +2004,94 @@ async fn group_join_status_handler(
         }
     }
 
-    crate::group::modify_group_async(&id, move |group| {
-        let mut approved: Option<(String, String)> = None;
-        for (k, v) in &group.approved_member_tokens {
-            if crate::group::constant_time_token_eq(k, &pre_auth_for_modify) {
-                approved = Some((k.clone(), v.clone()));
-                break;
-            }
-        }
-        let Some((key, token)) = approved else {
-            bail!("join request not found");
-        };
-        group.approved_member_tokens.remove(&key);
-        let name = group
-            .member_token_index
-            .get(&token)
-            .cloned()
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("member token index inconsistent"))?;
-        Ok(Json(crate::group::JoinResult {
-            id: request_id_for_modify,
-            status: "approved".to_string(),
-            name,
-            github: None,
-            member_token: Some(token),
-            pre_auth_token: None,
-        }))
+    let claim_pre_auth = pre_auth.clone();
+    let claim_request_id = request_id.clone();
+    let (name, token) = crate::group::modify_group_async(&id, move |group| {
+        crate::group::lease_approved_member_claim(group, &claim_request_id, &claim_pre_auth)
+            .ok_or_else(|| anyhow::anyhow!("join request not found"))
     })
     .await
-    .map_err(|e| {
-        if e.to_string().contains("join request not found") {
-            (StatusCode::NOT_FOUND, "join request not found".to_string())
-        } else {
-            warn!("group join status failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to consume approval".to_string(),
-            )
-        }
+    .map_err(map_join_status_error)?;
+    Ok(Json(crate::group::JoinResult {
+        id: request_id,
+        status: "approved".to_string(),
+        name,
+        github: None,
+        member_token: Some(token),
+        pre_auth_token: None,
+    }))
+}
+
+fn map_join_status_error(error: anyhow::Error) -> (StatusCode, String) {
+    let missing_file = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    });
+    if missing_file || error.to_string() == "join request not found" {
+        return (StatusCode::NOT_FOUND, "join request not found".to_string());
+    }
+    warn!("group join status lookup failed: {error:#}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "could not read join status; retry without discarding the claim token".to_string(),
+    )
+}
+
+async fn group_join_ack_handler(
+    Path((id, request_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<Arc<ProxyState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if let Err(msg) = check_rate_limit(state.rate_limit_per_minute, &state.rate_limiter, addr).await
+    {
+        return Err((StatusCode::TOO_MANY_REQUESTS, msg.to_string()));
+    }
+    check_origin(&state.allowed_origins, &headers)
+        .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    crate::threads::validate_id(&id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    crate::threads::validate_id(&request_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let pre_auth = extract_pre_auth(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "missing pre-auth token".to_string(),
+        )
+    })?;
+
+    crate::group::modify_group_async(&id, move |group| {
+        crate::group::acknowledge_join_approval(group, &request_id, &pre_auth)
     })
+    .await
+    .map_err(|error| {
+        warn!("group join acknowledgement failed: {error}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to acknowledge join approval".to_string(),
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
 struct RemoteAgentMessagePayload {
     content: String,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
+}
+
+fn required_remote_agent_message_id(
+    value: Option<&str>,
+) -> std::result::Result<String, &'static str> {
+    value
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or("message_id is required for idempotent agent delivery")
 }
 
 async fn group_remote_agent_message_handler(
@@ -1436,39 +2160,455 @@ async fn group_remote_agent_message_handler(
         return Ok(StatusCode::NO_CONTENT);
     }
 
+    let message_id = required_remote_agent_message_id(payload.message_id.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.to_string()))?;
+    if crate::threads::validate_id(&message_id).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid agent message id".to_string(),
+        ));
+    }
+    let reply_to = payload
+        .reply_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    if reply_to
+        .as_deref()
+        .is_some_and(|id| crate::threads::validate_id(id).is_err())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid reply target id".to_string(),
+        ));
+    }
+
     let message = crate::group::GroupMessage {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: message_id.clone(),
         timestamp: Utc::now(),
         sender: agent_name.clone(),
         content,
         kind: crate::group::MessageKind::Agent,
+        client_message_id: Some(message_id),
+        reply_to,
     };
-    crate::group::add_message_async(&id, &message)
+    crate::group::persist_and_queue_message_async(&id, &message, &agent_name)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to save message".to_string(),
-            )
+        .map_err(|error| {
+            if error.to_string().contains("different payload") {
+                (
+                    StatusCode::CONFLICT,
+                    "agent message id is already associated with different content".to_string(),
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save and queue remote agent message".to_string(),
+                )
+            }
         })?;
 
-    let group_for_dispatch = crate::group::load_group_async(&id).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to load group".to_string(),
-        )
-    })?;
-    let trigger_for_dispatch = message.clone();
-    tokio::spawn(async move {
-        if let Err(e) =
-            crate::group::dispatch_for_message(group_for_dispatch, trigger_for_dispatch, agent_name)
-                .await
-        {
-            eprintln!("warning: remote agent dispatch failed: {e}");
-        }
-    });
+    if let Err(error) = crate::group::schedule_group_dispatch(id.clone()) {
+        eprintln!("warning: remote message is durable but dispatch scheduling failed: {error}");
+    }
 
     Ok(StatusCode::CREATED)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostedDispatchCacheEntry {
+    dispatch_id: String,
+    group_id: String,
+    agent_name: String,
+    payload_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response: Option<crate::group::RemoteAgentDispatchResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostedDispatchTombstone {
+    dispatch_id: String,
+    group_id: String,
+    agent_name: String,
+    payload_hash: String,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HostedDispatchCache {
+    #[serde(default)]
+    records: Vec<HostedDispatchCacheEntry>,
+    #[serde(default)]
+    tombstones: Vec<HostedDispatchTombstone>,
+}
+
+enum HostedDispatchAdmission {
+    Start,
+    Ready(crate::group::RemoteAgentDispatchResponse),
+    Completed,
+    Ambiguous,
+}
+
+fn hosted_dispatch_cache_path() -> Result<std::path::PathBuf> {
+    Ok(omg_dir()?.join("hosted_dispatch_cache.json"))
+}
+
+fn hosted_dispatch_cache_lock() -> Result<std::fs::File> {
+    let dir = omg_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    crate::providers::restrict_omg_directory_permissions(&dir)?;
+    let path = dir.join("hosted_dispatch_cache.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    crate::providers::restrict_omg_file_permissions(&path)?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
+fn open_hosted_dispatch_attempt_lock(dispatch_id: &str) -> Result<std::fs::File> {
+    crate::threads::validate_id(dispatch_id)?;
+    let dir = omg_dir()?.join("hosted-dispatch-attempts");
+    std::fs::create_dir_all(&dir)?;
+    crate::providers::restrict_omg_directory_permissions(&dir)?;
+    let path = dir.join(format!("{dispatch_id}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    crate::providers::restrict_omg_file_permissions(&path)?;
+    Ok(file)
+}
+
+fn hosted_dispatch_attempt_lock(dispatch_id: &str) -> Result<std::fs::File> {
+    let file = open_hosted_dispatch_attempt_lock(dispatch_id)?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
+fn try_hosted_dispatch_attempt_lock(dispatch_id: &str) -> Result<Option<std::fs::File>> {
+    let file = open_hosted_dispatch_attempt_lock(dispatch_id)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_hosted_dispatch_cache() -> Result<HostedDispatchCache> {
+    let path = hosted_dispatch_cache_path()?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => bail!("hosted dispatch cache is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HostedDispatchCache::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() > MAX_HOSTED_DISPATCH_CACHE_BYTES {
+        bail!("hosted dispatch cache exceeds its byte limit");
+    }
+    let cache: HostedDispatchCache =
+        serde_json::from_slice(&std::fs::read(&path)?).context("parse hosted dispatch cache")?;
+    if cache.records.len() > MAX_HOSTED_DISPATCH_CACHE_RECORDS {
+        bail!("hosted dispatch cache exceeds its record limit");
+    }
+    if cache.tombstones.len() > MAX_HOSTED_DISPATCH_TOMBSTONES {
+        bail!("hosted dispatch cache exceeds its tombstone limit");
+    }
+    let mut ids = std::collections::HashSet::new();
+    for record in &cache.records {
+        crate::threads::validate_id(&record.dispatch_id)?;
+        crate::threads::validate_id(&record.group_id)?;
+        crate::group::validate_human_name(&record.agent_name)?;
+        if record.payload_hash.len() != 64
+            || !record
+                .payload_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || record.response.as_ref().is_some_and(|response| {
+                response.content.len() > crate::group::MAX_GROUP_MESSAGE_BYTES
+            })
+            || record
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.len() > MAX_HOSTED_DISPATCH_FAILURE_BYTES)
+            || !ids.insert(record.dispatch_id.as_str())
+        {
+            bail!("hosted dispatch cache contains an invalid record");
+        }
+    }
+    for record in &cache.tombstones {
+        crate::threads::validate_id(&record.dispatch_id)?;
+        crate::threads::validate_id(&record.group_id)?;
+        crate::group::validate_human_name(&record.agent_name)?;
+        if record.payload_hash.len() != 64
+            || !record
+                .payload_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || !ids.insert(record.dispatch_id.as_str())
+        {
+            bail!("hosted dispatch cache contains an invalid tombstone");
+        }
+    }
+    Ok(cache)
+}
+
+fn save_hosted_dispatch_cache(cache: &HostedDispatchCache) -> Result<()> {
+    if cache.records.len() > MAX_HOSTED_DISPATCH_CACHE_RECORDS {
+        bail!("hosted dispatch cache exceeds its record limit");
+    }
+    if cache.tombstones.len() > MAX_HOSTED_DISPATCH_TOMBSTONES {
+        bail!("hosted dispatch cache exceeds its tombstone limit");
+    }
+    let bytes = serde_json::to_vec_pretty(cache)?;
+    if bytes.len() as u64 > MAX_HOSTED_DISPATCH_CACHE_BYTES {
+        bail!("hosted dispatch cache exceeds its byte limit");
+    }
+    crate::providers::write_file_atomic(&hosted_dispatch_cache_path()?, bytes, true)
+}
+
+fn compact_one_completed_hosted_dispatch(
+    cache: &mut HostedDispatchCache,
+    protected_dispatch_id: Option<&str>,
+) -> Result<bool> {
+    let index = cache
+        .records
+        .iter()
+        .position(|record| {
+            record.response.is_some() && protected_dispatch_id != Some(record.dispatch_id.as_str())
+        })
+        .or_else(|| {
+            cache
+                .records
+                .iter()
+                .position(|record| record.response.is_some())
+        });
+    let Some(index) = index else {
+        return Ok(false);
+    };
+    if cache.tombstones.len() >= MAX_HOSTED_DISPATCH_TOMBSTONES {
+        bail!(
+            "hosted dispatch completion tombstones are full; refusing to erase idempotency evidence"
+        );
+    }
+    let record = cache.records.remove(index);
+    cache.tombstones.push(HostedDispatchTombstone {
+        dispatch_id: record.dispatch_id,
+        group_id: record.group_id,
+        agent_name: record.agent_name,
+        payload_hash: record.payload_hash,
+        updated_at: record.updated_at,
+    });
+    Ok(true)
+}
+
+fn save_hosted_dispatch_cache_compacting(
+    cache: &mut HostedDispatchCache,
+    protected_dispatch_id: Option<&str>,
+) -> Result<()> {
+    loop {
+        let encoded = serde_json::to_vec_pretty(&*cache)?;
+        let record_excess = cache
+            .records
+            .len()
+            .saturating_sub(MAX_HOSTED_DISPATCH_CACHE_RECORDS);
+        let byte_excess = encoded
+            .len()
+            .saturating_sub(MAX_HOSTED_DISPATCH_CACHE_BYTES as usize);
+        if record_excess == 0 && byte_excess == 0 {
+            return crate::providers::write_file_atomic(
+                &hosted_dispatch_cache_path()?,
+                encoded,
+                true,
+            );
+        }
+        let average_record_bytes = encoded.len() / cache.records.len().max(1);
+        let byte_estimate = if byte_excess == 0 {
+            0
+        } else {
+            byte_excess.div_ceil(average_record_bytes.max(1))
+        };
+        let batch = record_excess.max(byte_estimate).clamp(1, 64);
+        let mut compacted = 0;
+        for _ in 0..batch {
+            if !compact_one_completed_hosted_dispatch(cache, protected_dispatch_id)? {
+                break;
+            }
+            compacted += 1;
+        }
+        if compacted == 0 {
+            bail!("hosted dispatch cache has too many unresolved records");
+        }
+    }
+}
+
+fn hosted_dispatch_payload_matches(
+    group_id: &str,
+    agent_name: &str,
+    payload_hash: &str,
+    record_group_id: &str,
+    record_agent_name: &str,
+    record_payload_hash: &str,
+) -> bool {
+    record_group_id == group_id
+        && record_agent_name.eq_ignore_ascii_case(agent_name)
+        && record_payload_hash == payload_hash
+}
+
+fn begin_hosted_dispatch(
+    dispatch_id: &str,
+    group_id: &str,
+    agent_name: &str,
+    payload_hash: &str,
+) -> Result<HostedDispatchAdmission> {
+    crate::threads::validate_id(dispatch_id)?;
+    crate::threads::validate_id(group_id)?;
+    crate::group::validate_human_name(agent_name)?;
+    let _lock = hosted_dispatch_cache_lock()?;
+    let mut cache = load_hosted_dispatch_cache()?;
+    if let Some(record) = cache
+        .records
+        .iter()
+        .find(|record| record.dispatch_id == dispatch_id)
+    {
+        if !hosted_dispatch_payload_matches(
+            group_id,
+            agent_name,
+            payload_hash,
+            &record.group_id,
+            &record.agent_name,
+            &record.payload_hash,
+        ) {
+            bail!("hosted dispatch id is already associated with a different payload");
+        }
+        return Ok(match &record.response {
+            Some(response) => HostedDispatchAdmission::Ready(response.clone()),
+            None => HostedDispatchAdmission::Ambiguous,
+        });
+    }
+    if let Some(record) = cache
+        .tombstones
+        .iter()
+        .find(|record| record.dispatch_id == dispatch_id)
+    {
+        if !hosted_dispatch_payload_matches(
+            group_id,
+            agent_name,
+            payload_hash,
+            &record.group_id,
+            &record.agent_name,
+            &record.payload_hash,
+        ) {
+            bail!("hosted dispatch id is already associated with a different payload");
+        }
+        return Ok(HostedDispatchAdmission::Completed);
+    }
+    cache.records.push(HostedDispatchCacheEntry {
+        dispatch_id: dispatch_id.to_string(),
+        group_id: group_id.to_string(),
+        agent_name: agent_name.to_string(),
+        payload_hash: payload_hash.to_string(),
+        response: None,
+        failure: None,
+        updated_at: Utc::now(),
+    });
+    save_hosted_dispatch_cache_compacting(&mut cache, None)?;
+    Ok(HostedDispatchAdmission::Start)
+}
+
+fn finish_hosted_dispatch(
+    dispatch_id: &str,
+    response: &crate::group::RemoteAgentDispatchResponse,
+) -> Result<()> {
+    let _lock = hosted_dispatch_cache_lock()?;
+    let mut cache = load_hosted_dispatch_cache()?;
+    let record = cache
+        .records
+        .iter_mut()
+        .find(|record| record.dispatch_id == dispatch_id)
+        .ok_or_else(|| anyhow::anyhow!("hosted dispatch cache record disappeared"))?;
+    record.response = Some(response.clone());
+    record.failure = None;
+    record.updated_at = Utc::now();
+    save_hosted_dispatch_cache_compacting(&mut cache, Some(dispatch_id))
+}
+
+fn truncate_hosted_dispatch_failure(failure: &str) -> String {
+    let mut end = failure.len().min(MAX_HOSTED_DISPATCH_FAILURE_BYTES);
+    while !failure.is_char_boundary(end) {
+        end -= 1;
+    }
+    failure[..end].to_string()
+}
+
+fn fail_hosted_dispatch(dispatch_id: &str, failure: &str) -> Result<()> {
+    let _lock = hosted_dispatch_cache_lock()?;
+    let mut cache = load_hosted_dispatch_cache()?;
+    let record = cache
+        .records
+        .iter_mut()
+        .find(|record| record.dispatch_id == dispatch_id)
+        .ok_or_else(|| anyhow::anyhow!("hosted dispatch cache record disappeared"))?;
+    if record.response.is_some() {
+        bail!("completed hosted dispatch cannot be marked failed");
+    }
+    record.failure = Some(truncate_hosted_dispatch_failure(failure));
+    record.updated_at = Utc::now();
+    save_hosted_dispatch_cache_compacting(&mut cache, None)
+}
+
+pub(crate) fn retire_hosted_dispatch(dispatch_id: &str) -> Result<bool> {
+    crate::threads::validate_id(dispatch_id)?;
+    let Some(_attempt_lock) = try_hosted_dispatch_attempt_lock(dispatch_id)? else {
+        bail!("hosted dispatch is still executing and cannot be retired");
+    };
+    let _lock = hosted_dispatch_cache_lock()?;
+    let mut cache = load_hosted_dispatch_cache()?;
+    if cache
+        .tombstones
+        .iter()
+        .any(|record| record.dispatch_id == dispatch_id)
+    {
+        bail!("completed hosted dispatches cannot be retired");
+    }
+    let Some(index) = cache
+        .records
+        .iter()
+        .position(|record| record.dispatch_id == dispatch_id)
+    else {
+        return Ok(false);
+    };
+    if cache.records[index].response.is_some() {
+        bail!("completed hosted dispatches cannot be retired");
+    }
+    cache.records.remove(index);
+    save_hosted_dispatch_cache(&cache)?;
+    Ok(true)
+}
+
+async fn hosted_dispatch_gate(state: &ProxyState, dispatch_id: &str) -> Result<Arc<Mutex<()>>> {
+    let mut gates = state.hosted_dispatch_gates.lock().await;
+    if gates.len() >= MAX_HOSTED_DISPATCH_GATES && !gates.contains_key(dispatch_id) {
+        gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+        if gates.len() >= MAX_HOSTED_DISPATCH_GATES {
+            bail!("too many active hosted dispatches");
+        }
+    }
+    Ok(gates
+        .entry(dispatch_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone())
 }
 
 async fn group_remote_agent_dispatch_handler(
@@ -1499,14 +2639,90 @@ async fn group_remote_agent_dispatch_handler(
         .get("x-agent-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !crate::group::validate_hosted_agent_token(&id, &name, token) {
+    let Some(allow_yolo) = crate::group::hosted_agent_yolo_authorization(&id, &name, token) else {
         return Err((StatusCode::UNAUTHORIZED, "invalid agent token".to_string()));
+    };
+    if payload.yolo && !allow_yolo {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "hosted agent is not authorized for yolo execution".to_string(),
+        ));
     }
     if payload.group_id != id || !payload.agent_name.eq_ignore_ascii_case(&name) {
         return Err((
             StatusCode::BAD_REQUEST,
             "payload group/agent mismatch".to_string(),
         ));
+    }
+    if crate::threads::validate_id(&payload.dispatch_id).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid remote dispatch id".to_string(),
+        ));
+    }
+    if payload.prompt.len() > MAX_REMOTE_AGENT_PROMPT_BYTES
+        || payload.model.len() > 256
+        || payload.group_model.len() > 256
+        || payload.history.len() > 50
+    {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "remote agent dispatch payload is too large".to_string(),
+        ));
+    }
+
+    let payload_hash = blake3::hash(
+        &serde_json::to_vec(&payload)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
+    )
+    .to_hex()
+    .to_string();
+    let dispatch_id = payload.dispatch_id.clone();
+    let gate = hosted_dispatch_gate(&state, &dispatch_id)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+    let _dispatch_guard = gate.lock().await;
+    let attempt_dispatch_id = dispatch_id.clone();
+    let _attempt_guard =
+        tokio::task::spawn_blocking(move || hosted_dispatch_attempt_lock(&attempt_dispatch_id))
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+    let admission = {
+        let dispatch_id = dispatch_id.clone();
+        let id = id.clone();
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || {
+            begin_hosted_dispatch(&dispatch_id, &id, &name, &payload_hash)
+        })
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| {
+            let status = if error.to_string().contains("different payload") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, error.to_string())
+        })?
+    };
+    match admission {
+        HostedDispatchAdmission::Ready(response) => return Ok(Json(response)),
+        HostedDispatchAdmission::Completed => {
+            return Err((
+                StatusCode::CONFLICT,
+                "remote dispatch already completed; its exact cached response expired, and inference will not be repeated"
+                    .to_string(),
+            ));
+        }
+        HostedDispatchAdmission::Ambiguous => {
+            return Err((
+                StatusCode::CONFLICT,
+                "remote dispatch has an unresolved prior attempt; refusing to repeat inference"
+                    .to_string(),
+            ));
+        }
+        HostedDispatchAdmission::Start => {}
     }
 
     let model = crate::group::normalize_model(&payload.model);
@@ -1519,36 +2735,87 @@ async fn group_remote_agent_dispatch_handler(
     } else {
         Some(model)
     };
-    let yolo = payload.yolo;
+    let yolo = payload.yolo && allow_yolo;
     let prompt = payload.prompt;
-    let content = tokio::task::spawn_blocking(move || {
+    let tools = yolo.then(|| crate::all_tool_ids_csv().clone());
+    let max_turns = if yolo { Some(8) } else { Some(1) };
+    let result = tokio::task::spawn_blocking(move || {
         tokio::runtime::Handle::current().block_on(crate::run_single_turn_capture(
-            &prompt,
-            model,
-            yolo,
-            Some(1),
-            None,
+            &prompt, model, yolo, max_turns, tools,
         ))
     })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    .await;
+    let content = match result {
+        Ok(Ok(content)) => content,
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            let failure_dispatch_id = dispatch_id.clone();
+            let failure_message = message.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                fail_hosted_dispatch(&failure_dispatch_id, &failure_message)
+            })
+            .await
+            .map_err(|join_error| (StatusCode::INTERNAL_SERVER_ERROR, join_error.to_string()))?;
+            if let Err(persist_error) = persisted {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "remote inference failed: {message}; preserving its ambiguous admission also failed: {persist_error}"
+                    ),
+                ));
+            }
+            return Err((StatusCode::BAD_REQUEST, message));
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let failure_dispatch_id = dispatch_id.clone();
+            let failure_message = message.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                fail_hosted_dispatch(&failure_dispatch_id, &failure_message)
+            })
+            .await
+            .map_err(|join_error| (StatusCode::INTERNAL_SERVER_ERROR, join_error.to_string()))?;
+            if let Err(persist_error) = persisted {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "remote inference task failed: {message}; preserving its ambiguous admission also failed: {persist_error}"
+                    ),
+                ));
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, message));
+        }
+    };
 
-    Ok(Json(crate::group::RemoteAgentDispatchResponse {
+    let response = crate::group::RemoteAgentDispatchResponse {
         content: crate::group::truncate_message_content(&content)
             .trim()
             .to_string(),
-    }))
+    };
+    let response_to_save = response.clone();
+    let dispatch_id_to_save = dispatch_id.clone();
+    tokio::task::spawn_blocking(move || {
+        finish_hosted_dispatch(&dispatch_id_to_save, &response_to_save)
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn serve(args: &ServeArgs) -> Result<()> {
     let mut agent_config = crate::build_agent_config(args.model.clone())?;
     agent_config.default_yolo_mode = args.yolo;
+    let voice_config = relay_voice_config(&agent_config);
+    let voice_auth =
+        xai_grok_pager::voice::build_voice_auth(Arc::new(agent_config.create_auth_manager()));
 
     let (public_secret, secret_path, provided) = match &args.secret {
         Some(s) => {
-            if s.len() < 16 {
-                bail!("provided secret must be at least 16 characters");
+            if !is_valid_pairing_secret(s) {
+                bail!(
+                    "provided secret must contain 16-{MAX_PAIRING_SECRET_BYTES} ASCII WebSocket-token characters"
+                );
             }
             (s.clone(), None, true)
         }
@@ -1559,7 +2826,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
             if let Some(s) = read_persisted_secret(&path) {
                 (s, Some(path), false)
             } else {
-                let s = generate_secret();
+                let s = generate_secret()?;
                 crate::providers::write_file_atomic(&path, &s, true)?;
                 (s, Some(path), false)
             }
@@ -1595,8 +2862,9 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
             "warning: omgb serve is listening on a non-loopback address and the pairing URL uses plaintext ws://; use a TLS-terminating reverse proxy if you need wss://"
         );
     }
+    let cors = cors_layer(&allowed_origins)?;
 
-    let upstream_secret = generate_secret();
+    let upstream_secret = generate_secret()?;
     let upstream_addr = spawn_upstream_agent(agent_config, &upstream_secret).await?;
 
     let secret_hash = *blake3::hash(public_secret.as_bytes()).as_bytes();
@@ -1606,8 +2874,12 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
         allowed_origins,
         rate_limit_per_minute,
         rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        connection_limit: Arc::new(Semaphore::new(MAX_ACTIVE_PROXY_CONNECTIONS)),
         upstream_url,
         upstream_secret,
+        voice_config,
+        voice_auth,
+        hosted_dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
     });
 
     tokio::spawn(cleanup_rate_limiter(
@@ -1618,6 +2890,7 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/acp", get(ws_handler))
+        .route("/voice", get(voice_ws_handler))
         .route("/group", post(admin_create_group_handler))
         .route("/group/{id}", get(group_info_handler))
         .route("/group/{id}/joins", get(group_list_joins_handler))
@@ -1627,12 +2900,28 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
             post(group_approve_join_handler),
         )
         .route(
+            "/group/{id}/joins/{request_id}/reject",
+            post(group_reject_join_handler),
+        )
+        .route(
             "/group/{id}/joins/{request_id}/status",
             get(group_join_status_handler),
         )
         .route(
+            "/group/{id}/joins/{request_id}/status/ack",
+            post(group_join_ack_handler),
+        )
+        .route(
             "/group/{id}/messages",
             get(group_list_messages_handler).post(group_post_message_handler),
+        )
+        .route(
+            "/group/{id}/dispatch/{trigger_id}",
+            get(group_dispatch_status_handler).post(group_dispatch_retry_handler),
+        )
+        .route(
+            "/group/{id}/dispatches",
+            get(group_dispatch_statuses_handler),
         )
         .route(
             "/group/{id}/agent/{name}/message",
@@ -1644,8 +2933,16 @@ pub async fn serve(args: &ServeArgs) -> Result<()> {
         )
         .route("/workflow", post(admin_create_workflow_handler))
         .with_state(state);
+    let app = match cors {
+        Some(cors) => app.layer(cors),
+        None => app,
+    };
     let listener = TcpListener::bind(bind_addr).await?;
     let actual_addr = listener.local_addr()?;
+    let recovered_dispatches = crate::group::recover_pending_dispatches().await?;
+    if recovered_dispatches > 0 {
+        println!("  recovered group dispatch queues: {recovered_dispatches}");
+    }
 
     println!("oh-my-grok-build serve");
     println!("  bind: {actual_addr}");
@@ -1693,14 +2990,15 @@ pub async fn connect(args: &ConnectArgs) -> Result<()> {
         url.set_path("/ws");
     }
 
-    let secret = args.secret.clone().or_else(|| {
-        url.query_pairs()
-            .find(|(k, _)| k == "server-key")
-            .map(|(_, v)| v.into_owned())
-    });
+    let secret = take_pairing_secret(&mut url, args.secret.clone());
     if secret.is_none() {
         anyhow::bail!(
             "--secret is required; use the secret file printed by `omgb serve` or the server-key query parameter"
+        );
+    }
+    if !secret.as_deref().is_some_and(is_valid_pairing_secret) {
+        anyhow::bail!(
+            "pairing secret must contain 16-{MAX_PAIRING_SECRET_BYTES} ASCII WebSocket-token characters"
         );
     }
     url.set_query(None);
@@ -1751,10 +3049,268 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_agent_messages_require_a_stable_id() {
+        assert!(required_remote_agent_message_id(None).is_err());
+        assert!(required_remote_agent_message_id(Some("  ")).is_err());
+        assert_eq!(
+            required_remote_agent_message_id(Some(" agent-message-1 ")).unwrap(),
+            "agent-message-1"
+        );
+    }
+
+    #[test]
     fn test_generate_secret_length() {
-        let s = generate_secret();
-        assert_eq!(s.len(), 32);
+        let s = generate_secret().unwrap();
+        assert_eq!(s.len(), 64);
         assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generated_pairing_secrets_are_not_reused() {
+        assert_ne!(generate_secret().unwrap(), generate_secret().unwrap());
+    }
+
+    #[test]
+    fn pairing_secret_is_safe_for_authorization_and_websocket_protocols() {
+        assert!(is_valid_pairing_secret("0123456789abcdef"));
+        assert!(is_valid_pairing_secret("safe-token_012345"));
+        assert!(!is_valid_pairing_secret("too-short"));
+        assert!(!is_valid_pairing_secret("contains a space"));
+        assert!(!is_valid_pairing_secret("contains,comma-123"));
+    }
+
+    #[test]
+    fn join_status_only_reports_not_found_for_terminal_missing_state() {
+        let (status, _) = map_join_status_error(anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing group",
+        )));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, message) = map_join_status_error(anyhow::anyhow!("corrupt group JSON"));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(message.contains("retry"));
+    }
+
+    #[test]
+    fn voice_start_only_accepts_mono_signed_pcm_at_safe_rates() {
+        assert_eq!(
+            validate_voice_start(VoiceClientMessage::Start {
+                sample_rate: 16_000,
+                channels: 1,
+                encoding: "int16".into(),
+            }),
+            Ok(16_000)
+        );
+        for message in [
+            VoiceClientMessage::Start {
+                sample_rate: 7_999,
+                channels: 1,
+                encoding: "int16".into(),
+            },
+            VoiceClientMessage::Start {
+                sample_rate: 48_001,
+                channels: 1,
+                encoding: "int16".into(),
+            },
+            VoiceClientMessage::Start {
+                sample_rate: 16_000,
+                channels: 2,
+                encoding: "int16".into(),
+            },
+            VoiceClientMessage::Start {
+                sample_rate: 16_000,
+                channels: 1,
+                encoding: "float32".into(),
+            },
+            VoiceClientMessage::Stop,
+        ] {
+            assert!(validate_voice_start(message).is_err());
+        }
+    }
+
+    #[test]
+    fn connect_removes_pairing_secrets_from_the_websocket_url() {
+        let mut url =
+            Url::parse("ws://192.168.1.2/ws?server-key=0123456789abcdef&server_key=other&keep=yes")
+                .unwrap();
+        let secret = take_pairing_secret(&mut url, None);
+
+        assert_eq!(secret.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(url.as_str(), "ws://192.168.1.2/ws?keep=yes");
+    }
+
+    #[tokio::test]
+    async fn proxy_bridge_cancels_the_surviving_direction() {
+        let finished = tokio::spawn(async {});
+        let pending = tokio::spawn(async { std::future::pending::<()>().await });
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            finish_proxy_bridge(finished, pending),
+        )
+        .await
+        .expect("bridge cleanup must not wait for a closed peer forever");
+    }
+
+    #[test]
+    fn relay_connection_limit_is_positive() {
+        const { assert!(MAX_ACTIVE_PROXY_CONNECTIONS > 0) };
+    }
+
+    #[test]
+    fn hosted_dispatch_cache_deduplicates_and_preserves_ambiguous_attempts() {
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "omgb-hosted-dispatch-cache-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
+        let hash = "a".repeat(64);
+
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-1", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Start
+        ));
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-1", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Ambiguous
+        ));
+        let response = crate::group::RemoteAgentDispatchResponse {
+            content: "done".into(),
+        };
+        finish_hosted_dispatch("dispatch-1", &response).unwrap();
+        match begin_hosted_dispatch("dispatch-1", "group-1", "Alpha", &hash).unwrap() {
+            HostedDispatchAdmission::Ready(cached) => assert_eq!(cached.content, "done"),
+            _ => panic!("completed dispatch should return its cached response"),
+        }
+        assert!(begin_hosted_dispatch("dispatch-1", "group-1", "Alpha", &"b".repeat(64)).is_err());
+        assert!(retire_hosted_dispatch("dispatch-1").is_err());
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-1", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Ready(_)
+        ));
+
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-2", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Start
+        ));
+        fail_hosted_dispatch("dispatch-2", "provider failed after admission").unwrap();
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-2", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Ambiguous
+        ));
+        assert!(retire_hosted_dispatch("dispatch-2").unwrap());
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-2", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Start
+        ));
+
+        crate::providers::set_omg_home_for_tests(None);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn hosted_dispatch_compaction_preserves_completion_tombstones() {
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "omgb-hosted-dispatch-tombstone-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
+        let hash = "a".repeat(64);
+        let response = crate::group::RemoteAgentDispatchResponse {
+            content: "done".into(),
+        };
+        let mut cache = HostedDispatchCache::default();
+        for index in 0..MAX_HOSTED_DISPATCH_CACHE_RECORDS {
+            cache.records.push(HostedDispatchCacheEntry {
+                dispatch_id: format!("dispatch-{index}"),
+                group_id: "group-1".into(),
+                agent_name: "Alpha".into(),
+                payload_hash: hash.clone(),
+                response: Some(response.clone()),
+                failure: None,
+                updated_at: Utc::now(),
+            });
+        }
+        save_hosted_dispatch_cache(&cache).unwrap();
+
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-new", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Start
+        ));
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-0", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Completed
+        ));
+        let cache = load_hosted_dispatch_cache().unwrap();
+        assert_eq!(cache.records.len(), MAX_HOSTED_DISPATCH_CACHE_RECORDS);
+        assert_eq!(cache.tombstones.len(), 1);
+
+        crate::providers::set_omg_home_for_tests(None);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn hosted_dispatch_retirement_refuses_a_live_attempt_lock() {
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "omgb-hosted-dispatch-live-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
+        let hash = "a".repeat(64);
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-live", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Start
+        ));
+        let attempt_lock = hosted_dispatch_attempt_lock("dispatch-live").unwrap();
+        assert!(retire_hosted_dispatch("dispatch-live").is_err());
+        drop(attempt_lock);
+        assert!(retire_hosted_dispatch("dispatch-live").unwrap());
+
+        crate::providers::set_omg_home_for_tests(None);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn hosted_dispatch_byte_compaction_keeps_idempotency_evidence() {
+        let _guard = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "omgb-hosted-dispatch-byte-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::providers::set_omg_home_for_tests(Some(home.clone()));
+        let hash = "a".repeat(64);
+        let response = crate::group::RemoteAgentDispatchResponse {
+            content: "\0".repeat(crate::group::MAX_GROUP_MESSAGE_BYTES),
+        };
+        let mut cache = HostedDispatchCache::default();
+        for index in 0..512 {
+            cache.records.push(HostedDispatchCacheEntry {
+                dispatch_id: format!("dispatch-{index}"),
+                group_id: "group-1".into(),
+                agent_name: "Alpha".into(),
+                payload_hash: hash.clone(),
+                response: Some(response.clone()),
+                failure: None,
+                updated_at: Utc::now(),
+            });
+        }
+        save_hosted_dispatch_cache_compacting(&mut cache, Some("dispatch-511")).unwrap();
+        assert!(!cache.tombstones.is_empty());
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-0", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Completed
+        ));
+        assert!(matches!(
+            begin_hosted_dispatch("dispatch-511", "group-1", "Alpha", &hash).unwrap(),
+            HostedDispatchAdmission::Ready(_)
+        ));
+
+        crate::providers::set_omg_home_for_tests(None);
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
@@ -1801,10 +3357,26 @@ mod tests {
 
     #[test]
     fn test_pairing_payload() {
-        let payload = pairing_payload("wss://192.168.1.2:2419/ws", "abc123");
+        let payload = pairing_payload(
+            "wss://192.168.1.2:2419/ws",
+            "abc123",
+            Some(std::path::Path::new("/home/user/project")),
+        );
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed["url"], "wss://192.168.1.2:2419/ws");
         assert_eq!(parsed["secret"], "abc123");
+        assert_eq!(parsed["cwd"], "/home/user/project");
+    }
+
+    #[test]
+    fn pairing_payload_omits_unsafe_working_directory() {
+        let payload = pairing_payload(
+            "ws://127.0.0.1:2419/ws",
+            "abc123",
+            Some(std::path::Path::new("bad\npath")),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(parsed["cwd"].is_null());
     }
 
     #[test]
@@ -1850,9 +3422,35 @@ mod tests {
             allowed_origins: None,
             rate_limit_per_minute: None,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            connection_limit: Arc::new(Semaphore::new(MAX_ACTIVE_PROXY_CONNECTIONS)),
             upstream_url: String::new(),
             upstream_secret: String::new(),
+            voice_config: xai_grok_voice::VoiceConfig::default(),
+            voice_auth: xai_grok_voice::StaticVoiceAuth::shared("test-token")
+                .expect("test voice token is non-empty"),
+            hosted_dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    #[test]
+    fn cors_is_disabled_without_explicit_origins() {
+        let origins: Option<Vec<String>> = None;
+        assert!(cors_layer(&origins).unwrap().is_none());
+    }
+
+    #[test]
+    fn cors_accepts_explicit_origin_or_operator_wildcard() {
+        assert!(
+            cors_layer(&Some(vec!["https://app.example.test".to_string()]))
+                .unwrap()
+                .is_some()
+        );
+        assert!(cors_layer(&Some(vec!["*".to_string()])).unwrap().is_some());
+    }
+
+    #[test]
+    fn cors_rejects_malformed_configured_origin() {
+        assert!(cors_layer(&Some(vec!["not an origin".to_string()])).is_err());
     }
 
     #[tokio::test]
@@ -1974,6 +3572,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_server_token_uses_headers_only() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(extract_server_token(&headers), "");
+        headers.insert("x-server-token", "server-token".parse().unwrap());
+        assert_eq!(extract_server_token(&headers), "server-token");
+        headers.insert("authorization", "Bearer bearer-token".parse().unwrap());
+        assert_eq!(extract_server_token(&headers), "bearer-token");
+    }
+
+    #[test]
     fn extract_group_token_ignores_empty_header() {
         let mut headers = HeaderMap::new();
         headers.insert("x-member-token", "".parse().unwrap());
@@ -1988,6 +3596,16 @@ mod tests {
         let query = GroupTokenQuery {
             token: Some("query-token".into()),
         };
+        assert_eq!(extract_group_token(&query, &headers), "query-token");
+    }
+
+    #[test]
+    fn member_only_group_token_extraction_never_uses_query() {
+        let headers = HeaderMap::new();
+        let query = GroupTokenQuery {
+            token: Some("query-token".into()),
+        };
+        assert_eq!(extract_group_token_from_headers(&headers), "");
         assert_eq!(extract_group_token(&query, &headers), "query-token");
     }
 
