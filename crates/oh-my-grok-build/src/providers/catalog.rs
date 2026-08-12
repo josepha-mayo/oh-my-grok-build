@@ -57,6 +57,7 @@ impl ProviderTemplate {
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
+            cost_per_million: None,
         }
     }
 }

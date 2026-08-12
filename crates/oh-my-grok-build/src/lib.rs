@@ -2033,7 +2033,17 @@ async fn run_provider(args: ProviderArgs) -> Result<()> {
                 } else {
                     ""
                 };
-                println!("{}{} - {} -> {}", p.id, default, p.name, p.base_url);
+                let cost =
+                    moe::provider_cost_with_override(&p.id, Some(&p.base_url), p.cost_per_million);
+                let cost_source = if p.cost_per_million.is_some() {
+                    "configured"
+                } else {
+                    "fallback estimate"
+                };
+                println!(
+                    "{}{} - {} -> {} (routing cost: ${cost:.4}/1M, {cost_source})",
+                    p.id, default, p.name, p.base_url
+                );
             }
         }
         ProviderCommand::Catalog => {
@@ -2052,6 +2062,36 @@ async fn run_provider(args: ProviderArgs) -> Result<()> {
         ProviderCommand::Remove { id } => {
             remove_provider(&id)?;
             println!("removed provider {id}");
+        }
+        ProviderCommand::Cost { id, value, reset } => {
+            if reset {
+                let p = set_provider_cost(&id, None)?;
+                let fallback = moe::provider_cost(&p.id, Some(&p.base_url));
+                println!(
+                    "provider {} routing cost reset to fallback estimate ${fallback:.4}/1M tokens",
+                    p.id
+                );
+            } else if let Some(value) = value {
+                let p = set_provider_cost(&id, Some(value))?;
+                println!(
+                    "provider {} routing cost set to ${value:.4}/1M tokens",
+                    p.id
+                );
+            } else {
+                let p = get_provider(&id)?
+                    .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+                let value =
+                    moe::provider_cost_with_override(&p.id, Some(&p.base_url), p.cost_per_million);
+                let source = if p.cost_per_million.is_some() {
+                    "configured override"
+                } else {
+                    "fallback estimate"
+                };
+                println!(
+                    "provider {} routing cost: ${value:.4}/1M tokens ({source})",
+                    p.id
+                );
+            }
         }
         ProviderCommand::Discover(discover_args) => {
             let found = discover_local_models(&discover_args).await?;
@@ -2700,6 +2740,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
+            cost_per_million: None,
         };
         providers::save_omg_config(&providers::OmgConfig {
             providers: std::collections::HashMap::from([("codex".into(), provider)]),

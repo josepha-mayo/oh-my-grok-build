@@ -255,6 +255,17 @@ pub enum ProviderCommand {
     Add(AddProviderArgs),
     /// Remove a provider
     Remove { id: String },
+    /// Show, set, or reset the routing cost override for a provider
+    Cost {
+        /// Provider id
+        id: String,
+        /// Average USD cost per million tokens used by automatic routing
+        #[arg(value_name = "USD_PER_MILLION_TOKENS", conflicts_with = "reset")]
+        value: Option<f64>,
+        /// Remove the override and use the built-in fallback estimate
+        #[arg(long)]
+        reset: bool,
+    },
     /// Discover local models (Ollama / LM Studio / vLLM / SGLang / llama.cpp)
     Discover(DiscoverArgs),
     /// Test a provider's connectivity
@@ -289,6 +300,9 @@ pub struct AddProviderArgs {
     /// Auto-compact threshold percent (0-100); defaults to 80 for BYOK/local models
     #[arg(long)]
     pub auto_compact_threshold_percent: Option<u8>,
+    /// Average USD cost per million tokens used by automatic routing
+    #[arg(long)]
+    pub cost_per_million: Option<f64>,
     /// Default for this provider
     #[arg(long)]
     pub default: bool,

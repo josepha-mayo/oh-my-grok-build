@@ -182,6 +182,21 @@ pub struct ProviderConfig {
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u64>,
+    /// User-owned average USD cost per million tokens for automatic routing.
+    /// When absent, routing uses its documented built-in fallback estimate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_per_million: Option<f64>,
+}
+
+const MAX_PROVIDER_COST_PER_MILLION: f64 = 1_000_000.0;
+
+fn validate_provider_cost(value: f64) -> Result<f64> {
+    if !value.is_finite() || !(0.0..=MAX_PROVIDER_COST_PER_MILLION).contains(&value) {
+        bail!(
+            "provider routing cost must be a finite number between 0 and {MAX_PROVIDER_COST_PER_MILLION} USD per million tokens"
+        );
+    }
+    Ok(value)
 }
 
 pub fn load_omg_config() -> Result<OmgConfig> {
@@ -190,7 +205,15 @@ pub fn load_omg_config() -> Result<OmgConfig> {
         return Ok(OmgConfig::default());
     }
     let raw = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    let config: OmgConfig =
+        serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    for (id, provider) in &config.providers {
+        if let Some(value) = provider.cost_per_million {
+            validate_provider_cost(value)
+                .with_context(|| format!("provider '{id}' has an invalid routing cost"))?;
+        }
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -1360,6 +1383,7 @@ fn provider_from_grok_table(
         temperature: optional_f64("temperature")?,
         top_p: optional_f64("top_p")?,
         max_completion_tokens: optional_u64("max_completion_tokens")?,
+        cost_per_million: None,
     }))
 }
 
@@ -1519,6 +1543,7 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
+            cost_per_million: None,
         }
     };
 
@@ -1544,6 +1569,9 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
     }
     if let Some(th) = args.auto_compact_threshold_percent {
         provider.auto_compact_threshold_percent = Some(th.clamp(0, 100));
+    }
+    if let Some(cost) = args.cost_per_million {
+        provider.cost_per_million = Some(validate_provider_cost(cost)?);
     }
     provider.id = id.clone();
     if provider.model.trim().is_empty() || provider.model == "local-model" {
@@ -1643,6 +1671,31 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
         write_api_key_unlocked(&id, provider.env_key.as_deref(), &key)?;
     }
 
+    Ok(provider)
+}
+
+/// Set or clear the user-owned cost used by automatic provider routing.
+/// This updates only OMGB routing metadata and never rewrites provider keys.
+pub fn set_provider_cost(id: &str, cost_per_million: Option<f64>) -> Result<ProviderConfig> {
+    let id = sanitize_provider_id(id);
+    if id.is_empty() {
+        bail!("provider id is required");
+    }
+    let cost_per_million = cost_per_million.map(validate_provider_cost).transpose()?;
+    let _lock = provider_mutation_lock()?;
+    let mut cfg = load_omg_config()?;
+    if !cfg.providers.contains_key(&id) {
+        let provider = provider_from_grok_config(&id)?
+            .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+        cfg.providers.insert(id.clone(), provider);
+    }
+    let provider = cfg
+        .providers
+        .get_mut(&id)
+        .expect("provider was inserted above");
+    provider.cost_per_million = cost_per_million;
+    let provider = provider.clone();
+    save_omg_config_unlocked(&cfg)?;
     Ok(provider)
 }
 
@@ -1889,6 +1942,7 @@ pub fn add_discovered_providers(
                 temperature: None,
                 top_p: None,
                 max_completion_tokens: None,
+                cost_per_million: None,
             };
             cfg.providers.insert(id.clone(), config);
             if first_id.is_none() {
@@ -2295,6 +2349,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
+            cost_per_million: None,
         };
         let cfg = OmgConfig {
             providers: HashMap::from([("shared".into(), explicit)]),
@@ -2381,6 +2436,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
+            cost_per_million: None,
         };
         let mut env = HashMap::new();
         env.insert("OMGB_TEST_API_KEY".into(), "from-env".into());
@@ -2418,6 +2474,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
+            cost_per_million: None,
         };
         let env = HashMap::from([("OPENAI_API_KEY".into(), "fe_oa_not_a_platform_key".into())]);
 
@@ -2477,7 +2534,48 @@ mod tests {
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
+            cost_per_million: None,
         }
+    }
+
+    #[test]
+    fn provider_routing_cost_can_be_set_reset_and_is_validated() {
+        let _g = crate::OMGB_HOME_TEST_LOCK.lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("omgb-provider-cost-test-{}", uuid::Uuid::new_v4()));
+        set_omg_home_for_tests(Some(root.join("omg")));
+        set_grok_home_for_tests(Some(root.join("grok")));
+        save_omg_config(&OmgConfig {
+            default_model: None,
+            providers: HashMap::from([("priced".into(), test_provider("priced"))]),
+            relay: None,
+        })
+        .unwrap();
+
+        let updated = set_provider_cost("priced", Some(0.125)).unwrap();
+        assert_eq!(updated.cost_per_million, Some(0.125));
+        assert_eq!(
+            load_omg_config().unwrap().providers["priced"].cost_per_million,
+            Some(0.125)
+        );
+        assert!(set_provider_cost("priced", Some(-0.01)).is_err());
+        assert!(set_provider_cost("priced", Some(f64::INFINITY)).is_err());
+        assert!(set_provider_cost("not-configured", Some(0.01)).is_err());
+        assert_eq!(
+            load_omg_config().unwrap().providers["priced"].cost_per_million,
+            Some(0.125)
+        );
+
+        let reset = set_provider_cost("priced", None).unwrap();
+        assert_eq!(reset.cost_per_million, None);
+        assert_eq!(
+            load_omg_config().unwrap().providers["priced"].cost_per_million,
+            None
+        );
+
+        set_grok_home_for_tests(None);
+        set_omg_home_for_tests(None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2637,6 +2735,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_completion_tokens: None,
+            cost_per_million: None,
         };
         let cfg = OmgConfig {
             default_model: None,

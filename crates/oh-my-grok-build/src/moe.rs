@@ -15,10 +15,11 @@ use crate::providers::{
     provider_template,
 };
 
-/// Approximate cost index per 1M tokens (input+output average) for known
-/// providers. Values are derived from each provider's public pricing docs
-/// (2024-2025). Unknown cloud providers default to `5.0`; local providers are
-/// treated as `0.0`.
+/// Approximate fallback cost index per 1M tokens (input+output average) for
+/// known providers. These values are deliberately only fallbacks: pricing and
+/// selected models change, so a configured provider's user-owned override
+/// always wins. Unknown cloud providers default to `5.0`; local providers are
+/// treated as `0.0` unless explicitly overridden.
 const COSTS: &[(&str, f64)] = &[
     // Major cloud APIs (pricing per 1M tokens, avg of input + output).
     ("openai", 6.25),     // gpt-4o: $2.50 in / $10.00 out
@@ -125,6 +126,17 @@ const CODE_IDS: &[&str] = &[
 ];
 
 pub fn provider_cost(id: &str, base_url: Option<&str>) -> f64 {
+    provider_cost_with_override(id, base_url, None)
+}
+
+pub fn provider_cost_with_override(
+    id: &str,
+    base_url: Option<&str>,
+    override_cost: Option<f64>,
+) -> f64 {
+    if let Some(cost) = override_cost {
+        return cost;
+    }
     if is_local_provider_id(id) || base_url.is_some_and(crate::net::is_url_host_loopback) {
         return 0.0;
     }
@@ -241,17 +253,20 @@ pub fn select_provider_from(available: &[String], task: &str) -> Result<String> 
     let task_lower = task.to_ascii_lowercase();
     let mut scored: Vec<(&String, f64, i32)> = available
         .iter()
-        .map(|id| {
-            let base_url = crate::providers::get_provider(id)
-                .ok()
-                .flatten()
-                .map(|provider| provider.base_url)
-                .or_else(|| provider_template(id).map(|t| t.base_url));
-            let cost = provider_cost(id, base_url.as_deref());
-            let is_local = is_local_provider_id(id)
-                || base_url
-                    .as_deref()
-                    .is_some_and(crate::net::is_url_host_loopback);
+        .map(|id| -> Result<_> {
+            let configured = crate::providers::get_provider(id)?.or_else(|| provider_template(id));
+            let base_url = configured
+                .as_ref()
+                .map(|provider| provider.base_url.as_str());
+            let cost = provider_cost_with_override(
+                id,
+                base_url,
+                configured
+                    .as_ref()
+                    .and_then(|provider| provider.cost_per_million),
+            );
+            let is_local =
+                is_local_provider_id(id) || base_url.is_some_and(crate::net::is_url_host_loopback);
             let mut tie = 0;
             if task_contains_word(&task_lower, "local") && is_local {
                 tie += 3;
@@ -265,9 +280,9 @@ pub fn select_provider_from(available: &[String], task: &str) -> Result<String> 
             if task_contains_word(&task_lower, "cheap") && cost < 1.0 {
                 tie += 1;
             }
-            (id, cost, tie)
+            Ok((id, cost, tie))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     scored.sort_by(|a, b| {
         a.1.partial_cmp(&b.1)
@@ -371,6 +386,17 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_cost_override_wins_over_fallback_and_local_detection() {
+        assert!((provider_cost_with_override("openai", None, Some(0.42)) - 0.42).abs() < 1e-9);
+        assert!(
+            (provider_cost_with_override("ollama", Some("http://127.0.0.1:11434/v1"), Some(0.15),)
+                - 0.15)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
     fn test_provider_cost_cloud_harness_not_local() {
         assert!((provider_cost("codex", None) - 3.75).abs() < 1e-9);
         assert!((provider_cost("claude-code", None) - 9.0).abs() < 1e-9);
@@ -420,6 +446,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn configured_cost_override_controls_selection() {
+        with_temp_home(|_home| {
+            Box::pin(async move {
+                let mut provider = provider_template("openai").unwrap();
+                provider.cost_per_million = Some(0.05);
+                let cfg = crate::providers::OmgConfig {
+                    default_model: None,
+                    providers: [(provider.id.clone(), provider)].into_iter().collect(),
+                    relay: None,
+                };
+                crate::providers::save_omg_config(&cfg).unwrap();
+
+                let available = vec!["openai".into(), "deepseek".into()];
+                assert_eq!(
+                    select_provider_from(&available, "choose cheapest").unwrap(),
+                    "openai"
+                );
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_available_providers_reads_env_and_config() {
         with_temp_home(|home| {
             Box::pin(async move {
@@ -437,6 +486,7 @@ mod tests {
                     temperature: None,
                     top_p: None,
                     max_completion_tokens: None,
+                    cost_per_million: None,
                 };
                 let cfg = crate::providers::OmgConfig {
                     default_model: None,
@@ -472,6 +522,7 @@ mod tests {
                     temperature: None,
                     top_p: None,
                     max_completion_tokens: None,
+                    cost_per_million: None,
                 };
                 let cfg = crate::providers::OmgConfig {
                     default_model: None,
@@ -519,6 +570,7 @@ mod tests {
                     temperature: None,
                     top_p: None,
                     max_completion_tokens: None,
+                    cost_per_million: None,
                 };
                 let cfg = crate::providers::OmgConfig {
                     default_model: None,

@@ -149,7 +149,7 @@ possible.
 | `omgb` or `omgb tui` | Interactive TUI |
 | `omgb exec "PROMPT"` | One prompt and exit |
 | `omgb loop "PROMPT"` | Autonomous diff-driven loop |
-| `omgb provider list` / `add` / `remove` | BYOK and local model providers |
+| `omgb provider list` / `add` / `remove` / `cost` | BYOK/local providers and user-owned routing costs |
 | `omgb auth status` / `login` / `logout` | Optional Grok subscription session (device code by default) |
 | `omgb model` | List or switch active models |
 | `omgb cron add "0 9 * * *" "summarize issues"` | Schedule recurring prompts |
@@ -165,6 +165,12 @@ possible.
 | `omgb doctor` | Environment diagnostics |
 
 Enter provider API keys only in your own local terminal (for example through the one-command `OMGB_API_KEY` environment variable used by `omgb provider add`). Never paste a model-provider key into chat, a prompt, or a group message. Keyless local endpoints can be added with `omgb provider discover --add`, and Grok subscription sign-in remains optional.
+
+The automatic cheapest-provider router uses built-in prices only as fallback
+estimates. Pricing and selected models change, so set the value you actually
+want used with `omgb provider cost ID USD_PER_MILLION_TOKENS` (or
+`provider add --cost-per-million VALUE`). Inspect it with `provider cost ID` and
+remove an override with `provider cost ID --reset`.
 
 ## Slash commands in the TUI
 

@@ -55,8 +55,15 @@ Use a BYOK provider:
 ```bash
 omgb provider catalog
 OMGB_API_KEY="$OPENAI_API_KEY" omgb provider add openai --default
+omgb provider cost openai 2.50 # optional routing override; no key or network probe
 omgb exec "write a rust fibonacci" --model omgb-openai
 ```
+
+Automatic provider selection treats built-in prices as fallback estimates,
+because provider/model pricing changes. Use `omgb provider cost ID VALUE` to
+set your average USD cost per million tokens, `omgb provider cost ID` to inspect
+it, or `omgb provider cost ID --reset` to return to the fallback. The override
+can also be supplied during setup with `provider add --cost-per-million VALUE`.
 
 Or discover a local provider without any account sign-in:
 
