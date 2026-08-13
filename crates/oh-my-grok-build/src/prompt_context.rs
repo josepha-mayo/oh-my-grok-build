@@ -204,14 +204,18 @@ pub fn record_cache_shape(context: &CompiledPromptContext) {
     let Some(hash) = context.stable_prefix_sha256.as_deref() else {
         return;
     };
+    let mut data = serde_json::json!({
+        "stable_prefix_sha256": hash,
+        "stable_bytes": context.stable_bytes,
+        "volatile_bytes": context.volatile_bytes,
+    });
+    if let Some(run_id) = crate::research_run_id() {
+        data["research_run_id"] = serde_json::json!(run_id);
+    }
     let _ = crate::timeline::add_event(
         "prompt_cache",
         "compiled cache-stable supplemental context",
-        Some(serde_json::json!({
-            "stable_prefix_sha256": hash,
-            "stable_bytes": context.stable_bytes,
-            "volatile_bytes": context.volatile_bytes,
-        })),
+        Some(data),
     );
 }
 
@@ -220,17 +224,21 @@ pub fn record_cache_affinity(
     affinity: &CacheAffinity,
     attempt: usize,
 ) {
+    let mut data = serde_json::json!({
+        "cache_affinity_sha256": affinity.cache_affinity_sha256,
+        "stable_prefix_sha256": affinity.stable_prefix_sha256,
+        "workspace_policy_sha256": affinity.workspace_policy_sha256,
+        "stable_bytes": context.stable_bytes,
+        "volatile_bytes": context.volatile_bytes,
+        "attempt": attempt,
+    });
+    if let Some(run_id) = crate::research_run_id() {
+        data["research_run_id"] = serde_json::json!(run_id);
+    }
     let _ = crate::timeline::add_event(
         "prompt_cache",
         "prepared privacy-safe prompt cache affinity",
-        Some(serde_json::json!({
-            "cache_affinity_sha256": affinity.cache_affinity_sha256,
-            "stable_prefix_sha256": affinity.stable_prefix_sha256,
-            "workspace_policy_sha256": affinity.workspace_policy_sha256,
-            "stable_bytes": context.stable_bytes,
-            "volatile_bytes": context.volatile_bytes,
-            "attempt": attempt,
-        })),
+        Some(data),
     );
 }
 

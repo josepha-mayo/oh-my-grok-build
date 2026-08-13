@@ -362,6 +362,17 @@ fn cache_provider_id(model: &str) -> String {
         .unwrap_or_else(|| "grok-native".to_string())
 }
 
+pub(crate) fn research_run_id() -> Option<String> {
+    let raw = std::env::var("OMGB_RESEARCH_RUN_ID").ok()?;
+    parse_research_run_id(&raw)
+}
+
+fn parse_research_run_id(raw: &str) -> Option<String> {
+    uuid::Uuid::parse_str(raw.trim())
+        .ok()
+        .map(|value| value.to_string())
+}
+
 fn pager_cache_policy(args: &PagerArgs) -> crate::prompt_context::WorkspacePolicy {
     crate::prompt_context::WorkspacePolicy {
         sandbox_profile: config_sandbox_profile(),
@@ -1334,6 +1345,9 @@ async fn run_single_turn_with_provider_fingerprint(
                     data["cache_affinity_sha256"] =
                         serde_json::json!(affinity.cache_affinity_sha256);
                 }
+                if let Some(run_id) = research_run_id() {
+                    data["research_run_id"] = serde_json::json!(run_id);
+                }
                 if !errors.is_empty() {
                     data["errors"] = serde_json::json!(errors);
                 }
@@ -1378,6 +1392,9 @@ async fn run_single_turn_with_provider_fingerprint(
         let mut data = serde_json::json!({"tool_calls": tool_calls, "success": false});
         if let Some(affinity) = last_cache_affinity.as_ref() {
             data["cache_affinity_sha256"] = serde_json::json!(affinity.cache_affinity_sha256);
+        }
+        if let Some(run_id) = research_run_id() {
+            data["research_run_id"] = serde_json::json!(run_id);
         }
         if !errors.is_empty() {
             data["errors"] = serde_json::json!(errors);
@@ -2859,6 +2876,15 @@ async fn run_skill(args: SkillArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn research_run_id_accepts_only_canonical_uuid() {
+        assert_eq!(parse_research_run_id("not-a-run-id"), None);
+        assert_eq!(
+            parse_research_run_id("019ff292-3bda-7972-90bb-c57e72812b98").as_deref(),
+            Some("019ff292-3bda-7972-90bb-c57e72812b98")
+        );
+    }
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};

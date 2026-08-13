@@ -94,6 +94,13 @@ Run deep arXiv research (with optional model patch):
 omgb research "quantum error correction" --count 5 --model omgb-openai --yolo
 ```
 
+Every run writes a unique private manifest under `~/.omgb/research/runs/`. It
+binds the report and optional patch to SHA-256 artifact digests, the repository
+commit/dirty state, bounded source and execution settings, model/provider
+fingerprint, prompt/tool-policy hashes, and the matching prompt-cache timeline
+correlation ID. Raw prompts, workspace paths, and model errors are not copied
+into the manifest.
+
 Start the WebSocket relay server:
 
 ```bash

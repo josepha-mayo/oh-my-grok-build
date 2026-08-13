@@ -1,6 +1,7 @@
 //! Deep arXiv/web research for `omgb`.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -9,6 +10,8 @@ use anyhow::{Context, Result, bail};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use scraper::{Html, Selector};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::net::{http_get_text, is_non_public_ip, validate_url};
 
@@ -48,6 +51,32 @@ fn sanitize_output_path(dir: &Path, raw: &Path) -> Result<PathBuf> {
     Ok(dir.join(raw))
 }
 
+fn prepare_output_path(root: &Path, path: &Path) -> Result<()> {
+    std::fs::create_dir_all(root)?;
+    crate::providers::restrict_omg_directory_permissions(root)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("research output path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let canonical_root = dunce::canonicalize(root)
+        .with_context(|| format!("canonicalize research root {}", root.display()))?;
+    let canonical_parent = dunce::canonicalize(parent)
+        .with_context(|| format!("canonicalize research output parent {}", parent.display()))?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        bail!(
+            "research output parent escapes {}: {}",
+            canonical_root.display(),
+            canonical_parent.display()
+        );
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => bail!("research output must be a regular file: {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect output {}", path.display())),
+    }
+}
+
 #[derive(Debug)]
 struct ArxivEntry {
     title: String,
@@ -73,19 +102,216 @@ const DEFAULT_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 const URL_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const PATCH_PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_PROMPT_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RESEARCH_REPORT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESULTS: usize = 100;
+const RESEARCH_MANIFEST_VERSION: u8 = 1;
+const PATCH_TOOL_POLICY: &str = "grep,list_dir,read_file,web_fetch,web_search";
 
-pub async fn research(topic: &str, count: usize) -> Result<String> {
+#[derive(Debug, Serialize)]
+struct ResearchRepositoryProvenance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracked_dirty: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResearchBudgetManifest {
+    max_results: usize,
+    search_timeout_seconds: u64,
+    url_validation_timeout_seconds: u64,
+    report_bytes_limit: usize,
+    patch_timeout_seconds: u64,
+    patch_output_bytes_limit: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ResearchArtifactManifest {
+    kind: &'static str,
+    relative_path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ResearchSourceManifest {
+    name: &'static str,
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchGenerationManifest {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_execution_fingerprint: Option<String>,
+    prompt_sha256: String,
+    tool_policy_sha256: String,
+    yolo: bool,
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResearchRunManifest {
+    schema_version: u8,
+    run_id: String,
+    created_at: String,
+    topic_sha256: String,
+    topic_bytes: usize,
+    requested_count: usize,
+    effective_count: usize,
+    sources: Vec<ResearchSourceManifest>,
+    repository: ResearchRepositoryProvenance,
+    budget: ResearchBudgetManifest,
+    artifacts: Vec<ResearchArtifactManifest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_generation: Option<PatchGenerationManifest>,
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn hash_file(path: &Path) -> Result<(String, u64)> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect research artifact {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "research artifact is not a regular file: {}",
+            path.display()
+        );
+    }
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open research artifact {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read research artifact {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(read as u64);
+        digest.update(&buffer[..read]);
+    }
+    Ok((format!("{:x}", digest.finalize()), bytes))
+}
+
+fn artifact_manifest(
+    root: &Path,
+    path: &Path,
+    kind: &'static str,
+    expected_sha256: &str,
+) -> Result<ResearchArtifactManifest> {
+    let relative = path.strip_prefix(root).with_context(|| {
+        format!(
+            "research artifact {} is outside {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let (actual_sha256, bytes) = hash_file(path)?;
+    if actual_sha256 != expected_sha256 {
+        bail!(
+            "research artifact changed before it could be recorded: {}",
+            path.display()
+        );
+    }
+    Ok(ResearchArtifactManifest {
+        kind,
+        relative_path: relative.to_string_lossy().replace('\\', "/"),
+        sha256: actual_sha256,
+        bytes,
+    })
+}
+
+fn repository_provenance() -> ResearchRepositoryProvenance {
+    fn git(args: &[&str]) -> Option<std::process::Output> {
+        std::process::Command::new("git")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+    }
+
+    let head_commit = git(&["rev-parse", "--verify", "HEAD"])
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let tracked_dirty = head_commit.as_ref().and_then(|_| {
+        let changed = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .ok()
+                .map(|status| !status.success())
+        };
+        let worktree_changed = changed(&["diff", "--quiet"])?;
+        let index_changed = changed(&["diff", "--cached", "--quiet"])?;
+        Some(worktree_changed || index_changed)
+    });
+    ResearchRepositoryProvenance {
+        head_commit,
+        tracked_dirty,
+    }
+}
+
+fn write_run_manifest(root: &Path, manifest: &ResearchRunManifest) -> Result<(PathBuf, String)> {
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&runs)?;
+    crate::providers::restrict_omg_directory_permissions(&runs)?;
+    let path = runs.join(format!("{}.json", manifest.run_id));
+    if path.exists() {
+        bail!("research run manifest already exists: {}", path.display());
+    }
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    let manifest_sha256 = sha256(&bytes);
+    crate::providers::write_file_atomic(&path, &String::from_utf8(bytes)?, true)?;
+    let (actual_sha256, _) = hash_file(&path)?;
+    if actual_sha256 != manifest_sha256 {
+        bail!("research run manifest failed post-write verification");
+    }
+    Ok((path, manifest_sha256))
+}
+
+struct ResearchOutput {
+    report: String,
+    sources: Vec<ResearchSourceManifest>,
+}
+
+async fn research_with_provenance(topic: &str, count: usize) -> Result<ResearchOutput> {
     let count = count.min(MAX_RESULTS);
     let mut report = format!("Research: {}\n\n", topic);
     let mut found = false;
+    let mut sources = Vec::with_capacity(2);
 
     match arxiv_research(topic, count).await {
         Ok(text) => {
             report.push_str(&text);
             found = true;
+            sources.push(ResearchSourceManifest {
+                name: "arxiv_atom_v1",
+                outcome: "succeeded",
+                error_sha256: None,
+            });
         }
-        Err(e) => report.push_str(&format!("arXiv search unavailable: {e}\n\n")),
+        Err(error) => {
+            report.push_str(&format!("arXiv search unavailable: {error}\n\n"));
+            sources.push(ResearchSourceManifest {
+                name: "arxiv_atom_v1",
+                outcome: "failed",
+                error_sha256: Some(sha256(error.to_string().as_bytes())),
+            });
+        }
     }
 
     match web_search(topic, count).await {
@@ -94,14 +320,30 @@ pub async fn research(topic: &str, count: usize) -> Result<String> {
                 report.push_str(&format!("\nWeb results:\n\n{text}"));
                 found = true;
             }
+            sources.push(ResearchSourceManifest {
+                name: "duckduckgo_instant_or_html_v1",
+                outcome: if text.is_empty() {
+                    "empty"
+                } else {
+                    "succeeded"
+                },
+                error_sha256: None,
+            });
         }
-        Err(e) => report.push_str(&format!("\nWeb search unavailable: {e}\n")),
+        Err(error) => {
+            report.push_str(&format!("\nWeb search unavailable: {error}\n"));
+            sources.push(ResearchSourceManifest {
+                name: "duckduckgo_instant_or_html_v1",
+                outcome: "failed",
+                error_sha256: Some(sha256(error.to_string().as_bytes())),
+            });
+        }
     }
 
     if !found {
         bail!("no research results for '{topic}'");
     }
-    Ok(report)
+    Ok(ResearchOutput { report, sources })
 }
 
 async fn arxiv_research(topic: &str, count: usize) -> Result<String> {
@@ -306,7 +548,7 @@ async fn validated_search_url(raw: &str) -> Option<String> {
     }
 }
 
-async fn exec_prompt(model: &str, prompt: &str, yolo: bool) -> Result<String> {
+async fn exec_prompt(model: &str, prompt: &str, yolo: bool, run_id: &str) -> Result<String> {
     let prompt_file = crate::write_prompt_temp(prompt).await?;
     let _prompt_guard = crate::PromptFileGuard(prompt_file.clone());
     let exe = std::env::current_exe()?;
@@ -317,12 +559,13 @@ async fn exec_prompt(model: &str, prompt: &str, yolo: bool) -> Result<String> {
         .arg("--model")
         .arg(model)
         .arg("--tools")
-        .arg("read_file,grep,list_dir,web_search,web_fetch")
+        .arg(PATCH_TOOL_POLICY)
         .arg("--prompt-file")
         .arg(&prompt_file)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    cmd.env("OMGB_RESEARCH_RUN_ID", run_id);
     if yolo {
         cmd.arg("--yolo");
     }
@@ -370,36 +613,107 @@ pub async fn run_research(
     yolo: bool,
     output: Option<PathBuf>,
 ) -> Result<()> {
-    let report = research(topic, count).await?;
+    if model.is_some() && !yolo {
+        bail!("--yolo is required to generate a patch with --model");
+    }
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let research = research_with_provenance(topic, count).await?;
+    let report = research.report;
+    if report.len() > MAX_RESEARCH_REPORT_BYTES {
+        bail!(
+            "research report exceeds the {} byte limit",
+            MAX_RESEARCH_REPORT_BYTES
+        );
+    }
     let dir = crate::providers::omg_dir()?.join("research");
     let report_path = match output {
         Some(p) => sanitize_output_path(&dir, &p)?,
-        None => dir.join(format!("{}.md", safe_filename(topic))),
+        None => dir.join(format!("{}-{run_id}.md", safe_filename(topic))),
     };
-    if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    prepare_output_path(&dir, &report_path)?;
     crate::providers::write_file_atomic(&report_path, &report, true)?;
+    let report_sha256 = sha256(report.as_bytes());
+    let mut artifacts = vec![artifact_manifest(
+        &dir,
+        &report_path,
+        "research_report",
+        &report_sha256,
+    )?];
     println!("wrote research report to {}", report_path.display());
 
+    let mut patch_generation = None;
     if let Some(model) = model {
-        if !yolo {
-            bail!("--yolo is required to generate a patch with --model");
-        }
         let prompt = format!(
             "Given the following research report, propose a concise patch or implementation plan. Output only the patch content.\n\n{report}"
         );
-        match exec_prompt(&model, &prompt, yolo).await {
+        let provider_execution_fingerprint =
+            crate::providers::provider_execution_fingerprint(&model)?;
+        let prompt_sha256 = sha256(prompt.as_bytes());
+        let tool_policy_sha256 = sha256(PATCH_TOOL_POLICY.as_bytes());
+        match exec_prompt(&model, &prompt, yolo, &run_id).await {
             Ok(patch) => {
                 let patch_path = report_path.with_extension("patch");
+                prepare_output_path(&dir, &patch_path)?;
                 crate::providers::write_file_atomic(&patch_path, &patch, true)?;
+                artifacts.push(artifact_manifest(
+                    &dir,
+                    &patch_path,
+                    "model_patch_proposal",
+                    &sha256(patch.as_bytes()),
+                )?);
+                patch_generation = Some(PatchGenerationManifest {
+                    model,
+                    provider_execution_fingerprint,
+                    prompt_sha256,
+                    tool_policy_sha256,
+                    yolo,
+                    outcome: "succeeded",
+                    error_sha256: None,
+                });
                 println!("wrote patch to {}", patch_path.display());
             }
             Err(e) => {
+                patch_generation = Some(PatchGenerationManifest {
+                    model,
+                    provider_execution_fingerprint,
+                    prompt_sha256,
+                    tool_policy_sha256,
+                    yolo,
+                    outcome: "failed",
+                    error_sha256: Some(sha256(e.to_string().as_bytes())),
+                });
                 eprintln!("warning: could not generate patch: {e}");
             }
         }
     }
+
+    let manifest = ResearchRunManifest {
+        schema_version: RESEARCH_MANIFEST_VERSION,
+        run_id,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        topic_sha256: sha256(topic.as_bytes()),
+        topic_bytes: topic.len(),
+        requested_count: count,
+        effective_count: count.min(MAX_RESULTS),
+        sources: research.sources,
+        repository: repository_provenance(),
+        budget: ResearchBudgetManifest {
+            max_results: MAX_RESULTS,
+            search_timeout_seconds: DEFAULT_SEARCH_TIMEOUT.as_secs(),
+            url_validation_timeout_seconds: URL_VALIDATE_TIMEOUT.as_secs(),
+            report_bytes_limit: MAX_RESEARCH_REPORT_BYTES,
+            patch_timeout_seconds: PATCH_PROMPT_TIMEOUT.as_secs(),
+            patch_output_bytes_limit: MAX_PROMPT_OUTPUT_BYTES,
+        },
+        artifacts,
+        patch_generation,
+    };
+    let (manifest_path, manifest_sha256) = write_run_manifest(&dir, &manifest)?;
+    println!(
+        "wrote verified research manifest to {} (sha256 {})",
+        manifest_path.display(),
+        manifest_sha256
+    );
     Ok(())
 }
 
@@ -490,6 +804,44 @@ fn attr_value(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<Strin
 mod tests {
     use super::*;
 
+    fn test_manifest(run_id: String, artifact: ResearchArtifactManifest) -> ResearchRunManifest {
+        ResearchRunManifest {
+            schema_version: RESEARCH_MANIFEST_VERSION,
+            run_id,
+            created_at: "2026-08-13T00:00:00Z".into(),
+            topic_sha256: sha256(b"private research topic"),
+            topic_bytes: 22,
+            requested_count: 5,
+            effective_count: 5,
+            sources: vec![
+                ResearchSourceManifest {
+                    name: "arxiv_atom_v1",
+                    outcome: "succeeded",
+                    error_sha256: None,
+                },
+                ResearchSourceManifest {
+                    name: "duckduckgo_instant_or_html_v1",
+                    outcome: "succeeded",
+                    error_sha256: None,
+                },
+            ],
+            repository: ResearchRepositoryProvenance {
+                head_commit: Some("a".repeat(40)),
+                tracked_dirty: Some(false),
+            },
+            budget: ResearchBudgetManifest {
+                max_results: MAX_RESULTS,
+                search_timeout_seconds: DEFAULT_SEARCH_TIMEOUT.as_secs(),
+                url_validation_timeout_seconds: URL_VALIDATE_TIMEOUT.as_secs(),
+                report_bytes_limit: MAX_RESEARCH_REPORT_BYTES,
+                patch_timeout_seconds: PATCH_PROMPT_TIMEOUT.as_secs(),
+                patch_output_bytes_limit: MAX_PROMPT_OUTPUT_BYTES,
+            },
+            artifacts: vec![artifact],
+            patch_generation: None,
+        }
+    }
+
     #[test]
     fn test_parse_atom() {
         let xml = r#"<feed>
@@ -539,6 +891,51 @@ mod tests {
         assert!(sanitize_output_path(dir, std::path::Path::new("report.md")).is_ok());
         assert!(sanitize_output_path(dir, std::path::Path::new("../passwd")).is_err());
         assert!(sanitize_output_path(dir, std::path::Path::new("/etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn prepare_output_path_rejects_non_file_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("research");
+        let target = root.join("report.md");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(prepare_output_path(&root, &target).is_err());
+    }
+
+    #[test]
+    fn artifact_manifest_verifies_content_and_relative_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("report.md");
+        std::fs::write(&path, "verified report").unwrap();
+        let artifact = artifact_manifest(
+            temp.path(),
+            &path,
+            "research_report",
+            &sha256(b"verified report"),
+        )
+        .unwrap();
+        assert_eq!(artifact.relative_path, "report.md");
+        assert_eq!(artifact.bytes, 15);
+        assert!(
+            artifact_manifest(temp.path(), &path, "research_report", &sha256(b"tampered")).is_err()
+        );
+    }
+
+    #[test]
+    fn run_manifest_is_unique_verified_and_does_not_persist_raw_topic() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.md");
+        std::fs::write(&report, "report").unwrap();
+        let artifact =
+            artifact_manifest(temp.path(), &report, "research_report", &sha256(b"report")).unwrap();
+        let manifest = test_manifest(uuid::Uuid::new_v4().to_string(), artifact);
+        let (path, expected) = write_run_manifest(temp.path(), &manifest).unwrap();
+        let (actual, _) = hash_file(&path).unwrap();
+        assert_eq!(actual, expected);
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(!raw.contains("private research topic"));
+        assert!(raw.contains("topic_sha256"));
+        assert!(write_run_manifest(temp.path(), &manifest).is_err());
     }
 
     #[test]

@@ -187,6 +187,15 @@ possible.
 | `omgb skill` | Reviewable, rollbackable supplemental harness refinements |
 | `omgb doctor` | Environment diagnostics |
 
+Research reports use unique run IDs by default. Each completed invocation also
+writes a verified private JSON manifest below `~/.omgb/research/runs/` with the
+repository commit and tracked-dirty state, source/budget limits, artifact
+SHA-256 values, and (when a model is used) the provider execution fingerprint
+plus canonical prompt and tool-policy hashes. The same run ID is attached to
+the child execution and prompt-cache timeline events, so cost/cache telemetry
+can be reconciled without storing raw prompts, paths, or error text in the
+manifest.
+
 Enter provider API keys only in your own local terminal (for example through the one-command `OMGB_API_KEY` environment variable used by `omgb provider add`). Never paste a model-provider key into chat, a prompt, or a group message. Keyless local endpoints can be added with `omgb provider discover --add`, and Grok subscription sign-in remains optional.
 
 `omgb provider add` refuses a configured model that is absent from the
