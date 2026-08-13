@@ -60,6 +60,18 @@ pub struct ModelListEntry {
     pub context_window: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTestReport {
+    pub provider_id: String,
+    pub model: String,
+    pub backend: String,
+    pub endpoint: String,
+    pub model_list_supported: bool,
+    pub model_advertised: bool,
+    pub inference_verified: bool,
+}
+
 pub fn omg_dir() -> Result<PathBuf> {
     #[cfg(test)]
     if let Some(override_path) = OMGB_HOME_OVERRIDE.lock().unwrap().as_ref() {
@@ -1627,6 +1639,13 @@ pub async fn add_provider(args: &AddProviderArgs) -> Result<ProviderConfig> {
             provider.base_url
         )
     })?;
+    if !models.iter().any(|model| model.id == provider.model) {
+        bail!(
+            "provider {} does not advertise configured model '{}'; choose one returned by its /models endpoint",
+            provider.base_url,
+            provider.model
+        );
+    }
 
     if provider.context_window.is_none() {
         let model_in_list = models.iter().find(|m| m.id == provider.model);
@@ -2119,13 +2138,17 @@ pub(crate) async fn is_provider_reachable(provider: &ProviderConfig) -> bool {
         Duration::from_secs(2),
     )
     .await
-    .is_some_and(|v| !v.is_empty())
+    .is_some_and(|models| models.iter().any(|entry| entry.id == provider.model))
 }
 
 fn fallback_context_window(model: &str) -> Option<u64> {
     let lower = model.to_ascii_lowercase();
-    if lower.contains("gpt-4o") || lower.contains("gpt-4-turbo") {
+    if lower.contains("gpt-5.6") {
+        Some(1_050_000)
+    } else if lower.contains("gpt-4o") || lower.contains("gpt-4-turbo") {
         Some(128_000)
+    } else if lower.contains("claude-sonnet-5") {
+        Some(1_000_000)
     } else if lower.contains("claude-3") {
         Some(200_000)
     } else if lower.contains("grok-4.5") || lower.contains("grok-4") {
@@ -2146,14 +2169,46 @@ fn fallback_context_window(model: &str) -> Option<u64> {
     }
 }
 
-pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
+fn inference_endpoint(base_url: &str, backend: &str) -> Option<String> {
+    let path = match backend {
+        "chat_completions" => "chat/completions",
+        "responses" => "responses",
+        "messages" => "messages",
+        _ => return None,
+    };
+    Some(format!("{}/{path}", base_url.trim_end_matches('/')))
+}
+
+fn provider_error_summary(text: &str, api_key: Option<&str>) -> String {
+    const MAX_CHARS: usize = 512;
+    let redacted = match api_key.filter(|key| !key.is_empty()) {
+        Some(key) => text.replace(key, "[redacted]"),
+        None => text.to_string(),
+    };
+    let sanitized = redacted
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == ' ')
+        .take(MAX_CHARS + 1)
+        .collect::<String>();
+    if sanitized.chars().count() > MAX_CHARS {
+        format!(
+            "{}...",
+            sanitized.chars().take(MAX_CHARS).collect::<String>()
+        )
+    } else {
+        sanitized
+    }
+}
+
+pub async fn test_provider(id: &str) -> Result<ProviderTestReport> {
     let provider = get_provider(id)?.ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
     let api_key = resolve_api_key(&provider)?;
     let base_url = provider.base_url.trim_end_matches('/').to_string();
     let backend = provider
         .api_backend
         .as_deref()
-        .unwrap_or("chat_completions");
+        .unwrap_or("chat_completions")
+        .to_string();
 
     let mut headers = provider.extra_headers.clone().unwrap_or_default();
     if let Some(key) = &api_key {
@@ -2171,69 +2226,97 @@ pub async fn test_provider(id: &str) -> Result<(bool, Option<String>)> {
     if let Some(models) = fetch_model_list(
         &base_url,
         api_key.as_deref(),
-        backend,
+        &backend,
         &headers,
         allow_local,
         allow_private,
         Duration::from_secs(10),
     )
     .await
-        && !models.is_empty()
     {
-        return Ok((true, None));
+        let model_advertised = models.iter().any(|model| model.id == provider.model);
+        if !model_advertised {
+            let sample = models
+                .iter()
+                .take(8)
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "provider is reachable, but configured model '{}' is not advertised by /models{}",
+                provider.model,
+                if sample.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (sample: {sample})")
+                }
+            );
+        }
+        return Ok(ProviderTestReport {
+            provider_id: provider.id,
+            model: provider.model,
+            backend,
+            endpoint: format!("{base_url}/models"),
+            model_list_supported: true,
+            model_advertised: true,
+            inference_verified: false,
+        });
     }
 
+    let endpoint = inference_endpoint(&base_url, &backend)
+        .ok_or_else(|| anyhow::anyhow!("unsupported provider backend '{backend}'"))?;
     if backend == "chat_completions" {
-        let url = validate_url(
-            &format!("{base_url}/chat/completions"),
-            allow_local,
-            allow_private,
-        )
-        .await?;
+        let url = validate_url(&endpoint, allow_local, allow_private).await?;
         let body = serde_json::json!({
             "model": provider.model,
             "messages": [{"role": "system", "content": "ping"}],
             "max_tokens": 1,
         });
         let (status, text) = http_post_json(&url, &headers, body, Duration::from_secs(10)).await?;
-        if status == 200 {
-            Ok((true, None))
-        } else {
-            Ok((false, Some(format!("HTTP {status}: {text}"))))
+        if status != 200 {
+            bail!(
+                "provider inference probe failed with HTTP {status}: {}",
+                provider_error_summary(&text, api_key.as_deref())
+            );
         }
     } else if backend == "responses" {
-        let url =
-            validate_url(&format!("{base_url}/responses"), allow_local, allow_private).await?;
+        let url = validate_url(&endpoint, allow_local, allow_private).await?;
         let body = serde_json::json!({
             "model": provider.model,
             "input": "ping",
             "max_output_tokens": 1,
         });
         let (status, text) = http_post_json(&url, &headers, body, Duration::from_secs(10)).await?;
-        if status == 200 {
-            Ok((true, None))
-        } else {
-            Ok((false, Some(format!("HTTP {status}: {text}"))))
+        if status != 200 {
+            bail!(
+                "provider inference probe failed with HTTP {status}: {}",
+                provider_error_summary(&text, api_key.as_deref())
+            );
         }
     } else if backend == "messages" {
-        let url = validate_url(&format!("{base_url}/messages"), allow_local, allow_private).await?;
+        let url = validate_url(&endpoint, allow_local, allow_private).await?;
         let body = serde_json::json!({
             "model": provider.model,
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 1,
         });
         let (status, text) = http_post_json(&url, &headers, body, Duration::from_secs(10)).await?;
-        if status == 200 {
-            Ok((true, None))
-        } else {
-            Ok((false, Some(format!("HTTP {status}: {text}"))))
+        if status != 200 {
+            bail!(
+                "provider inference probe failed with HTTP {status}: {}",
+                provider_error_summary(&text, api_key.as_deref())
+            );
         }
-    } else {
-        Ok((
-            false,
-            Some("provider did not respond to models list".into()),
-        ))
     }
+    Ok(ProviderTestReport {
+        provider_id: provider.id,
+        model: provider.model,
+        backend,
+        endpoint,
+        model_list_supported: false,
+        model_advertised: false,
+        inference_verified: true,
+    })
 }
 
 pub fn sanitize_provider_id(id: &str) -> String {
@@ -2270,6 +2353,39 @@ mod tests {
         assert_eq!(sanitize_provider_id("-llama-cpp-"), "llama-cpp");
         assert_eq!(sanitize_provider_id("café"), "caf");
         assert!(sanitize_provider_id("---").is_empty());
+    }
+
+    #[test]
+    fn inference_endpoints_match_each_supported_wire_protocol() {
+        assert_eq!(
+            inference_endpoint("https://api.openai.com/v1/", "responses").as_deref(),
+            Some("https://api.openai.com/v1/responses")
+        );
+        assert_eq!(
+            inference_endpoint("https://api.anthropic.com/v1", "messages").as_deref(),
+            Some("https://api.anthropic.com/v1/messages")
+        );
+        assert_eq!(
+            inference_endpoint("http://localhost:11434/v1", "chat_completions").as_deref(),
+            Some("http://localhost:11434/v1/chat/completions")
+        );
+        assert_eq!(inference_endpoint("https://example.test", "unknown"), None);
+    }
+
+    #[test]
+    fn provider_error_summaries_are_single_line_and_bounded() {
+        assert_eq!(
+            provider_error_summary("bad\r\nrequest\t", None),
+            "badrequest"
+        );
+        assert_eq!(
+            provider_error_summary("request leaked secret-key", Some("secret-key")),
+            "request leaked [redacted]"
+        );
+        let long = "x".repeat(600);
+        let summary = provider_error_summary(&long, None);
+        assert!(summary.ends_with("..."));
+        assert_eq!(summary.chars().count(), 515);
     }
 
     #[test]

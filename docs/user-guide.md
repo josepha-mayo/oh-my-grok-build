@@ -181,6 +181,13 @@ possible.
 
 Enter provider API keys only in your own local terminal (for example through the one-command `OMGB_API_KEY` environment variable used by `omgb provider add`). Never paste a model-provider key into chat, a prompt, or a group message. Keyless local endpoints can be added with `omgb provider discover --add`, and Grok subscription sign-in remains optional.
 
+`omgb provider add` refuses a configured model that is absent from the
+provider's live `/models` response. Run `omgb provider test ID` after a provider
+or model change. It verifies model access through `/models`, or uses a bounded
+one-token request against the configured chat-completions, Responses, or
+Messages endpoint when model listing is unavailable. The report never includes
+the resolved API key.
+
 The automatic cheapest-provider router uses built-in prices only as fallback
 estimates. Pricing and selected models change, so set the value you actually
 want used with `omgb provider cost ID USD_PER_MILLION_TOKENS` (or

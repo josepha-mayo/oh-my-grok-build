@@ -52,6 +52,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | --- | --- |
 | `oh-my-grok-build` / `omgb` binary boots and calls into upstream `xai-grok-pager` | ✅ |
 | `omgb provider` — add BYOK providers (OpenAI, Anthropic, xAI, OpenRouter, Ollama, LM Studio, vLLM, llama.cpp, Tabby) | ✅ |
+| Provider admission/test verifies the configured model against live `/models` or its exact bounded inference endpoint | ✅ |
 | `omgb auth` — optional Grok subscription status/device login/logout, separate from BYOK | ✅ |
 | `omgb provider discover` — local model discovery (Ollama/LM Studio) | ✅ |
 | `omgb model` — switch default model, list custom models | ✅ |

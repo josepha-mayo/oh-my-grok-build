@@ -74,10 +74,10 @@ pub(crate) const TEMPLATES: &[ProviderTemplate] = &[
     t(
         "groq",
         "Groq",
-        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
         "https://api.groq.com/openai/v1",
         Some("GROQ_API_KEY"),
-        128_000,
+        131_072,
     ),
     t(
         "mistral",
@@ -138,10 +138,10 @@ pub(crate) const TEMPLATES: &[ProviderTemplate] = &[
     t(
         "gemini",
         "Gemini",
-        "gemini-1.5-flash",
+        "gemini-3.6-flash",
         "https://generativelanguage.googleapis.com/v1beta/openai",
         Some("GEMINI_API_KEY"),
-        128_000,
+        1_000_000,
     ),
     t(
         "anyscale",
@@ -772,21 +772,21 @@ pub(crate) const TEMPLATES: &[ProviderTemplate] = &[
     ProviderTemplate {
         id: "codex",
         name: "OpenAI Codex",
-        model: "codex-mini-latest",
+        model: "gpt-5.6",
         base_url: "https://api.openai.com/v1",
         env_key: Some("OPENAI_API_KEY"),
         extra_headers: None,
-        context_window: Some(128_000),
+        context_window: Some(1_050_000),
         api_backend: Some("responses"),
     },
     ProviderTemplate {
         id: "claude-code",
         name: "Claude Code",
-        model: "claude-3-5-sonnet-20241022",
+        model: "claude-sonnet-5",
         base_url: "https://api.anthropic.com/v1",
         env_key: Some("ANTHROPIC_API_KEY"),
         extra_headers: Some(&[("anthropic-version", "2023-06-01")]),
-        context_window: Some(200_000),
+        context_window: Some(1_000_000),
         api_backend: Some("messages"),
     },
     t(
@@ -809,30 +809,30 @@ pub(crate) const TEMPLATES: &[ProviderTemplate] = &[
     ProviderTemplate {
         id: "anthropic",
         name: "Anthropic",
-        model: "claude-3-5-sonnet-20241022",
+        model: "claude-sonnet-5",
         base_url: "https://api.anthropic.com/v1",
         env_key: Some("ANTHROPIC_API_KEY"),
         extra_headers: Some(&[("anthropic-version", "2023-06-01")]),
-        context_window: Some(200_000),
+        context_window: Some(1_000_000),
         api_backend: Some("messages"),
     },
     ProviderTemplate {
         id: "openrouter",
         name: "OpenRouter",
-        model: "anthropic/claude-3.5-sonnet",
+        model: "anthropic/claude-sonnet-5",
         base_url: "https://openrouter.ai/api/v1",
         env_key: Some("OPENROUTER_API_KEY"),
         extra_headers: Some(&[
             ("HTTP-Referer", "https://oh-my-grok.build"),
             ("X-Title", "oh-my-grok-build"),
         ]),
-        context_window: Some(200_000),
+        context_window: Some(1_000_000),
         api_backend: Some("chat_completions"),
     },
     ProviderTemplate {
         id: "xai",
         name: "xAI",
-        model: "grok-4.5",
+        model: "grok-4.6",
         base_url: "https://api.x.ai/v1",
         env_key: Some("XAI_API_KEY"),
         extra_headers: None,
@@ -842,12 +842,12 @@ pub(crate) const TEMPLATES: &[ProviderTemplate] = &[
     ProviderTemplate {
         id: "openai",
         name: "OpenAI",
-        model: "gpt-4o",
+        model: "gpt-5.6",
         base_url: "https://api.openai.com/v1",
         env_key: Some("OPENAI_API_KEY"),
         extra_headers: None,
-        context_window: Some(128_000),
-        api_backend: Some("chat_completions"),
+        context_window: Some(1_050_000),
+        api_backend: Some("responses"),
     },
     ProviderTemplate {
         id: "ollama",
@@ -957,10 +957,33 @@ mod tests {
         let p = provider_template("groq").unwrap();
         assert_eq!(p.id, "groq");
         assert_eq!(p.name, "Groq");
-        assert_eq!(p.model, "llama-3.3-70b-versatile");
+        assert_eq!(p.model, "openai/gpt-oss-120b");
         assert!(p.base_url.contains("groq.com"));
         assert!(p.context_window.is_some());
         assert_eq!(p.api_backend.as_deref(), Some("chat_completions"));
+    }
+
+    #[test]
+    fn primary_provider_defaults_use_their_verified_wire_protocols() {
+        for (id, model, backend) in [
+            ("openai", "gpt-5.6", "responses"),
+            ("anthropic", "claude-sonnet-5", "messages"),
+            ("xai", "grok-4.6", "chat_completions"),
+            (
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                "chat_completions",
+            ),
+            ("gemini", "gemini-3.6-flash", "chat_completions"),
+        ] {
+            let provider = provider_template(id).expect("primary provider must exist");
+            assert_eq!(provider.model, model, "unexpected default for {id}");
+            assert_eq!(
+                provider.api_backend.as_deref(),
+                Some(backend),
+                "unexpected wire protocol for {id}"
+            );
+        }
     }
 
     #[test]

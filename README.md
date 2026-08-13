@@ -55,9 +55,18 @@ Use a BYOK provider:
 ```bash
 omgb provider catalog
 OMGB_API_KEY="$OPENAI_API_KEY" omgb provider add openai --default
+omgb provider test openai
 omgb provider cost openai 2.50 # optional routing override; no key or network probe
 omgb exec "write a rust fibonacci" --model omgb-openai
 ```
+
+Provider addition validates the configured model against the endpoint's live
+`/models` response before persisting the provider. `provider test` repeats that
+model-specific authorization check; for compatible endpoints without a models
+API it sends a bounded one-token inference probe to the exact configured wire
+protocol. Output reports only the provider/model/backend and verified endpoint,
+never credentials. Catalog defaults are maintained conveniences, not a source
+of truth over the live provider API.
 
 Automatic provider selection treats built-in prices as fallback estimates,
 because provider/model pricing changes. Use `omgb provider cost ID VALUE` to

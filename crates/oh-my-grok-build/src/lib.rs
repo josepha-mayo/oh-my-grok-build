@@ -2094,12 +2094,24 @@ async fn run_provider(args: ProviderArgs) -> Result<()> {
             }
         }
         ProviderCommand::Test { id } => {
-            let (ok, err) = test_provider(&id).await?;
-            if ok {
-                println!("provider {id}: ok");
-            } else {
-                bail!("provider {id} test failed: {}", err.unwrap_or_default());
-            }
+            let report = test_provider(&id).await?;
+            println!(
+                "provider {}: ok (model={}, backend={}, endpoint={}, model_list={}, inference_probe={})",
+                report.provider_id,
+                report.model,
+                report.backend,
+                report.endpoint,
+                if report.model_list_supported && report.model_advertised {
+                    "verified"
+                } else {
+                    "unavailable"
+                },
+                if report.inference_verified {
+                    "verified"
+                } else {
+                    "not-needed"
+                }
+            );
         }
     }
     Ok(())
