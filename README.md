@@ -183,6 +183,15 @@ conversation envelopes.
 | `omgb undo` | Undo the last omgb commit. |
 | `omgb feedback "<message>"` | Open a GitHub issue to submit feedback (`--open` to launch browser). |
 
+New groups default to separated planner, executor, and verifier roles. A
+task-class group message cannot complete through an executor's self-report:
+the durable plan includes an independent reviewer/verifier/security agent,
+runs assurance after producer evidence, disables tools for that assurance
+turn even in a yolo group, and requires a typed `VERIFIED:` verdict. A
+`REJECTED:` or untyped response leaves the dispatch failed and visible for
+review. Conversation-class chat remains lightweight, and only authenticated
+humans can issue approval-class messages.
+
 Thread inbox delivery is durable and fail-closed after an interrupted model/tool turn. For a send that may need to be retried, pass the same stable identifier each time:
 
 ```bash

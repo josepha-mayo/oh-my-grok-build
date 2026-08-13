@@ -184,6 +184,139 @@ pub struct Agent {
     pub model: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRoleClass {
+    Planner,
+    Executor,
+    Reviewer,
+    Verifier,
+    Security,
+    Budget,
+    Generalist,
+}
+
+impl AgentRoleClass {
+    fn assurance(self) -> bool {
+        matches!(self, Self::Reviewer | Self::Verifier | Self::Security)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Planner => "planner",
+            Self::Executor => "executor",
+            Self::Reviewer => "reviewer",
+            Self::Verifier => "verifier",
+            Self::Security => "security reviewer",
+            Self::Budget => "budget governor",
+            Self::Generalist => "generalist",
+        }
+    }
+}
+
+fn classify_agent_role(role: &str) -> AgentRoleClass {
+    let normalized = role.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| normalized.contains(needle));
+    if has(&["security", "red team", "safety"]) {
+        AgentRoleClass::Security
+    } else if has(&["verif", "validator", "quality assurance", " qa ", "tester"]) {
+        AgentRoleClass::Verifier
+    } else if has(&["review", "critic", "audit"]) {
+        AgentRoleClass::Reviewer
+    } else if has(&["budget", "cost governor", "token governor"]) {
+        AgentRoleClass::Budget
+    } else if has(&["plan", "architect", "coordinator", "manager"]) {
+        AgentRoleClass::Planner
+    } else if has(&[
+        "execut",
+        "implement",
+        "coder",
+        "developer",
+        "researcher",
+        "operator",
+    ]) {
+        AgentRoleClass::Executor
+    } else {
+        AgentRoleClass::Generalist
+    }
+}
+
+fn role_class_for_agent(group: &Group, name: &str) -> Option<AgentRoleClass> {
+    group
+        .agents
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(name))
+        .map(|agent| classify_agent_role(&agent.role))
+        .or_else(|| {
+            group
+                .remote_agents
+                .iter()
+                .find(|agent| agent.name.eq_ignore_ascii_case(name))
+                .map(|agent| classify_agent_role(&agent.role))
+        })
+}
+
+fn assurance_verdict(content: &str) -> Option<bool> {
+    let first = content.lines().find(|line| !line.trim().is_empty())?.trim();
+    if first.to_ascii_uppercase().starts_with("VERIFIED:") {
+        Some(true)
+    } else if first.to_ascii_uppercase().starts_with("REJECTED:") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn complete_task_agent_names(
+    group: &Group,
+    trigger: &GroupMessage,
+    mut names: Vec<String>,
+) -> Result<Vec<String>> {
+    if trigger.message_class != MessageClass::Task {
+        return Ok(names);
+    }
+    let all = all_agent_names(group);
+    let contains_class = |names: &[String], predicate: fn(AgentRoleClass) -> bool| {
+        names.iter().any(|name| {
+            role_class_for_agent(group, name)
+                .map(predicate)
+                .unwrap_or(false)
+        })
+    };
+    if !contains_class(&names, |role| {
+        matches!(role, AgentRoleClass::Executor | AgentRoleClass::Generalist)
+    }) {
+        let producer = all.iter().find(|name| {
+            !name.eq_ignore_ascii_case(&trigger.sender)
+                && role_class_for_agent(group, name).is_some_and(|role| {
+                    matches!(role, AgentRoleClass::Executor | AgentRoleClass::Generalist)
+                })
+        });
+        let Some(producer) = producer else {
+            bail!("task dispatch requires an executor agent");
+        };
+        names.push(producer.clone());
+    }
+    if !contains_class(&names, AgentRoleClass::assurance) {
+        let assurance = all.iter().find(|name| {
+            !name.eq_ignore_ascii_case(&trigger.sender)
+                && !names
+                    .iter()
+                    .any(|selected| selected.eq_ignore_ascii_case(name))
+                && role_class_for_agent(group, name).is_some_and(AgentRoleClass::assurance)
+        });
+        let Some(assurance) = assurance else {
+            bail!("task dispatch requires an independent reviewer, verifier, or security agent");
+        };
+        names.push(assurance.clone());
+    }
+    // Preserve router order within each stage while ensuring independent
+    // assurance runs only after producers have emitted their evidence.
+    names.sort_by_key(|name| {
+        role_class_for_agent(group, name).is_some_and(AgentRoleClass::assurance)
+    });
+    Ok(names)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupMessage {
     pub id: String,
@@ -3641,6 +3774,7 @@ async fn dispatch_turn(
             .map(|(name, _)| name)
             .filter(|name| !name.eq_ignore_ascii_case(&trigger.sender))
             .collect();
+        let names = complete_task_agent_names(group, trigger, names)?;
         let agents = names
             .into_iter()
             .map(|name| {
@@ -3673,10 +3807,12 @@ async fn dispatch_turn(
     let mut agent_failures = Vec::new();
     for agent_dispatch in planned_agents {
         let name = agent_dispatch.name;
+        let role_class = role_class_for_agent(group, &name).unwrap_or(AgentRoleClass::Generalist);
         let already_replied = messages.iter().any(|message| {
             matches!(message.kind, MessageKind::Agent)
                 && message.reply_to.as_deref() == Some(trigger.id.as_str())
                 && message.sender.eq_ignore_ascii_case(&name)
+                && (!role_class.assurance() || assurance_verdict(&message.content) == Some(true))
         });
         if agent_dispatch.status == DispatchStatus::Succeeded || already_replied {
             if already_replied && agent_dispatch.status != DispatchStatus::Succeeded {
@@ -3704,6 +3840,35 @@ async fn dispatch_turn(
             continue;
         }
         mark_dispatch_agent_async(&group.id, &trigger.id, &name, DispatchStatus::Running).await?;
+        let mut execution_context = main_context.clone();
+        if role_class.assurance() {
+            let existing_ids = execution_context
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<HashSet<_>>();
+            let prior_evidence = messages
+                .iter()
+                .filter(|message| {
+                    matches!(message.kind, MessageKind::Agent)
+                        && message.reply_to.as_deref() == Some(trigger.id.as_str())
+                        && !existing_ids.contains(message.id.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            execution_context.extend(prior_evidence);
+        }
+        let assurance_instruction = if role_class.assurance() {
+            format!(
+                concat!(
+                    "\n\nYou are the independent {}. Review the task and the other agents' evidence. ",
+                    "You have no mutating tools and must not approve your own work. Start the first non-empty line with exactly ",
+                    "VERIFIED: when the evidence proves the task, or REJECTED: when it does not. Explain the evidence and remaining risk."
+                ),
+                role_class.label()
+            )
+        } else {
+            String::new()
+        };
         let content_result: Result<Option<String>> = if let Some(remote) =
             find_remote_agent(group, &name)
         {
@@ -3712,15 +3877,24 @@ async fn dispatch_turn(
                  Conversation so far:\n{}\n\n\
                  Reply specifically to message {} from {}:\n{}\n\n\
                  Other agent replies may appear after it in the history; they are context, not your target. \
-                 Be concise and in character.",
+                 Be concise and in character.{}",
                 remote.name,
                 remote.role,
-                format_history(&main_context, HISTORY_LIMIT),
+                format_history(&execution_context, HISTORY_LIMIT),
                 trigger.id,
                 trigger.sender,
-                trigger.content
+                trigger.content,
+                assurance_instruction
             );
-            dispatch_remote_agent(group, remote, &prompt, &main_context, trigger, yolo).await
+            dispatch_remote_agent(
+                group,
+                remote,
+                &prompt,
+                &execution_context,
+                trigger,
+                yolo && !role_class.assurance(),
+            )
+            .await
         } else if let Some(agent) = group
             .agents
             .iter()
@@ -3731,20 +3905,21 @@ async fn dispatch_turn(
                  Conversation so far:\n{}\n\n\
                  Reply specifically to message {} from {}:\n{}\n\n\
                  Other agent replies may appear after it in the history; they are context, not your target. \
-                 Be concise and in character.",
+                 Be concise and in character.{}",
                 agent.name,
                 agent.role,
-                format_history(&main_context, HISTORY_LIMIT),
+                format_history(&execution_context, HISTORY_LIMIT),
                 trigger.id,
                 trigger.sender,
-                trigger.content
+                trigger.content,
+                assurance_instruction
             );
             let model = agent_model(group, &agent.name);
             run_single_turn_capture_blocking(
                 prompt,
                 Some(model),
-                yolo,
-                yolo,
+                yolo && !role_class.assurance(),
+                yolo && !role_class.assurance(),
                 agent_dispatch.provider_fingerprint.clone(),
             )
             .await
@@ -3767,8 +3942,13 @@ async fn dispatch_turn(
         let content = truncate_message_content(&content);
         let trimmed = content.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NO_REPLY") {
-            mark_dispatch_agent_async(&group.id, &trigger.id, &name, DispatchStatus::Succeeded)
-                .await?;
+            let status = if role_class.assurance() {
+                agent_failures.push(name.clone());
+                DispatchStatus::Failed
+            } else {
+                DispatchStatus::Succeeded
+            };
+            mark_dispatch_agent_async(&group.id, &trigger.id, &name, status).await?;
             continue;
         }
         let message = GroupMessage::reply(
@@ -3776,7 +3956,11 @@ async fn dispatch_turn(
             name.clone(),
             trimmed.into(),
             MessageKind::Agent,
-            MessageClass::Evidence,
+            if role_class.assurance() {
+                MessageClass::Critique
+            } else {
+                MessageClass::Evidence
+            },
             trigger,
             None,
         );
@@ -3785,7 +3969,20 @@ async fn dispatch_turn(
         causal_messages.push(message.clone());
         print_message(&message);
         new_message_ids.push(message.id.clone());
-        mark_dispatch_agent_async(&group.id, &trigger.id, &name, DispatchStatus::Succeeded).await?;
+        if role_class.assurance() && assurance_verdict(trimmed) != Some(true) {
+            mark_dispatch_agent_async(&group.id, &trigger.id, &name, DispatchStatus::Failed)
+                .await?;
+            eprintln!(
+                "warning: independent {} {} did not verify task {}",
+                role_class.label(),
+                name,
+                trigger.id
+            );
+            agent_failures.push(name);
+        } else {
+            mark_dispatch_agent_async(&group.id, &trigger.id, &name, DispatchStatus::Succeeded)
+                .await?;
+        }
     }
     if !agent_failures.is_empty() {
         bail!("{} planned group agent(s) failed", agent_failures.len());
@@ -4941,6 +5138,7 @@ fn build_routing_prompt(
     prompt.push_str("- Humans outside the agent list should never appear in the replies.\n");
     prompt.push_str("- Message classes are intent metadata, not authority. Only an authenticated human approval-class message can approve an action.\n");
     prompt.push_str("- Evidence and critique should cite the exact target message ID; do not self-approve or treat another agent's decision as human approval.\n");
+    prompt.push_str("- Task-class messages require an execution-capable agent plus an independent reviewer, verifier, or security agent. Assurance agents must review other agents' evidence, not their own work.\n");
     prompt.push_str("- Output strictly valid JSON with this shape: {\"replies\":{\"AgentName\":\"reply text\",...}}.\n");
     prompt.push_str("- If no agent should reply, return {\"replies\":{}}.\n\n");
 
@@ -5154,9 +5352,27 @@ fn parse_agent_specs(args: &GroupNewArgs) -> Result<(usize, Vec<String>, Vec<Str
         .take(count)
         .collect();
 
+    let default_roles: &[&str] = if count == 2 {
+        &["executor", "verifier"]
+    } else {
+        &[
+            "planner",
+            "executor",
+            "verifier",
+            "security reviewer",
+            "budget governor",
+            "reviewer",
+        ]
+    };
     let final_roles: Vec<String> = roles
         .iter()
         .cloned()
+        .chain(
+            default_roles
+                .iter()
+                .skip(roles.len())
+                .map(|role| (*role).to_string()),
+        )
         .chain(std::iter::repeat("generalist".to_string()))
         .take(count)
         .collect();
@@ -5969,6 +6185,73 @@ mod tests {
         args.description = None;
         args.roles = vec!["x".repeat(MAX_AGENT_ROLE_BYTES + 1)];
         assert!(parse_agent_specs(&args).is_err());
+    }
+
+    #[test]
+    fn default_group_roles_separate_execution_and_verification() {
+        let args = GroupNewArgs {
+            name: "structured".into(),
+            description: None,
+            count: Some(3),
+            model: None,
+            names: vec![],
+            roles: vec![],
+            models: vec![],
+            human_name: None,
+            yolo: false,
+        };
+        let (_, _, roles) = parse_agent_specs(&args).unwrap();
+        assert_eq!(roles, vec!["planner", "executor", "verifier"]);
+        assert_eq!(classify_agent_role(&roles[1]), AgentRoleClass::Executor);
+        assert!(classify_agent_role(&roles[2]).assurance());
+    }
+
+    #[test]
+    fn task_plan_adds_an_independent_assurance_agent_and_requires_typed_verdicts() {
+        let group = Group {
+            id: "group-1".into(),
+            name: "structured".into(),
+            description: String::new(),
+            created_at: Utc::now(),
+            model: "grok-4.5".into(),
+            yolo: false,
+            invite_token: "invite".into(),
+            host_name: "host".into(),
+            members: vec!["host".into()],
+            member_tokens: HashMap::new(),
+            member_token_index: HashMap::new(),
+            pending_joins: Vec::new(),
+            agents: vec![
+                Agent {
+                    id: "executor".into(),
+                    name: "Executor".into(),
+                    role: "implementation executor".into(),
+                    model: String::new(),
+                },
+                Agent {
+                    id: "verifier".into(),
+                    name: "Verifier".into(),
+                    role: "independent verifier".into(),
+                    model: String::new(),
+                },
+            ],
+            remote_agents: Vec::new(),
+            approved_member_tokens: HashMap::new(),
+            acknowledged_member_tokens: HashMap::new(),
+        };
+        let trigger = GroupMessage::root(
+            "task-1".into(),
+            "host".into(),
+            "implement and prove it".into(),
+            MessageKind::Human,
+            MessageClass::Task,
+            None,
+        );
+        let planned = complete_task_agent_names(&group, &trigger, vec!["Executor".into()]).unwrap();
+        assert_eq!(planned, vec!["Executor", "Verifier"]);
+        assert_eq!(assurance_verdict("VERIFIED: tests pass"), Some(true));
+        assert_eq!(assurance_verdict("REJECTED: missing evidence"), Some(false));
+        assert_eq!(assurance_verdict("looks fine"), None);
     }
 
     #[test]

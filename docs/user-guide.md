@@ -187,6 +187,14 @@ possible.
 | `omgb skill` | Reviewable, rollbackable supplemental harness refinements |
 | `omgb doctor` | Environment diagnostics |
 
+New groups use planner, executor, and verifier defaults (two-agent groups use
+executor plus verifier). For task-class messages, routing durably adds an
+independent reviewer, verifier, or security agent when needed and schedules
+assurance after producer evidence. Assurance turns have no tools even when the
+group is yolo-enabled and must begin with `VERIFIED:` or `REJECTED:`. Only a
+typed verified result can complete that participant; agent messages never gain
+human approval authority.
+
 Research reports use unique run IDs by default. Each completed invocation also
 writes a verified private JSON manifest below `~/.omgb/research/runs/` with the
 repository commit and tracked-dirty state, source/budget limits, artifact
