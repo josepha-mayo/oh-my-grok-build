@@ -1228,18 +1228,26 @@ pub(crate) fn provider_execution_fingerprint(model: &str) -> Result<Option<Strin
     provider_execution_fingerprint_unlocked(model)
 }
 
+pub(crate) struct PreparedProviderExecution {
+    _guard: Option<ProviderMutationGuard>,
+    pub fingerprint: Option<String>,
+}
+
 /// Prepare one immutable provider execution window. The mutation locks stay
 /// held until the returned guard drops, so config.json, .env and Grok's model
 /// table cannot change between identity validation and the model request.
 pub(crate) fn prepare_provider_execution(
     model: &str,
     expected_fingerprint: Option<&str>,
-) -> Result<Option<ProviderMutationGuard>> {
+) -> Result<PreparedProviderExecution> {
     let Some(id) = model.trim().strip_prefix("omgb-") else {
         if expected_fingerprint.is_some() {
             bail!("persisted provider identity does not match model '{model}'");
         }
-        return Ok(None);
+        return Ok(PreparedProviderExecution {
+            _guard: None,
+            fingerprint: None,
+        });
     };
     let guard = provider_mutation_lock()?;
     ensure_provider_configured_unlocked(id)?;
@@ -1248,7 +1256,10 @@ pub(crate) fn prepare_provider_execution(
     if expected_fingerprint.is_some_and(|expected| expected != current) {
         bail!("provider '{id}' changed after this execution was planned");
     }
-    Ok(Some(guard))
+    Ok(PreparedProviderExecution {
+        _guard: Some(guard),
+        fingerprint: Some(current),
+    })
 }
 
 fn effective_providers_from_tables(

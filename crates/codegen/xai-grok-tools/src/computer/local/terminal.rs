@@ -508,7 +508,7 @@ struct LocalTerminalActor {
     /// Whether persistent shell state is enabled.
     persistent_shell: bool,
 
-    login_shell_capture: bool,
+    _login_shell_capture: bool,
 
     /// Per-backend `find`→`bfs` / `grep`→`ugrep` shadow enable state, resolved
     /// once by the host and baked in at construction. Passed to
@@ -556,7 +556,7 @@ impl LocalTerminalActor {
             _cgroup_guard: cgroup_guard,
             memory_monitor,
             persistent_shell,
-            login_shell_capture,
+            _login_shell_capture: login_shell_capture,
             search_shadows,
             #[cfg(unix)]
             shell_state: None,
@@ -583,7 +583,7 @@ impl LocalTerminalActor {
         }
 
         #[cfg(unix)]
-        if self.login_shell_capture && login_env_capture_enabled() {
+        if self._login_shell_capture && login_env_capture_enabled() {
             self.ensure_static_shell_initialized(cwd).await;
             return self.spawn_static_command(command, cwd, env).await;
         }
@@ -955,7 +955,7 @@ impl LocalTerminalActor {
                 if self.persistent_shell {
                     // Cursor's persistent shell initializes lazily on first
                     // command; warming is only for the static capture path.
-                } else if self.login_shell_capture && login_env_capture_enabled() {
+                } else if self._login_shell_capture && login_env_capture_enabled() {
                     self.ensure_static_shell_initialized(&cwd).await;
                 } else if self.login_env.is_none() {
                     self.login_env = Some(capture_login_env().await);
@@ -3010,7 +3010,7 @@ fn spawn_shell_command(
     };
 
     #[cfg(not(unix))]
-    let mut build_cmd = |with_breakaway: bool| {
+    let build_cmd = |with_breakaway: bool| {
         use windows::Win32::System::Threading::{
             CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
         };

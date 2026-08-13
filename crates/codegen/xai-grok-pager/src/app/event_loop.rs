@@ -535,6 +535,7 @@ fn restore_after_child(
 /// Each attempt uses a bounded safe-handoff wait; timeout leaves the one-shot
 /// request pending, reports once, and gates the next attempt behind a deferred
 /// timer so the feedback frame cannot trigger an immediate blocking retry.
+#[allow(clippy::too_many_arguments)] // Explicit event-loop state avoids hidden globals.
 fn run_pending_suspends(
     app: &mut AppView,
     terminal: &mut PagerTerminal,

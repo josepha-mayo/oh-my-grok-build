@@ -186,7 +186,7 @@ Within the bounded receipt history, an exact retry is acknowledged without addin
 
 ### Cache-stable context and bounded self-improvement
 
-`omgb` compiles supplemental system context in a deterministic order: stable skill and taste policy first, followed by volatile recalled memory. Platform newline differences and call-site ordering do not change the stable-prefix hash. The timeline records only that SHA-256 hash and byte counts, never prompt or secret content, so cache-shape regressions can be measured without collecting user data.
+`omgb` compiles supplemental system context in a deterministic order: stable skill and taste policy first, followed by volatile recalled memory. Platform newline differences and call-site ordering do not change the stable-prefix hash. Each model attempt also derives a cache-affinity hash from the provider/model, the stable-prefix hash, the immutable provider-execution fingerprint, and normalized sandbox/tool/approval policy. Equivalent tool sets and JSON agent manifests canonicalize to the same affinity; policy or provider changes invalidate it. The timeline records only these SHA-256 hashes, byte counts, and attempt number—never prompt text, paths, policy values, or secrets—so provider-reported cached-input tokens can be compared without collecting user data.
 
 Automatic learning does not silently rewrite the harness. A qualifying trajectory creates a typed proposal:
 

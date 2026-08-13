@@ -324,6 +324,53 @@ fn config_sandbox_profile() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn cache_provider_id(model: &str) -> String {
+    model
+        .trim()
+        .strip_prefix("omgb-")
+        .map(str::to_string)
+        .or_else(|| crate::providers::resolve_model_to_provider(model))
+        .unwrap_or_else(|| "grok-native".to_string())
+}
+
+fn pager_cache_policy(args: &PagerArgs) -> crate::prompt_context::WorkspacePolicy {
+    crate::prompt_context::WorkspacePolicy {
+        sandbox_profile: config_sandbox_profile(),
+        yolo: args.yolo,
+        trust: args.trust,
+        permission_mode: args.permission_mode_flag.clone(),
+        cli_tools: args.cli_tools.clone(),
+        cli_disallowed_tools: args.cli_disallowed_tools.clone(),
+        allow_rules: args.allow_rules.clone(),
+        deny_rules: args.deny_rules.clone(),
+        disable_web_search: args.disable_web_search,
+        agent: args.agent.clone(),
+        agent_manifest_sha256: crate::prompt_context::json_content_sha256(
+            args.agents_json.as_deref(),
+        ),
+        reasoning_effort: args.reasoning_effort.clone(),
+    }
+}
+
+fn headless_cache_policy(options: &HeadlessOptions) -> crate::prompt_context::WorkspacePolicy {
+    crate::prompt_context::WorkspacePolicy {
+        sandbox_profile: config_sandbox_profile(),
+        yolo: options.yolo,
+        trust: options.trust,
+        permission_mode: options.permission_mode_flag.clone(),
+        cli_tools: options.cli_tools.clone(),
+        cli_disallowed_tools: options.cli_disallowed_tools.clone(),
+        allow_rules: options.allow_rules.clone(),
+        deny_rules: options.deny_rules.clone(),
+        disable_web_search: options.disable_web_search,
+        agent: options.agent.clone(),
+        agent_manifest_sha256: crate::prompt_context::json_content_sha256(
+            options.agents_json.as_deref(),
+        ),
+        reasoning_effort: options.reasoning_effort.clone(),
+    }
+}
+
 pub(crate) async fn run_tui(args: TuiArgs) -> Result<()> {
     let mut argv = vec!["omgb".to_string()];
     if let Some(m) = args.model {
@@ -365,7 +412,27 @@ pub(crate) async fn run_tui(args: TuiArgs) -> Result<()> {
         ],
         vec![],
     );
-    crate::prompt_context::record_cache_shape(&context);
+    let cache_model = pager_args.model.clone().or_else(|| {
+        build_agent_config(None)
+            .ok()
+            .and_then(|config| config.models.default)
+    });
+    if let Some(model) = cache_model.as_deref() {
+        let provider_fingerprint = crate::providers::provider_execution_fingerprint(model)
+            .ok()
+            .flatten();
+        if let Some(affinity) = crate::prompt_context::cache_affinity(
+            &context,
+            &cache_provider_id(model),
+            model,
+            provider_fingerprint.as_deref(),
+            pager_cache_policy(&pager_args),
+        ) {
+            crate::prompt_context::record_cache_affinity(&context, &affinity, 1);
+        }
+    } else {
+        crate::prompt_context::record_cache_shape(&context);
+    }
     pager_args.rules = context.rules;
 
     pager_run(pager_args, None).await?;
@@ -1129,8 +1196,7 @@ async fn run_single_turn_with_provider_fingerprint(
         ],
         volatile_rules,
     );
-    crate::prompt_context::record_cache_shape(&context);
-    let rules = context.rules;
+    let rules = context.rules.clone();
 
     let resume = session.resume.as_ref().filter(|s| !s.is_empty()).cloned();
     let auto_new_session =
@@ -1183,11 +1249,13 @@ async fn run_single_turn_with_provider_fingerprint(
     )?;
     crate::tool_overrides::apply_tool_overrides_to_headless_options(&overrides, &mut options)?;
 
+    let cache_policy = headless_cache_policy(&options);
     let mut last_result: Result<()> = Err(anyhow::anyhow!("no usable model candidates"));
     let mut errors: Vec<String> = Vec::new();
     let mut last_attempt_session_id = effective_session_id.clone();
-    for m in &candidates {
-        let _provider_execution_guard = match providers::prepare_provider_execution(
+    let mut last_cache_affinity = None;
+    for (attempt_index, m) in candidates.iter().enumerate() {
+        let prepared_provider = match providers::prepare_provider_execution(
             m,
             expected_provider_fingerprint.as_deref(),
         ) {
@@ -1197,6 +1265,17 @@ async fn run_single_turn_with_provider_fingerprint(
                 continue;
             }
         };
+        let cache_affinity = crate::prompt_context::cache_affinity(
+            &context,
+            &cache_provider_id(m),
+            m,
+            prepared_provider.fingerprint.as_deref(),
+            cache_policy.clone(),
+        );
+        if let Some(affinity) = cache_affinity.as_ref() {
+            crate::prompt_context::record_cache_affinity(&context, affinity, attempt_index + 1);
+            last_cache_affinity = Some(affinity.clone());
+        }
         let mut opts = options.clone();
         opts.model = Some(m.clone());
         let attempt_session_id =
@@ -1222,6 +1301,10 @@ async fn run_single_turn_with_provider_fingerprint(
                     0
                 };
                 let mut data = serde_json::json!({"tool_calls": tool_calls, "success": true});
+                if let Some(affinity) = cache_affinity.as_ref() {
+                    data["cache_affinity_sha256"] =
+                        serde_json::json!(affinity.cache_affinity_sha256);
+                }
                 if !errors.is_empty() {
                     data["errors"] = serde_json::json!(errors);
                 }
@@ -1264,6 +1347,9 @@ async fn run_single_turn_with_provider_fingerprint(
             .map(|session_id| count_chat_tool_calls(session_id, &cwd))
             .unwrap_or(0);
         let mut data = serde_json::json!({"tool_calls": tool_calls, "success": false});
+        if let Some(affinity) = last_cache_affinity.as_ref() {
+            data["cache_affinity_sha256"] = serde_json::json!(affinity.cache_affinity_sha256);
+        }
         if !errors.is_empty() {
             data["errors"] = serde_json::json!(errors);
         }

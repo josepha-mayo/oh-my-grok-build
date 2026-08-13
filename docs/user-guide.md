@@ -207,8 +207,13 @@ remove an override with `provider cost ID --reset`.
 The harness places stable skill and taste policy before volatile recalled memory
 and canonicalizes component order, whitespace, and newlines. This keeps the
 largest reusable prompt prefix byte-stable across turns. `prompt_cache` timeline
-events expose only the stable-prefix SHA-256 and stable/volatile byte counts;
-they never contain the prompt text.
+events expose only stable-prefix, workspace-policy, and cache-affinity SHA-256
+values plus stable/volatile byte counts and attempt number. The affinity binds
+the provider/model and immutable provider-execution fingerprint to normalized
+sandbox, tool, and approval policy; equivalent tool sets and JSON manifests do
+not churn it, while a policy/provider change invalidates it. Events never
+contain prompt text, paths, policy values, or secrets. Compare these events with
+the provider-reported cached-input token counters to detect cache regressions.
 
 Recursive improvement is deliberately reviewable. `omgb skill auto-create`
 generates an inactive proposal from a qualifying timeline trajectory. Inspect it
