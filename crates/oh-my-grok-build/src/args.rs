@@ -1131,10 +1131,34 @@ pub enum SkillCommand {
     List,
     /// Show a skill by name
     Show { name: String },
-    /// Suggest and write a skill from the timeline
+    /// Propose a reviewable skill refinement from the timeline
     AutoCreate {
         #[arg(short, long, default_value = "5")]
         threshold: usize,
+    },
+    /// List pending and historical harness-refinement proposals
+    Proposals,
+    /// Show a harness-refinement proposal and its candidate skill
+    Proposal { id: String },
+    /// Promote a proposed skill after deterministic validation and review
+    Approve {
+        id: String,
+        /// Confirm that the candidate should become active harness context
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Reject a proposal without changing the active harness
+    Reject {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Roll back an approved proposal if its active skill has not drifted
+    Rollback {
+        id: String,
+        /// Confirm restoration of the proposal's recorded prior state
+        #[arg(long)]
+        confirm: bool,
     },
 }
 

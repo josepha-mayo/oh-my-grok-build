@@ -154,7 +154,7 @@ keep advertising a listener that cannot accept sessions.
 | `omgb doctor` | Environment diagnostics and remediation. |
 | `omgb update --check` / `omgb update --apply` | Check for or install an attestation-verified GitHub Release update. |
 | `omgb taste` | Remember a coding-style preference. |
-| `omgb skill` | Manage auto-generated skills. |
+| `omgb skill` | Propose, review, approve, reject, and roll back evidence-backed harness refinements. |
 | `omgb commit` | Commit the current working tree. |
 | `omgb review` | Review current changes (git status + diff). |
 | `omgb undo` | Undo the last omgb commit. |
@@ -167,6 +167,22 @@ omgb thread send planner implementer "review the patch" --message-id review-patc
 ```
 
 Within the bounded receipt history, an exact retry is acknowledged without adding a second inbox item; reusing the identifier with a different sender or payload is rejected.
+
+### Cache-stable context and bounded self-improvement
+
+`omgb` compiles supplemental system context in a deterministic order: stable skill and taste policy first, followed by volatile recalled memory. Platform newline differences and call-site ordering do not change the stable-prefix hash. The timeline records only that SHA-256 hash and byte counts, never prompt or secret content, so cache-shape regressions can be measured without collecting user data.
+
+Automatic learning does not silently rewrite the harness. A qualifying trajectory creates a typed proposal:
+
+```bash
+omgb skill auto-create --threshold 5
+omgb skill proposals
+omgb skill proposal <id>
+omgb skill approve <id> --confirm
+omgb skill rollback <id> --confirm
+```
+
+The base prompt, provider credentials, tool policy, and executable code are outside this refinement path. Candidate skills are size/schema validated, content-addressed, inactive until explicit approval, and rollback uses a compare-by-hash guard so later operator edits cannot be overwritten. Interrupted approvals and rollbacks reconcile to the observed on-disk state or stop as ambiguous for manual review.
 
 ## Mobile app
 

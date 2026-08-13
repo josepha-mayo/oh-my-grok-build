@@ -108,7 +108,7 @@ When called without a command, `omgb` starts the interactive TUI.
   Record a coding-style preference.
 
 - `skill`
-  Manage auto-generated skills.
+  Manage evidence-backed harness refinements. `auto-create` writes an inactive proposal; use `proposals` and `proposal ID` to review it, `approve ID --confirm` to activate it, `reject ID` to reject it, or `rollback ID --confirm` to restore the recorded prior skill when its content hash still matches.
 
 - `commit`, `review`, `undo`
   Git helpers.

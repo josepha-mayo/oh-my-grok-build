@@ -21,13 +21,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            clippy: cargo clippy --workspace --all-targets
+            clippy: cargo clippy -p oh-my-grok-build --all-targets --no-deps -- -D warnings
             test: cargo test -p oh-my-grok-build
           - os: macos-latest
-            clippy: cargo clippy --workspace --all-targets
+            clippy: cargo clippy -p oh-my-grok-build --all-targets --no-deps -- -D warnings
             test: cargo test -p oh-my-grok-build
           - os: windows-latest
-            clippy: cargo clippy -p oh-my-grok-build --all-targets
+            clippy: cargo clippy -p oh-my-grok-build --all-targets --no-deps -- -D warnings
             test: cargo test -p oh-my-grok-build
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -163,13 +163,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: "1.92.0"
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit Rust dependencies
+        run: cargo audit

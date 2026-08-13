@@ -33,6 +33,7 @@ mod net;
 mod notifications;
 mod playbook;
 mod pr;
+mod prompt_context;
 mod prompt_guard;
 mod providers;
 mod research;
@@ -356,21 +357,16 @@ pub(crate) async fn run_tui(args: TuiArgs) -> Result<()> {
     )?;
     crate::tool_overrides::apply_tool_overrides_to_pager_args(&overrides, &mut pager_args)?;
 
-    let mut rules_parts = Vec::new();
-    if let Some(r) = pager_args.rules.take() {
-        rules_parts.push(r);
-    }
-    let skill_rules = crate::skill::skill_preamble();
-    if !skill_rules.trim().is_empty() {
-        rules_parts.push(skill_rules);
-    }
-    let taste_rules = crate::taste::taste_preamble();
-    if !taste_rules.trim().is_empty() {
-        rules_parts.push(taste_rules);
-    }
-    if !rules_parts.is_empty() {
-        pager_args.rules = Some(rules_parts.join("\n"));
-    }
+    let context = crate::prompt_context::compile(
+        vec![
+            ("00-user-rules", pager_args.rules.take().unwrap_or_default()),
+            ("10-skills", crate::skill::skill_preamble()),
+            ("20-taste", crate::taste::taste_preamble()),
+        ],
+        vec![],
+    );
+    crate::prompt_context::record_cache_shape(&context);
+    pager_args.rules = context.rules;
 
     pager_run(pager_args, None).await?;
     Ok(())
@@ -1112,7 +1108,7 @@ async fn run_single_turn_with_provider_fingerprint(
 ) -> Result<()> {
     let candidates = resolve_model_candidates(prompt, model).await?;
 
-    let mut rules_parts = Vec::new();
+    let mut volatile_rules = Vec::new();
     let mut one_shot_lease = None;
     if memory {
         let notes = crate::memory::recall(prompt, 5)?;
@@ -1123,22 +1119,18 @@ async fn run_single_turn_with_provider_fingerprint(
             .unwrap_or_default();
         let recalled = crate::memory::format_prompt_memory(notes, shots);
         if !recalled.trim().is_empty() {
-            rules_parts.push(recalled);
+            volatile_rules.push(("90-memory", recalled));
         }
     }
-    let skill_rules = crate::skill::skill_preamble();
-    if !skill_rules.is_empty() {
-        rules_parts.push(skill_rules);
-    }
-    let taste_rules = crate::taste::taste_preamble();
-    if !taste_rules.is_empty() {
-        rules_parts.push(taste_rules);
-    }
-    let rules = if rules_parts.is_empty() {
-        None
-    } else {
-        Some(rules_parts.join("\n"))
-    };
+    let context = crate::prompt_context::compile(
+        vec![
+            ("10-skills", crate::skill::skill_preamble()),
+            ("20-taste", crate::taste::taste_preamble()),
+        ],
+        volatile_rules,
+    );
+    crate::prompt_context::record_cache_shape(&context);
+    let rules = context.rules;
 
     let resume = session.resume.as_ref().filter(|s| !s.is_empty()).cloned();
     let auto_new_session =
@@ -1656,16 +1648,13 @@ async fn maybe_auto_create_skill(tool_calls: usize) {
     if threshold == 0 || tool_calls < threshold {
         return;
     }
-    match crate::skill::auto_create_skill_from_timeline(threshold).await {
-        Ok(Some(skill)) => {
-            if let Err(e) = crate::skill::write_skill(&skill) {
-                eprintln!("warning: failed to write auto-generated skill: {e}");
-            } else {
-                println!("auto-generated skill: {}", skill.name);
-            }
-        }
+    match crate::skill::propose_skill_from_timeline(threshold).await {
+        Ok(Some(proposal)) => println!(
+            "proposed harness refinement {} for skill '{}' (review with `omgb skill proposal {}`)",
+            proposal.id, proposal.candidate.name, proposal.id
+        ),
         Ok(None) => {}
-        Err(e) => eprintln!("warning: auto skill creation failed: {e}"),
+        Err(e) => eprintln!("warning: auto skill proposal failed: {e}"),
     }
 }
 
@@ -2680,12 +2669,61 @@ async fn run_skill(args: SkillArgs) -> Result<()> {
             eprintln!("skill not found: {name}");
         }
         SkillCommand::AutoCreate { threshold } => {
-            if let Some(skill) = crate::skill::auto_create_skill_from_timeline(threshold).await? {
-                crate::skill::write_skill(&skill)?;
-                println!("created skill: {}", skill.name);
+            if let Some(proposal) = crate::skill::propose_skill_from_timeline(threshold).await? {
+                println!(
+                    "proposed refinement {} for skill '{}' (not active; review then run `omgb skill approve {} --confirm`)",
+                    proposal.id, proposal.candidate.name, proposal.id
+                );
             } else {
                 println!("no suitable timeline run found");
             }
+        }
+        SkillCommand::Proposals => {
+            let proposals = crate::skill::list_proposals()?;
+            if proposals.is_empty() {
+                println!("no refinement proposals");
+            }
+            for proposal in proposals {
+                println!(
+                    "{} [{:?}] {} source={} candidate={}",
+                    proposal.id,
+                    proposal.status,
+                    proposal.candidate.name,
+                    proposal.source_sha256,
+                    proposal.candidate_sha256
+                );
+            }
+        }
+        SkillCommand::Proposal { id } => {
+            let proposal = crate::skill::load_proposal(&id)?;
+            println!(
+                "proposal {} [{:?}]\ncreated: {}\nsource sha256: {}\ncandidate sha256: {}\nnote: {}\n\n{}",
+                proposal.id,
+                proposal.status,
+                proposal.created_at.to_rfc3339(),
+                proposal.source_sha256,
+                proposal.candidate_sha256,
+                proposal.note.as_deref().unwrap_or("-"),
+                crate::skill::format_skill_markdown(&proposal.candidate)?
+            );
+        }
+        SkillCommand::Approve { id, confirm } => {
+            let proposal = crate::skill::approve_proposal(&id, confirm)?;
+            println!(
+                "activated refinement {} for skill '{}'",
+                proposal.id, proposal.candidate.name
+            );
+        }
+        SkillCommand::Reject { id, reason } => {
+            let proposal = crate::skill::reject_proposal(&id, reason)?;
+            println!("rejected refinement {}", proposal.id);
+        }
+        SkillCommand::Rollback { id, confirm } => {
+            let proposal = crate::skill::rollback_proposal(&id, confirm)?;
+            println!(
+                "rolled back refinement {} for skill '{}'",
+                proposal.id, proposal.candidate.name
+            );
         }
     }
     Ok(())

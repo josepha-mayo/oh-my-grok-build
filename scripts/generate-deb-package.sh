@@ -38,7 +38,9 @@ if find "$plugin" -type l -print -quit | grep -q .; then
   exit 1
 fi
 
-deb_version=${version/-/~}
+# Escape the replacement tilde. In Bash parameter substitution an unescaped
+# leading `~` expands to $HOME, producing an invalid path/version in CI.
+deb_version=${version/-/\~}
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 package_root="$work_dir/omgb"

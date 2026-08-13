@@ -90,7 +90,8 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 
 | Feature | Status |
 | --- | --- |
-| Self-improving / auto skill creation from completed tasks | ✅ |
+| Evidence-backed harness refinement proposals with explicit promotion, recovery, and rollback | ✅ |
+| Cache-stable supplemental prompt compilation and privacy-safe prefix-shape telemetry | ✅ |
 | LSP + DAP integration (semantic refactor, debugger attach) | ✅ |
 | Hashline / safe token-efficient edits with mismatch rejection | ✅ |
 | Persistent cross-session memory (SQLite/JSONL, hindsight, playbooks) | ✅ |

@@ -176,6 +176,7 @@ possible.
 | `omgb update` | Check for and install self-updates |
 | `omgb group` | Multi-agent group chat |
 | `omgb workflow` | Reusable agent workflows |
+| `omgb skill` | Reviewable, rollbackable supplemental harness refinements |
 | `omgb doctor` | Environment diagnostics |
 
 Enter provider API keys only in your own local terminal (for example through the one-command `OMGB_API_KEY` environment variable used by `omgb provider add`). Never paste a model-provider key into chat, a prompt, or a group message. Keyless local endpoints can be added with `omgb provider discover --add`, and Grok subscription sign-in remains optional.
@@ -185,6 +186,23 @@ estimates. Pricing and selected models change, so set the value you actually
 want used with `omgb provider cost ID USD_PER_MILLION_TOKENS` (or
 `provider add --cost-per-million VALUE`). Inspect it with `provider cost ID` and
 remove an override with `provider cost ID --reset`.
+
+## Cache-stable context and harness refinement
+
+The harness places stable skill and taste policy before volatile recalled memory
+and canonicalizes component order, whitespace, and newlines. This keeps the
+largest reusable prompt prefix byte-stable across turns. `prompt_cache` timeline
+events expose only the stable-prefix SHA-256 and stable/volatile byte counts;
+they never contain the prompt text.
+
+Recursive improvement is deliberately reviewable. `omgb skill auto-create`
+generates an inactive proposal from a qualifying timeline trajectory. Inspect it
+with `omgb skill proposal ID`, then explicitly run `omgb skill approve ID
+--confirm` or `omgb skill reject ID`. An approved proposal can be reverted with
+`omgb skill rollback ID --confirm`; rollback refuses to overwrite a skill that
+an operator changed after promotion. This mechanism cannot modify the immutable
+base prompt, provider credentials/endpoints, tool approval policy, or executable
+code.
 
 ## Slash commands in the TUI
 
