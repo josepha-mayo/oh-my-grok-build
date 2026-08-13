@@ -1215,6 +1215,28 @@ fn spawn_permission_manager_with_pin(
                                 // Live count at emit, this request included.
                                 queue_depth: Some(in_flight_actor.load(Ordering::Relaxed) as u32),
                             };
+                            let audit = xai_tool_runtime::audit::PermissionAudit {
+                                call_id: event.tool_id.clone(),
+                                tool_name: event.tool_name.clone(),
+                                access_kind: event.access_kind.clone(),
+                                access_detail_sha256: xai_tool_runtime::audit::text_sha256(
+                                    event.access_detail.as_deref(),
+                                ),
+                                yolo_mode: event.yolo_mode,
+                                auto_approved: event.auto_approved,
+                                user_prompted: event.user_prompted,
+                                decision: event.decision.clone(),
+                                prompt_outcome: event.prompt_outcome.clone(),
+                                permission_mode: event.permission_mode.clone(),
+                                decision_reason: event.decision_reason.clone(),
+                            };
+                            if let Err(error) = xai_tool_runtime::audit::record_permission(audit) {
+                                tracing::warn!(
+                                    tool_call_id = event.tool_id,
+                                    error = %error,
+                                    "failed to persist privacy-safe permission audit"
+                                );
+                            }
                             let _ = event_tx.send(event);
                         };
 

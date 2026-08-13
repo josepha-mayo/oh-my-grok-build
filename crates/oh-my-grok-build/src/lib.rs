@@ -110,12 +110,41 @@ unsafe fn load_omg_env_into_process() -> Result<()> {
     Ok(())
 }
 
+/// Provision the bounded local tool-action ledger before the runtime starts.
+/// The exact path is owned by omgb; a caller-provided environment override is
+/// deliberately ignored so tool arguments cannot be redirected to an
+/// attacker-controlled audit sink.
+fn configure_tool_audit() -> Result<()> {
+    let root = crate::providers::omg_dir()?;
+    std::fs::create_dir_all(&root)?;
+    crate::providers::restrict_omg_directory_permissions(&root)?;
+    let path = root.join("tool_actions.jsonl");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            crate::providers::restrict_omg_file_permissions(&path)?;
+        }
+        Ok(_) => bail!(
+            "tool action audit must be a regular file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::providers::write_file_atomic(&path, String::new(), true)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // SAFETY: main is still single-threaded; this runs before Tokio, signal
+    // handlers, or the tool registry starts.
+    unsafe { std::env::set_var("OMGB_TOOL_AUDIT_PATH", &path) };
+    Ok(())
+}
+
 pub fn main() -> Result<()> {
     // Load referenced BYOK keys from ~/.omgb/.env into the process environment
     // before any other thread can observe it. Upstream Grok Build resolves
     // env_key via std::env::var, so this bridge is required.
     // SAFETY: no other threads exist; this is the very first operation.
     unsafe { load_omg_env_into_process() }?;
+    configure_tool_audit()?;
 
     // omgb: opt out of upstream telemetry/feedback by default. Users can opt in
     // by setting these env vars or [features] flags in ~/.grok/config.toml.

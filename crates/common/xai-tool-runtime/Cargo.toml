@@ -8,16 +8,21 @@ description = "Unified Tool trait, dispatch trait, error taxonomy, notifications
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
+fs2 = { workspace = true }
 futures = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 tokio-util = { workspace = true }
 xai-grok-tools-api = { workspace = true }
 xai-tool-protocol = { workspace = true }
 xai-tool-types = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 
 [lints]

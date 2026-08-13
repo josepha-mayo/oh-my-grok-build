@@ -200,6 +200,10 @@ omgb skill rollback <id> --confirm
 
 The base prompt, provider credentials, tool policy, and executable code are outside this refinement path. Candidate skills are size/schema validated, content-addressed, inactive until explicit approval, and rollback uses a compare-by-hash guard so later operator edits cannot be overwritten. Interrupted approvals and rollbacks reconcile to the observed on-disk state or stop as ambiguous for manual review.
 
+### Browser/computer action evidence
+
+Every dispatched tool action is admitted through the normal permission manager and receives a stable call ID. `omgb` provisions a private, bounded `~/.omgb/tool_actions.jsonl` ledger before the runtime starts. It records the authoritative permission outcome and durable start/terminal envelopes with canonical argument/result hashes, tool taxonomy, read-only status, an idempotency key, and retry classification. Raw commands, URLs, paths, page content, screenshots, DOM/accessibility data, and tool output are not written to the ledger. An interrupted read-only action is classified as safe to retry; an interrupted mutating browser/computer/filesystem action remains ambiguous until its postcondition is reconciled. If the start record cannot be synced, the tool is not executed.
+
 ## Mobile app
 
 A separate React Native + Expo mobile app lives in the `grok-build-app` repository. The `omgb serve` QR includes the harness's absolute working directory so the app can create a valid ACP session on both Windows and Unix without guessing a path.

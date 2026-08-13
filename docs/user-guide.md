@@ -224,6 +224,19 @@ an operator changed after promotion. This mechanism cannot modify the immutable
 base prompt, provider credentials/endpoints, tool approval policy, or executable
 code.
 
+## Browser and computer action audit
+
+Before starting the runtime, `omgb` creates a private bounded tool ledger at
+`~/.omgb/tool_actions.jsonl`. Permission decisions and tool execution are
+correlated by the model's stable call ID. Each action stores only canonical
+argument/result SHA-256 values, tool kind, read-only status, an idempotency key,
+permission outcome, terminal evidence class, and retry class. It never stores
+raw commands, URLs, paths, page text, screenshots, accessibility trees, or tool
+output. If the durable start record cannot be synced, execution fails closed.
+After an interrupted result, read-only calls may be retried; mutating browser,
+computer, shell, and filesystem calls are marked ambiguous and require a state
+check before retry.
+
 ## Slash commands in the TUI
 
 The TUI and mobile app support these slash commands:

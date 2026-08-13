@@ -361,6 +361,11 @@ struct DispatchParts {
     output_converter: OutputConverter,
     /// `use_tool` target tool name, surfaced in the final `ToolRunResult`.
     effective_tool_name: Option<String>,
+    /// Canonical taxonomy used by the local audit/retry contract.
+    tool_kind: ToolKind,
+    /// Read-only calls are safe to retry after an interrupted result; mutating
+    /// calls remain ambiguous until their postcondition is reconciled.
+    read_only: bool,
 }
 /// Per-tool metadata + instance stored in the builder.
 ///
@@ -1479,22 +1484,179 @@ impl FinalizedToolset {
         let tool_name = tool_name.to_owned();
         let tool_call_id = tool_call_id.to_owned();
         Box::pin(async_stream::stream! {
-            let parts = match this.prepare_dispatch(& tool_name, tool_args, &
-            tool_call_id, cwd_override,) { Ok(parts) => parts, Err(e) => { yield
-            xai_tool_runtime::ToolStreamItem::Terminal(Err(e)); return; } }; let
-            DispatchParts { lr_handle, ctx, canonical_params, output_converter,
-            effective_tool_name, } = parts; let mut inner = lr_handle.execute(ctx,
-            canonical_params). await; while let Some(item) = inner.next(). await {
-            match item { xai_tool_runtime::ToolStreamItem::Progress(p) => { yield
-            xai_tool_runtime::ToolStreamItem::Progress(p); }
-            xai_tool_runtime::ToolStreamItem::Terminal(Err(e)) => { yield
-            xai_tool_runtime::ToolStreamItem::Terminal(Err(e)); return; }
-            xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => { let run_result
-            = this.finalize_output(typed.value, & output_converter,
-            effective_tool_name). await; yield
-            xai_tool_runtime::ToolStreamItem::Terminal(run_result); return; } } }
-            yield
-            xai_tool_runtime::ToolStreamItem::Terminal(Err(stream_no_terminal_error()));
+            let parts = match this.prepare_dispatch(
+                &tool_name,
+                tool_args,
+                &tool_call_id,
+                cwd_override,
+            ) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    yield xai_tool_runtime::ToolStreamItem::Terminal(Err(error));
+                    return;
+                }
+            };
+            let DispatchParts {
+                lr_handle,
+                ctx,
+                canonical_params,
+                output_converter,
+                effective_tool_name,
+                tool_kind,
+                read_only,
+            } = parts;
+            let args_sha256 = xai_tool_runtime::audit::canonical_json_sha256(&canonical_params);
+            let idempotency_key = xai_tool_runtime::audit::idempotency_key(
+                &tool_call_id,
+                &tool_name,
+                &args_sha256,
+            );
+            let retry_class = if read_only {
+                "safe_read_only"
+            } else {
+                "ambiguous_if_interrupted"
+            };
+            let start_record = xai_tool_runtime::audit::ToolActionAudit {
+                phase: "started",
+                call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                tool_kind: tool_kind.as_key().to_string(),
+                read_only,
+                args_sha256: args_sha256.clone(),
+                idempotency_key: idempotency_key.clone(),
+                policy_decision: "allowed_upstream",
+                outcome: "pending",
+                retry_class,
+                postcondition: None,
+                evidence_sha256: None,
+            };
+            if let Err(error) = xai_tool_runtime::audit::record_tool_action(start_record).await {
+                yield xai_tool_runtime::ToolStreamItem::Terminal(Err(
+                    xai_tool_runtime::ToolError::custom(
+                        "audit_unavailable",
+                        format!(
+                            "tool action was not started because its durable audit record failed: {error}"
+                        ),
+                    ),
+                ));
+                return;
+            }
+            let mut inner = lr_handle.execute(ctx, canonical_params).await;
+            while let Some(item) = inner.next().await {
+                match item {
+                    xai_tool_runtime::ToolStreamItem::Progress(progress) => {
+                        yield xai_tool_runtime::ToolStreamItem::Progress(progress);
+                    }
+                    xai_tool_runtime::ToolStreamItem::Terminal(Err(error)) => {
+                        let evidence = serde_json::json!({
+                            "kind": error.kind.as_str(),
+                            "detail": error.detail.clone(),
+                        });
+                        let record = xai_tool_runtime::audit::ToolActionAudit {
+                            phase: "terminal",
+                            call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_kind: tool_kind.as_key().to_string(),
+                            read_only,
+                            args_sha256: args_sha256.clone(),
+                            idempotency_key: idempotency_key.clone(),
+                            policy_decision: "allowed_upstream",
+                            outcome: "failed",
+                            retry_class,
+                            postcondition: Some("tool_error_observed"),
+                            evidence_sha256: Some(
+                                xai_tool_runtime::audit::canonical_json_sha256(&evidence),
+                            ),
+                        };
+                        if let Err(audit_error) =
+                            xai_tool_runtime::audit::record_tool_action(record).await
+                        {
+                            yield xai_tool_runtime::ToolStreamItem::Terminal(Err(
+                                xai_tool_runtime::ToolError::custom(
+                                    "audit_outcome_ambiguous",
+                                    format!(
+                                        "tool failed, but its terminal audit record could not be persisted; do not retry mutating actions automatically (call {tool_call_id}): {audit_error}"
+                                    ),
+                                ),
+                            ));
+                            return;
+                        }
+                        yield xai_tool_runtime::ToolStreamItem::Terminal(Err(error));
+                        return;
+                    }
+                    xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
+                        let evidence_sha256 =
+                            xai_tool_runtime::audit::canonical_json_sha256(&typed.value);
+                        let run_result = this
+                            .finalize_output(
+                                typed.value,
+                                &output_converter,
+                                effective_tool_name,
+                            )
+                            .await;
+                        let (outcome, postcondition) = if run_result.is_ok() {
+                            ("succeeded", "tool_terminal_result_observed")
+                        } else {
+                            ("failed", "tool_output_conversion_failed")
+                        };
+                        let record = xai_tool_runtime::audit::ToolActionAudit {
+                            phase: "terminal",
+                            call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_kind: tool_kind.as_key().to_string(),
+                            read_only,
+                            args_sha256: args_sha256.clone(),
+                            idempotency_key: idempotency_key.clone(),
+                            policy_decision: "allowed_upstream",
+                            outcome,
+                            retry_class,
+                            postcondition: Some(postcondition),
+                            evidence_sha256: Some(evidence_sha256),
+                        };
+                        if let Err(audit_error) =
+                            xai_tool_runtime::audit::record_tool_action(record).await
+                        {
+                            yield xai_tool_runtime::ToolStreamItem::Terminal(Err(
+                                xai_tool_runtime::ToolError::custom(
+                                    "audit_outcome_ambiguous",
+                                    format!(
+                                        "tool result was observed, but its terminal audit record could not be persisted; do not retry mutating actions automatically (call {tool_call_id}): {audit_error}"
+                                    ),
+                                ),
+                            ));
+                            return;
+                        }
+                        yield xai_tool_runtime::ToolStreamItem::Terminal(run_result);
+                        return;
+                    }
+                }
+            }
+            let record = xai_tool_runtime::audit::ToolActionAudit {
+                phase: "terminal",
+                call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                tool_kind: tool_kind.as_key().to_string(),
+                read_only,
+                args_sha256,
+                idempotency_key,
+                policy_decision: "allowed_upstream",
+                outcome: "failed",
+                retry_class,
+                postcondition: Some("dispatch_stream_ended_without_terminal"),
+                evidence_sha256: None,
+            };
+            if let Err(audit_error) = xai_tool_runtime::audit::record_tool_action(record).await {
+                yield xai_tool_runtime::ToolStreamItem::Terminal(Err(
+                    xai_tool_runtime::ToolError::custom(
+                        "audit_outcome_ambiguous",
+                        format!(
+                            "tool dispatch ended without a result and its audit record failed; do not retry mutating actions automatically (call {tool_call_id}): {audit_error}"
+                        ),
+                    ),
+                ));
+                return;
+            }
+            yield xai_tool_runtime::ToolStreamItem::Terminal(Err(stream_no_terminal_error()));
         })
     }
     /// Pre-dispatch setup shared by [`call`] / [`call_streaming`].
@@ -1510,16 +1672,19 @@ impl FinalizedToolset {
         tool_call_id: &str,
         cwd_override: Option<std::path::PathBuf>,
     ) -> Result<DispatchParts, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (registry_id, output_converter, reverse_params, tool_kind, read_only) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
                 .find(|t| t.client_name == tool_name)
                 .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
+            let identity = crate::normalization::tool_identity_of(entry.metadata.as_ref());
             (
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
+                identity.tool_kind,
+                identity.read_only,
             )
         };
         let canonical_params = if reverse_params.is_empty() {
@@ -1571,6 +1736,8 @@ impl FinalizedToolset {
             canonical_params,
             output_converter,
             effective_tool_name,
+            tool_kind,
+            read_only,
         })
     }
     /// Post-dispatch tail shared by [`call`] / [`call_streaming`].
