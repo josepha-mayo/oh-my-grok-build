@@ -558,6 +558,7 @@ const RELAY_CAPABILITIES: &[&str] = &[
     "group.dispatch.status.v1",
     "group.history.cursor.v1",
     "group.join.ack.v1",
+    "group.message.envelope.v2",
     "relay.status.v1",
     "voice.pcm.v1",
 ];
@@ -1239,7 +1240,33 @@ struct GroupMessagePayload {
     content: String,
     kind: crate::group::MessageKind,
     #[serde(default)]
+    message_class: crate::group::MessageClass,
+    #[serde(default)]
     client_message_id: Option<String>,
+}
+
+fn canonical_member_message_kind(
+    kind: crate::group::MessageKind,
+) -> std::result::Result<crate::group::MessageKind, &'static str> {
+    match kind {
+        crate::group::MessageKind::Human | crate::group::MessageKind::User => {
+            Ok(crate::group::MessageKind::Human)
+        }
+        crate::group::MessageKind::Agent => {
+            Err("members cannot submit messages with agent identity")
+        }
+    }
+}
+
+fn validate_member_message_class(
+    message_class: crate::group::MessageClass,
+    is_host: bool,
+) -> std::result::Result<(), &'static str> {
+    if message_class == crate::group::MessageClass::Approval && !is_host {
+        Err("only the group host can issue approval-class messages")
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -1673,6 +1700,13 @@ async fn group_post_message_handler(
         ));
     }
     let content = payload.content.trim().to_string();
+    let message_kind = canonical_member_message_kind(payload.kind)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.to_string()))?;
+    validate_member_message_class(
+        payload.message_class,
+        crate::group::is_host_member_token(&group, &token),
+    )
+    .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     crate::group::validate_message_content(&content).map_err(|e| {
         let status = if content.len() > crate::group::MAX_GROUP_MESSAGE_BYTES {
             StatusCode::PAYLOAD_TOO_LARGE
@@ -1700,15 +1734,14 @@ async fn group_post_message_handler(
         ));
     }
     let message_id = client_message_id.clone();
-    let message = crate::group::GroupMessage {
-        id: message_id,
-        timestamp: Utc::now(),
+    let message = crate::group::GroupMessage::root(
+        message_id,
         sender,
         content,
-        kind: payload.kind,
-        client_message_id: Some(client_message_id),
-        reply_to: None,
-    };
+        message_kind,
+        payload.message_class,
+        Some(client_message_id),
+    );
     crate::group::persist_and_queue_message_async(&id, &message, &message.sender)
         .await
         .map_err(|error| {
@@ -2301,6 +2334,8 @@ struct RemoteAgentMessagePayload {
     message_id: Option<String>,
     #[serde(default)]
     reply_to: Option<String>,
+    #[serde(default)]
+    message_class: Option<crate::group::MessageClass>,
 }
 
 fn required_remote_agent_message_id(
@@ -2403,15 +2438,35 @@ async fn group_remote_agent_message_handler(
         ));
     }
 
-    let message = crate::group::GroupMessage {
-        id: message_id.clone(),
-        timestamp: Utc::now(),
-        sender: agent_name.clone(),
+    let message_class = payload
+        .message_class
+        .unwrap_or(crate::group::MessageClass::Evidence);
+    if message_class == crate::group::MessageClass::Approval {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "agents cannot issue approval-class messages".to_string(),
+        ));
+    }
+    let mut message = crate::group::GroupMessage::root(
+        message_id.clone(),
+        agent_name.clone(),
         content,
-        kind: crate::group::MessageKind::Agent,
-        client_message_id: Some(message_id),
-        reply_to,
-    };
+        crate::group::MessageKind::Agent,
+        message_class,
+        Some(message_id),
+    );
+    if let Some(parent_id) = reply_to {
+        let parent = crate::group::load_messages_async(&id)
+            .await
+            .ok()
+            .and_then(|messages| messages.into_iter().find(|item| item.id == parent_id));
+        if let Some(parent) = parent {
+            message.trace_id = Some(parent.trace_id.unwrap_or_else(|| parent.id.clone()));
+        } else {
+            message.trace_id = Some(parent_id.clone());
+        }
+        message.reply_to = Some(parent_id);
+    }
     crate::group::persist_and_queue_message_async(&id, &message, &agent_name)
         .await
         .map_err(|error| {
@@ -3316,12 +3371,34 @@ mod tests {
         assert_eq!(response.api_version, RELAY_API_VERSION);
         assert!(response.capabilities.contains(&"acp.session.resume"));
         assert!(response.capabilities.contains(&"group.join.ack.v1"));
+        assert!(response.capabilities.contains(&"group.message.envelope.v2"));
         assert!(response.capabilities.contains(&"relay.status.v1"));
         assert_eq!(
             response.limits.group_message_bytes,
             crate::group::MAX_GROUP_MESSAGE_BYTES
         );
         assert_eq!(response.limits.group_message_page, MAX_GROUP_MESSAGE_PAGE);
+    }
+
+    #[test]
+    fn group_member_ingress_cannot_claim_agent_identity() {
+        assert_eq!(
+            canonical_member_message_kind(crate::group::MessageKind::User).unwrap(),
+            crate::group::MessageKind::Human
+        );
+        assert_eq!(
+            canonical_member_message_kind(crate::group::MessageKind::Human).unwrap(),
+            crate::group::MessageKind::Human
+        );
+        assert!(
+            canonical_member_message_kind(crate::group::MessageKind::Agent).is_err(),
+            "agent identity is reserved for authenticated agent ingress"
+        );
+        assert!(
+            validate_member_message_class(crate::group::MessageClass::Approval, false).is_err()
+        );
+        assert!(validate_member_message_class(crate::group::MessageClass::Approval, true).is_ok());
+        assert!(validate_member_message_class(crate::group::MessageClass::Evidence, false).is_ok());
     }
 
     #[tokio::test]

@@ -117,6 +117,13 @@ pairing secrets, provider credentials, prompts, paths, or group contents.
 The relay exits if its embedded ACP agent stops, so a service manager does not
 keep advertising a listener that cannot accept sessions.
 
+Group messages use a versioned v2 envelope with a stable idempotency ID, causal
+parent, root trace ID, authenticated sender kind, and a typed class
+(`conversation`, `task`, `evidence`, `decision`, `critique`, or `approval`).
+Only the authenticated group host can submit approval-class messages; member
+ingress cannot claim agent identity. Older archived messages remain readable as v1
+conversation envelopes.
+
 ## Configuration
 
 - `~/.grok/config.toml` — Grok Build configuration.

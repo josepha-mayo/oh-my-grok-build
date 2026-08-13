@@ -93,6 +93,7 @@ Legend: `✅` verified in Rust, `🚧` in progress, `⏳` planned, `N/A` out of 
 | --- | --- |
 | Evidence-backed harness refinement proposals with explicit promotion, recovery, and rollback | ✅ |
 | Cache-stable supplemental prompt compilation and privacy-safe prefix-shape telemetry | ✅ |
+| Group protocol v2 typed envelopes, causal trace propagation, and human-only approvals | ✅ |
 | LSP + DAP integration (semantic refactor, debugger attach) | ✅ |
 | Hashline / safe token-efficient edits with mismatch rejection | ✅ |
 | Persistent cross-session memory (SQLite/JSONL, hindsight, playbooks) | ✅ |

@@ -135,6 +135,14 @@ the documented upstream `grok serve` ACP-only path available, but a malformed or
 incompatible advertised OMGB contract fails with one compatibility error rather
 than later protocol failures.
 
+The `group.message.envelope.v2` capability adds a stable root trace and typed
+message classes to the existing durable group IDs, causal replies, dispatch
+status, and reconnect paging. The mobile composer lets humans label a message
+as conversation, task, evidence, decision, or critique; the group host also
+gets approval. Agent messages can contribute evidence and critique, but the
+relay rejects an agent or non-host member attempt to issue an approval-class
+message and rejects a member attempt to impersonate an agent.
+
 `GET /status` is an authenticated operator endpoint. Send the relay pairing
 secret in `x-server-token` to receive bounded uptime, connection-capacity,
 local hosted-dispatch, rate-limit, version, and API-version fields. The response
