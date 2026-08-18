@@ -1066,6 +1066,7 @@ pub struct UseArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct BrowserArgs {
+    #[arg(default_value = "")]
     pub prompt: String,
     #[arg(short, long)]
     pub model: Option<String>,
@@ -1079,6 +1080,18 @@ pub struct BrowserArgs {
     /// Allow the starting URL to point to private/LAN addresses
     #[arg(long)]
     pub allow_private: bool,
+    /// Install and configure the pinned official Playwright MCP adapter
+    #[arg(long)]
+    pub setup: bool,
+    /// Replace an existing user-scoped `playwright` MCP definition during setup
+    #[arg(long, requires = "setup")]
+    pub force_setup: bool,
+    /// Configure Playwright to run without a visible browser window
+    #[arg(long, requires = "setup")]
+    pub headless: bool,
+    /// Configure Playwright with a fresh non-persistent profile per session
+    #[arg(long, requires = "setup")]
+    pub isolated: bool,
 }
 
 #[derive(Debug, Args, Clone)]

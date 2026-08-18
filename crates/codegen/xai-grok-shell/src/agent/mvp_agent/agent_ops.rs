@@ -2813,6 +2813,15 @@ impl MvpAgent {
                 agent_name = % name,
                 "Resolving agent definition from config.toml [agent] name"
             );
+            // These capability profiles are security boundaries, not merely
+            // personas. A project-local definition with the same name must
+            // not replace their curated toolset or MCP inheritance contract.
+            if name == "browser-use" || name == "browser_use" {
+                return AgentDefinition::browser_use();
+            }
+            if name == "computer-use" || name == "computer_use" {
+                return AgentDefinition::computer_use();
+            }
             if let Some(def) = xai_grok_agent::discovery::by_name_in_cwd(name, cwd) {
                 return def;
             }
@@ -2825,6 +2834,7 @@ impl MvpAgent {
         let agent_name = std::env::var("GROK_AGENT").ok();
         let resolved = match agent_name.as_deref() {
             Some("browser-use") | Some("browser_use") => AgentDefinition::browser_use(),
+            Some("computer-use") | Some("computer_use") => AgentDefinition::computer_use(),
             Some("grok-build-concise") | Some("grok_build_concise") => {
                 AgentDefinition::grok_build_concise()
             }

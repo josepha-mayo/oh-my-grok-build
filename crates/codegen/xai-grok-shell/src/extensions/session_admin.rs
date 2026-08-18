@@ -313,6 +313,27 @@ async fn soft_delete_chat_conversation(agent: &MvpAgent, conversation_id: &str) 
 
 // session/update_mcp_servers
 
+fn filter_mcp_servers_for_session(
+    servers: Vec<acp::McpServer>,
+    handle: &crate::session::SessionHandle,
+    cwd: &std::path::Path,
+) -> Vec<acp::McpServer> {
+    let definition = match handle.agent_name.as_str() {
+        "browser-use" | "browser_use" => xai_grok_agent::AgentDefinition::browser_use(),
+        "computer-use" | "computer_use" => xai_grok_agent::AgentDefinition::computer_use(),
+        name => {
+            let Some(definition) = xai_grok_agent::discovery::by_name_in_cwd(name, cwd) else {
+                return servers;
+            };
+            definition
+        }
+    };
+    crate::session::managed_mcp::filter_mcp_servers_by_inheritance(
+        servers,
+        &definition.mcp_inheritance,
+    )
+}
+
 async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -341,6 +362,7 @@ async fn handle_update_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequest) -> 
         agent.plugin_registry_handle().snapshot().as_deref(),
         &agent.cfg.borrow().compat_resolved,
     );
+    let merged = filter_mcp_servers_for_session(merged, &handle, &cwd);
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     handle
@@ -422,6 +444,7 @@ async fn handle_reload_all_mcp_servers(agent: &MvpAgent) -> ExtResult {
             agent.plugin_registry_handle().snapshot().as_deref(),
             &compat,
         );
+        let merged = filter_mcp_servers_for_session(merged, &handle, &cwd);
 
         let (tx, _rx) = tokio::sync::oneshot::channel();
         if handle
@@ -500,6 +523,7 @@ async fn handle_reload_project_mcp_servers(agent: &MvpAgent, args: &acp::ExtRequ
             agent.plugin_registry_handle().snapshot().as_deref(),
             &agent.cfg.borrow().compat_resolved,
         );
+        let merged = filter_mcp_servers_for_session(merged, &handle, cwd);
 
         let (tx, _rx) = tokio::sync::oneshot::channel();
         if handle

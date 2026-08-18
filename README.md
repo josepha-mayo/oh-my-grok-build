@@ -60,6 +60,17 @@ omgb provider cost openai 2.50 # optional routing override; no key or network pr
 omgb exec "write a rust fibonacci" --model omgb-openai
 ```
 
+OpenCode Zen is available as a first-class template and defaults to its free
+`hy3-free` model. Its key is accepted only through the
+transient setup environment and is stored in the private OMGB environment file,
+never in provider JSON or Git:
+
+```bash
+OMGB_API_KEY="$OPENCODE_ZEN_API_KEY" omgb provider add opencode-zen --default
+omgb provider test opencode-zen
+omgb exec "reply exactly ZEN_OK" --model omgb-opencode-zen
+```
+
 Provider addition validates the configured model against the endpoint's live
 `/models` response before persisting the provider. `provider test` repeats that
 model-specific authorization check; for compatible endpoints without a models
@@ -172,7 +183,7 @@ conversation envelopes.
 | `omgb playbook` | Run deterministic CI playbooks. |
 | `omgb workflow run|list|show|new|create` | Run YAML/JSON workflows with exec/fan_out/shell steps. |
 | `omgb group` | Multi-agent group chat with humans and agents. |
-| `omgb use` / `omgb browser` | Computer / browser use (gated by `--yolo` or `OMGB_ALLOW_DESKTOP_CONTROL=1`). |
+| `omgb use` / `omgb browser` | Capability-scoped computer / browser use through explicit MCP adapters; both `--yolo` and `OMGB_ALLOW_DESKTOP_CONTROL=1` are required. |
 | `omgb mcp` | Manage MCP servers. |
 | `omgb doctor` | Environment diagnostics and remediation. |
 | `omgb update --check` / `omgb update --apply` | Check for or install an attestation-verified GitHub Release update. |
@@ -239,7 +250,10 @@ npx expo start
 
 - Provider API keys are written to `~/.omgb/.env` with `0600` permissions on Unix.
 - Outgoing HTTP requests are pinned to resolved public IPs and redirects are disabled to mitigate SSRF.
-- `omgb use` and `omgb browser` require explicit desktop-control gating (`--yolo` and `OMGB_ALLOW_DESKTOP_CONTROL=1`).
+- `omgb browser --setup` verifies and installs the pinned official Microsoft Playwright MCP adapter. Add `--headless` and/or `--isolated` during setup when desired; an existing `playwright` definition is never replaced unless `--force-setup` is explicit.
+- `omgb use` requires a platform-specific MCP server named `computer`, configured with `omgb mcp add computer -- <adapter-command> [args...]`. The command fails closed when no enabled adapter is present; it never falls back to shell commands while claiming desktop control.
+- `omgb use` and `omgb browser` require both explicit gates: `--yolo` and `OMGB_ALLOW_DESKTOP_CONTROL=1`. Their strict profiles expose only MCP discovery/invocation and only inherit `computer` or `playwright`, respectively—no filesystem, shell, skills, subagents, or unrelated connectors.
+- Browser and computer prompts treat visible/page content as untrusted data, require observation before mutation and postcondition evidence afterward, and stop at unexpected authentication, purchases, uploads, account/security changes, destructive actions, or origin changes not explicitly authorized by the user.
 - Shell commands passed through Grok's `run_terminal_cmd` are validated by `plugin/bin/safe-shell-guard`.
 - Telemetry and upstream feedback are disabled by default; use `omgb feedback` to submit issues via GitHub.
 

@@ -850,6 +850,16 @@ pub(crate) const TEMPLATES: &[ProviderTemplate] = &[
         api_backend: Some("responses"),
     },
     ProviderTemplate {
+        id: "opencode-zen",
+        name: "OpenCode Zen",
+        model: "hy3-free",
+        base_url: "https://opencode.ai/zen/v1",
+        env_key: Some("OPENCODE_ZEN_API_KEY"),
+        extra_headers: None,
+        context_window: Some(128_000),
+        api_backend: Some("chat_completions"),
+    },
+    ProviderTemplate {
         id: "ollama",
         name: "Ollama (local)",
         model: "codellama",
@@ -918,6 +928,7 @@ mod tests {
     fn catalog_contains_expected_providers() {
         for id in &[
             "openai",
+            "opencode-zen",
             "anthropic",
             "xai",
             "openrouter",
@@ -967,6 +978,7 @@ mod tests {
     fn primary_provider_defaults_use_their_verified_wire_protocols() {
         for (id, model, backend) in [
             ("openai", "gpt-5.6", "responses"),
+            ("opencode-zen", "hy3-free", "chat_completions"),
             ("anthropic", "claude-sonnet-5", "messages"),
             ("xai", "grok-4.6", "chat_completions"),
             (

@@ -97,8 +97,8 @@ pub(crate) async fn spawn_session_actor(
     auth_manager: Option<Arc<AuthManager>>,
     attribution_callback: Option<xai_grok_sampler::SharedAttributionCallback>,
     mut tool_context: ToolContext,
-    mcp_servers: Vec<acp::McpServer>,
-    initial_client_mcp_servers: Vec<acp::McpServer>,
+    mut mcp_servers: Vec<acp::McpServer>,
+    mut initial_client_mcp_servers: Vec<acp::McpServer>,
     mcp_meta_config_map: McpMetaConfigMap,
     parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
     acp_mcp_servers: Vec<crate::session::mcp_servers::AcpServerEntry>,
@@ -204,6 +204,14 @@ pub(crate) async fn spawn_session_actor(
     ),
     xai_grok_agent::AgentBuildError,
 > {
+    mcp_servers = crate::session::managed_mcp::filter_mcp_servers_by_inheritance(
+        mcp_servers,
+        &agent_definition.mcp_inheritance,
+    );
+    initial_client_mcp_servers = crate::session::managed_mcp::filter_mcp_servers_by_inheritance(
+        initial_client_mcp_servers,
+        &agent_definition.mcp_inheritance,
+    );
     if max_turns == Some(0) {
         return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
             "max_turns must be greater than 0".to_string(),

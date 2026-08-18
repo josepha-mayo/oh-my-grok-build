@@ -22,6 +22,7 @@
 //! hot-reload skips it.
 
 use super::*;
+use crate::agent::config::AgentDefinition;
 
 /// Max wait for a GUI client's trust decision before giving up (fail-closed).
 /// Generous because it is a human decision, but bounds the detached task so a
@@ -141,6 +142,7 @@ impl MvpAgent {
                 cmd_tx: h.cmd_tx.clone(),
                 initial_client_mcp_servers: h.initial_client_mcp_servers.clone(),
                 cwd: PathBuf::from(&h.info.cwd),
+                agent_name: h.agent_name.clone(),
             })
             .collect();
         if targets.is_empty() {
@@ -282,6 +284,7 @@ struct ReloadTarget {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<crate::session::SessionCommand>,
     initial_client_mcp_servers: Vec<acp::McpServer>,
     cwd: PathBuf,
+    agent_name: String,
 }
 
 /// Inputs for [`reload_project_servers_after_grant`], bundled to keep the
@@ -340,6 +343,19 @@ async fn reload_project_servers_after_grant(ctx: ReloadAfterGrant<'_>) {
             plugin_snapshot.as_deref(),
             ctx.compat,
         );
+        let definition = match target.agent_name.as_str() {
+            "browser-use" | "browser_use" => Some(AgentDefinition::browser_use()),
+            "computer-use" | "computer_use" => Some(AgentDefinition::computer_use()),
+            name => xai_grok_agent::discovery::by_name_in_cwd(name, session_cwd),
+        };
+        let merged = if let Some(definition) = definition {
+            crate::session::managed_mcp::filter_mcp_servers_by_inheritance(
+                merged,
+                &definition.mcp_inheritance,
+            )
+        } else {
+            merged
+        };
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let _ = target
             .cmd_tx

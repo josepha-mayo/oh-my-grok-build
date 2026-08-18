@@ -85,6 +85,28 @@ pub(crate) fn mcp_server_name(s: &acp::McpServer) -> &str {
     }
 }
 
+/// Apply an agent profile's MCP inheritance contract to a concrete server
+/// list. This is used for top-level sessions as well as subagents so a
+/// capability-specific profile cannot see unrelated configured connectors.
+pub(crate) fn filter_mcp_servers_by_inheritance(
+    servers: Vec<acp::McpServer>,
+    inheritance: &xai_grok_agent::config::McpInheritance,
+) -> Vec<acp::McpServer> {
+    use xai_grok_agent::config::McpInheritance;
+    match inheritance {
+        McpInheritance::All => servers,
+        McpInheritance::None => Vec::new(),
+        McpInheritance::Named(names) => servers
+            .into_iter()
+            .filter(|server| names.iter().any(|name| name == mcp_server_name(server)))
+            .collect(),
+        McpInheritance::Except(names) => servers
+            .into_iter()
+            .filter(|server| !names.iter().any(|name| name == mcp_server_name(server)))
+            .collect(),
+    }
+}
+
 pub fn merge_managed_mcp_servers(
     client_mcp_servers: Vec<acp::McpServer>,
     cwd: &std::path::Path,
@@ -495,6 +517,34 @@ pub fn merge_plugin_oauth_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stdio(name: &str) -> acp::McpServer {
+        acp::McpServer::Stdio(acp::McpServerStdio::new(name, "adapter"))
+    }
+
+    #[test]
+    fn agent_mcp_inheritance_scopes_top_level_connectors() {
+        use xai_grok_agent::config::McpInheritance;
+        let servers = vec![stdio("playwright"), stdio("github"), stdio("computer")];
+        let named = filter_mcp_servers_by_inheritance(
+            servers.clone(),
+            &McpInheritance::Named(vec!["playwright".into()]),
+        );
+        assert_eq!(named.len(), 1);
+        assert_eq!(mcp_server_name(&named[0]), "playwright");
+
+        let except = filter_mcp_servers_by_inheritance(
+            servers.clone(),
+            &McpInheritance::Except(vec!["github".into()]),
+        );
+        assert_eq!(except.len(), 2);
+        assert!(
+            except
+                .iter()
+                .all(|server| mcp_server_name(server) != "github")
+        );
+        assert!(filter_mcp_servers_by_inheritance(servers, &McpInheritance::None).is_empty());
+    }
 
     fn make_managed(name: &str, endpoint: &str, scope: &str) -> ManagedMcpConfig {
         ManagedMcpConfig {
