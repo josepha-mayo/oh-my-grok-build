@@ -25,7 +25,7 @@ impl ApiBackend {
     name = "oh-my-grok-build",
     about = "Oh My Grok Build harness",
     version,
-    after_help = "Plugin slash commands in the TUI:\n  /autonomous, /browser, /btw, /byok, /create-workflow, /dream, /group, /live, /loop, /plan, /recap, /research, /schedule, /taste, /use, /voice, /workflow, /yolo"
+    after_help = "Plugin slash commands in the TUI:\n  /autonomous, /browser, /btw, /byok, /create-workflow, /dream, /group, /live, /local, /loop, /plan, /recap, /research, /schedule, /taste, /use, /voice, /workflow, /yolo"
 )]
 pub struct OmgbArgs {
     #[command(subcommand)]
@@ -266,7 +266,7 @@ pub enum ProviderCommand {
         #[arg(long)]
         reset: bool,
     },
-    /// Discover local models (Ollama / LM Studio / vLLM / SGLang / llama.cpp)
+    /// Discover models from every known/configured local OpenAI-compatible endpoint
     Discover(DiscoverArgs),
     /// Test a provider's connectivity
     Test { id: String },
@@ -320,6 +320,12 @@ pub struct DiscoverArgs {
     pub sglang_url: Option<String>,
     #[arg(long)]
     pub llama_cpp_url: Option<String>,
+    /// Additional OpenAI-compatible local base URL; repeat for multiple servers
+    #[arg(long = "url", value_name = "URL")]
+    pub urls: Vec<String>,
+    /// Display every discovered model, choose one interactively, add it, and make it default
+    #[arg(long)]
+    pub select: bool,
     #[arg(long)]
     pub add: bool,
 }

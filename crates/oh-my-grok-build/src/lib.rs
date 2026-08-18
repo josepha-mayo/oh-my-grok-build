@@ -2235,11 +2235,40 @@ async fn run_provider(args: ProviderArgs) -> Result<()> {
         }
         ProviderCommand::Discover(discover_args) => {
             let found = discover_local_models(&discover_args).await?;
-            for (provider, _url, models) in &found {
-                let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-                println!("{provider}: {}", ids.join(", "));
+            let choices: Vec<_> = found
+                .iter()
+                .flat_map(|(provider, url, models)| {
+                    models.iter().map(move |model| (provider, url, model))
+                })
+                .collect();
+            if choices.is_empty() {
+                println!("no local OpenAI-compatible models discovered");
+            } else {
+                for (index, (provider, url, model)) in choices.iter().enumerate() {
+                    println!("{:>3}. {}  [{}]  {}", index + 1, model.id, provider, url);
+                }
             }
-            if discover_args.add {
+            if discover_args.select {
+                use std::io::Write;
+                if choices.is_empty() {
+                    bail!("no local models are available to select");
+                }
+                print!("Select local model [1-{}]: ", choices.len());
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let selected = input.trim().parse::<usize>().unwrap_or(1);
+                if selected == 0 || selected > choices.len() {
+                    bail!("selection must be between 1 and {}", choices.len());
+                }
+                let (provider, url, model) = choices[selected - 1];
+                let selected_found =
+                    vec![((*provider).clone(), (*url).clone(), vec![model.clone()])];
+                add_discovered_providers(&selected_found)?;
+                let id = providers::discovered_provider_id(provider, &model.id);
+                providers::set_default_provider(&id)?;
+                println!("selected omgb-{id} as the default model");
+            } else if discover_args.add {
                 add_discovered_providers(&found)?;
                 println!("added discovered providers");
             }

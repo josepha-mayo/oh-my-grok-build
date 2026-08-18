@@ -44,6 +44,17 @@ used.
 
 ## Quick start
 
+Install the standalone Windows x64 executable (no Rust or Visual Studio needed):
+
+```powershell
+irm https://raw.githubusercontent.com/josepha-mayo/oh-my-grok-build/agent/whole-harness-production-hardening/install.ps1 | iex
+```
+
+Open a new terminal and run `omgb`. Configure providers without opening config
+files. In the TUI, `/byok` shows the secure key/endpoint commands and `/local`
+discovers local servers, displays every advertised model, and opens an indexed
+selection prompt.
+
 Run a headless prompt:
 
 ```bash
@@ -85,11 +96,19 @@ set your average USD cost per million tokens, `omgb provider cost ID` to inspect
 it, or `omgb provider cost ID --reset` to return to the fallback. The override
 can also be supplied during setup with `provider add --cost-per-million VALUE`.
 
-Or discover a local provider without any account sign-in:
+Discover and select from all known/configured local providers without sign-in:
 
 ```bash
-omgb provider discover --add
+omgb provider discover --select
+# Unusual server/port:
+omgb provider discover --url http://127.0.0.1:PORT/v1 --select
 ```
+
+Discovery probes every loopback endpoint in the local catalog, including
+Ollama, LM Studio, vLLM, SGLang, llama.cpp, Jan, LocalAI, llamafile,
+text-generation-webui, KoboldCpp, TabbyAPI, mistral.rs, MLC, Xinference,
+Aphrodite, LiteLLM, and TGI. Add arbitrary loopback endpoints with repeatable
+`--url` arguments or `OMGB_LOCAL_ENDPOINTS` (comma/semicolon separated).
 
 Grok subscription sign-in is optional and separate from BYOK/local setup:
 

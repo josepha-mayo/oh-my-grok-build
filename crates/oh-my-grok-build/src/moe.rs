@@ -312,6 +312,8 @@ pub async fn select_provider_or_fallback(prompt: &str) -> Result<String> {
             vllm_url: None,
             sglang_url: None,
             llama_cpp_url: None,
+            urls: Vec::new(),
+            select: false,
             add: false,
         };
         let discovered = discover_local_models(&args).await?;

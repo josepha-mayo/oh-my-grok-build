@@ -258,7 +258,7 @@ check before retry.
 
 The TUI and mobile app support these slash commands:
 
-- `/autonomous`, `/browser`, `/btw`, `/byok`, `/create-workflow`, `/dream`, `/group`, `/live`, `/loop`, `/plan`, `/recap`, `/research`, `/schedule`, `/taste`, `/use`, `/voice`, `/workflow`, `/yolo`
+- `/autonomous`, `/browser`, `/btw`, `/byok`, `/create-workflow`, `/dream`, `/group`, `/live`, `/local`, `/loop`, `/plan`, `/recap`, `/research`, `/schedule`, `/taste`, `/use`, `/voice`, `/workflow`, `/yolo`
 
 ## Configuration
 

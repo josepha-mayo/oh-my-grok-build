@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::args::{AddProviderArgs, DiscoverArgs};
@@ -18,11 +19,6 @@ fn is_false(value: &bool) -> bool {
 
 pub mod catalog;
 
-const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
-const DEFAULT_LMSTUDIO_URL: &str = "http://localhost:1234/v1";
-const DEFAULT_VLLM_URL: &str = "http://localhost:8000/v1";
-const DEFAULT_LLAMA_CPP_URL: &str = "http://localhost:8080/v1";
-const DEFAULT_SGLANG_URL: &str = "http://localhost:30000/v1";
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
 const LOCAL_PROVIDER_IDS: &[&str] = &[
@@ -1913,7 +1909,7 @@ async fn discover_one(base_url: &str, name: &str) -> Option<(String, String, Vec
         &HashMap::new(),
         true,
         true,
-        Duration::from_secs(10),
+        Duration::from_secs(3),
     )
     .await?;
     if models.is_empty() {
@@ -1925,27 +1921,57 @@ async fn discover_one(base_url: &str, name: &str) -> Option<(String, String, Vec
 pub async fn discover_local_models(
     args: &DiscoverArgs,
 ) -> Result<Vec<(String, String, Vec<ModelListEntry>)>> {
-    let ollama = args.ollama_url.as_deref().unwrap_or(DEFAULT_OLLAMA_URL);
-    let lmstudio = args.lmstudio_url.as_deref().unwrap_or(DEFAULT_LMSTUDIO_URL);
-    let vllm = args.vllm_url.as_deref().unwrap_or(DEFAULT_VLLM_URL);
-    let sglang = args.sglang_url.as_deref().unwrap_or(DEFAULT_SGLANG_URL);
-    let llama_cpp = args
-        .llama_cpp_url
-        .as_deref()
-        .unwrap_or(DEFAULT_LLAMA_CPP_URL);
+    let mut endpoints: Vec<(String, String)> = LOCAL_PROVIDER_IDS
+        .iter()
+        .filter_map(|id| {
+            catalog::provider_template(id)
+                .filter(|provider| crate::net::is_url_host_loopback(&provider.base_url))
+                .map(|provider| ((*id).to_string(), provider.base_url))
+        })
+        .collect();
+    let overrides = [
+        ("ollama", args.ollama_url.as_deref()),
+        ("lmstudio", args.lmstudio_url.as_deref()),
+        ("vllm", args.vllm_url.as_deref()),
+        ("sglang", args.sglang_url.as_deref()),
+        ("llama-cpp", args.llama_cpp_url.as_deref()),
+    ];
+    for (name, replacement) in overrides {
+        if let Some(replacement) = replacement {
+            endpoints.retain(|(existing, _)| existing != name);
+            endpoints.push((name.to_string(), replacement.to_string()));
+        }
+    }
+    for provider in load_omg_config()?.providers.into_values() {
+        if crate::net::is_url_host_loopback(&provider.base_url) {
+            endpoints.push((provider.id, provider.base_url));
+        }
+    }
+    let env_urls = std::env::var("OMGB_LOCAL_ENDPOINTS").unwrap_or_default();
+    for raw in args
+        .urls
+        .iter()
+        .map(String::as_str)
+        .chain(env_urls.split([',', ';']).map(str::trim))
+        .filter(|value| !value.is_empty())
+    {
+        let url = Url::parse(raw).context("invalid local discovery URL")?;
+        if !crate::net::is_url_host_loopback(raw) {
+            bail!("local discovery URL must use a loopback host: {raw}");
+        }
+        let label = format!("local-{}", url.port_or_known_default().unwrap_or(0));
+        endpoints.push((label, raw.trim_end_matches('/').to_string()));
+    }
+    let mut seen = HashSet::new();
+    endpoints.retain(|(_, url)| seen.insert(url.to_ascii_lowercase()));
+    let probes = endpoints.iter().map(|(name, url)| discover_one(url, name));
+    let mut found: Vec<_> = join_all(probes).await.into_iter().flatten().collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(found)
+}
 
-    let (ollama, lmstudio, vllm, sglang, llama_cpp) = tokio::join!(
-        discover_one(ollama, "ollama"),
-        discover_one(lmstudio, "lmstudio"),
-        discover_one(vllm, "vllm"),
-        discover_one(sglang, "sglang"),
-        discover_one(llama_cpp, "llama-cpp"),
-    );
-
-    Ok([ollama, lmstudio, vllm, sglang, llama_cpp]
-        .into_iter()
-        .flatten()
-        .collect())
+pub(crate) fn discovered_provider_id(provider: &str, model: &str) -> String {
+    format!("{provider}-{}", sanitize_provider_id(model))
 }
 
 pub fn add_discovered_providers(
@@ -1957,7 +1983,7 @@ pub fn add_discovered_providers(
     for (provider, base_url, models) in discovered {
         for model in models {
             let model_id = sanitize_provider_id(&model.id);
-            let id = format!("{provider}-{model_id}");
+            let id = discovered_provider_id(provider, &model.id);
             let config = ProviderConfig {
                 id: id.clone(),
                 name: format!("{provider} {model_id} (local)"),
